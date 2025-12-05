@@ -9,3 +9,25 @@ bvxc.sqlite
 tab_flags.csv
 
 rsconnect/
+# macOS
+.DS_Store
+
+# R history / session junk
+.Rhistory
+.Rapp.history
+
+# RStudio project files
+.Rproj.user/
+*.Rproj
+
+# Local config / secrets
+.Renviron
+
+# Shiny deployment metadata
+rsconnect/
+
+# SQLite databases
+*.sqlite
+
+# CSV logs / exports
+*.csv
