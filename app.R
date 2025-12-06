@@ -33,6 +33,13 @@ ADMIN_PASSWORD       <- Sys.getenv("BVXC_ADMIN_PASSWORD",  unset = NA_character_
 # Optional override for return URL base (useful on shinyapps.io / reverse proxy)
 RETURN_BASE_URL <- Sys.getenv("BVXC_RETURN_BASE_URL", unset = NA_character_)
 
+# ---- Validate Square environment ----
+ALLOWED_SQUARE_ENVS <- c("sandbox", "production")
+
+if (is.na(SQUARE_ENV) || !nzchar(SQUARE_ENV) || !(SQUARE_ENV %in% ALLOWED_SQUARE_ENVS)) {
+  stop("SQUARE_ENV must be 'sandbox' or 'production'")
+}
+
 # Label for Square depending on environment
 SQUARE_LABEL <- if (identical(SQUARE_ENV, "sandbox")) "Square sandbox" else "Square"
 
@@ -488,8 +495,8 @@ day_tab <- tabPanel(
           format = "yyyy-mm-dd"
         ),
         h4("Number of passes"),
-        numericInput("n_adult",  "Adults (18+)",      value = 1, min = 0, max = 100, step = 1),
-        numericInput("n_youth",  "Youth (9–18)",      value = 0, min = 0, max = 100, step = 1),
+numericInput("n_adult",  "Adults (19+)",      value = 1, min = 0, max = 100, step = 1),
+  numericInput("n_youth",  "Youth (9–18)",      value = 0, min = 0, max = 100, step = 1),
         numericInput("n_under9", "Children under 9",  value = 0, min = 0, max = 100, step = 1),
         numericInput("n_family", "Family day passes", value = 0, min = 0, max = 100, step = 1),
         tags$hr(),
@@ -831,12 +838,15 @@ server <- function(input, output, session) {
   })
 
   output$season_price_line <- renderUI({
+    # Show "(sandbox demo)" only when using Square sandbox
+    env_note <- if (identical(SQUARE_ENV, "sandbox")) " (sandbox demo)" else ""
     tags$p(
       sprintf(
-        "Adult $%0.2f · Youth $%0.2f · Family $%0.2f (sandbox demo)",
+        "Adult $%0.2f · Youth $%0.2f · Family $%0.2f%s",
         rv_config$price_season_adult / 100,
         rv_config$price_season_youth / 100,
-        rv_config$price_season_family / 100
+        rv_config$price_season_family / 100,
+        env_note
       )
     )
   })
@@ -855,10 +865,13 @@ server <- function(input, output, session) {
   })
 
   output$christmas_price_line <- renderUI({
+    # Same conditional note for Christmas passes
+    env_note <- if (identical(SQUARE_ENV, "sandbox")) " (sandbox demo)" else ""
     tags$p(
       sprintf(
-        "Christmas 2-week pass: $%0.2f (sandbox demo, per person)",
-        rv_config$price_christmas_pass / 100
+        "Christmas 2-week pass: $%0.2f%s per person",
+        rv_config$price_christmas_pass / 100,
+        env_note
       )
     )
   })
@@ -869,16 +882,6 @@ server <- function(input, output, session) {
         "Per transaction limits: up to %d Christmas passes, and a maximum of $%0.2f total.",
         as.integer(rv_config$max_christmas_passes),
         rv_config$max_christmas_amount
-      ),
-      style = "font-size:0.9em; color:#666;"
-    )
-  })
-
-  output$donation_limits_text <- renderUI({
-    tags$p(
-      sprintf(
-        "Maximum online donation: $%0.2f per transaction.",
-        rv_config$max_donation_amount
       ),
       style = "font-size:0.9em; color:#666;"
     )
