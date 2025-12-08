@@ -36,3 +36,19 @@ bvxc.sqlite
 *.bak
 app copy.R
 rsconnect/
+
+# Local secrets
+.Renviron
+.env
+
+# Local databases
+*.sqlite
+
+
+# Local secrets
+.Renviron
+.env
+
+# Local databases
+*.sqlite
+
