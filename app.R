@@ -5,7 +5,6 @@
 
 library(shiny)
 library(httr)
-library(jsonlite)
 library(DBI)
 library(RSQLite)
 library(uuid)
@@ -17,7 +16,7 @@ need     <- shiny::need
 # ---------- GLOBAL SETTINGS ----------
 
 Sys.setenv(TZ = "America/Vancouver")
-APP_VERSION <- "BVXC passes v2.2 – 2025-12-05"
+APP_VERSION <- "BVXC passes v2.3 – 2025-12-08"
 
 # Load .Renviron if present (for local + shinyapps.io bundle)
 if (file.exists(".Renviron")) {
@@ -39,9 +38,6 @@ ALLOWED_SQUARE_ENVS <- c("sandbox", "production")
 if (is.na(SQUARE_ENV) || !nzchar(SQUARE_ENV) || !(SQUARE_ENV %in% ALLOWED_SQUARE_ENVS)) {
   stop("SQUARE_ENV must be 'sandbox' or 'production'")
 }
-
-# Label for Square depending on environment
-SQUARE_LABEL <- if (identical(SQUARE_ENV, "sandbox")) "Square sandbox" else "Square"
 
 # Helper to build the redirect URL after payment
 build_return_url <- function(session) {
@@ -89,12 +85,6 @@ square_base_url <- if (identical(SQUARE_ENV, "production")) {
   "https://connect.squareupsandbox.com"
 }
 
-SQUARE_ENV_LABEL <- if (identical(SQUARE_ENV, "sandbox")) {
-  " (Square sandbox)"
-} else {
-  ""
-}
-
 # ---------- HELPERS ----------
 
 `%||%` <- function(a, b) if (!is.null(a) && !is.na(a)) a else b
@@ -122,14 +112,23 @@ compute_age_years <- function(dob, ref_date = Sys.Date()) {
   as.integer(floor(dif / 365.25))
 }
 
+is_valid_email <- function(x) {
+  x <- trimws(x %||% "")
+  if (!nzchar(x)) return(FALSE)
+  grepl("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", x)
+}
+
 YOUTH_MIN_AGE <- 9L
 YOUTH_MAX_AGE <- 18L
 ADULT_MIN_AGE <- 19L
 
 get_db_connection <- function() {
-  dbConnect(RSQLite::SQLite(), "bvxc.sqlite")
+  con <- dbConnect(RSQLite::SQLite(), "bvxc.sqlite")
+  # Improve concurrency / reduce 'database is locked' risk
+  dbExecute(con, "PRAGMA journal_mode = WAL;")
+  dbExecute(con, "PRAGMA busy_timeout = 5000;")  # 5 seconds
+  con
 }
-
 
 # ---------- DB INIT & HELPERS ----------
 
@@ -495,8 +494,8 @@ day_tab <- tabPanel(
           format = "yyyy-mm-dd"
         ),
         h4("Number of passes"),
-numericInput("n_adult",  "Adults (19+)",      value = 1, min = 0, max = 100, step = 1),
-  numericInput("n_youth",  "Youth (9–18)",      value = 0, min = 0, max = 100, step = 1),
+        numericInput("n_adult",  "Adults (19+)",      value = 1, min = 0, max = 100, step = 1),
+        numericInput("n_youth",  "Youth (9–18)",      value = 0, min = 0, max = 100, step = 1),
         numericInput("n_under9", "Children under 9",  value = 0, min = 0, max = 100, step = 1),
         numericInput("n_family", "Family day passes", value = 0, min = 0, max = 100, step = 1),
         tags$hr(),
@@ -506,7 +505,7 @@ numericInput("n_adult",  "Adults (19+)",      value = 1, min = 0, max = 100, ste
         tags$hr(),
         actionButton(
           "pay",
-          paste0("Pay for day passes", SQUARE_ENV_LABEL),
+          "Pay for day passes",
           class = "btn btn-primary btn-lg btn-block"
         ),
         tags$br(),
@@ -568,7 +567,7 @@ donation_tab <- tabPanel(
         tags$hr(),
         actionButton(
           "donation_only_pay",
-          paste0("Make donation", SQUARE_ENV_LABEL),
+          "Make donation",
           class = "btn btn-primary btn-lg btn-block"
         ),
         tags$br(),
@@ -618,7 +617,7 @@ christmas_tab <- tabPanel(
         tags$hr(),
         actionButton(
           "christmas_pay",
-          paste0("Pay for Christmas passes", SQUARE_ENV_LABEL),
+          "Pay for Christmas passes",
           class = "btn btn-primary btn-lg btn-block"
         ),
         tags$br(),
@@ -663,7 +662,7 @@ season_tab <- tabPanel(
         tags$hr(),
         actionButton(
           "season_pay",
-          paste0("Pay for season passes", SQUARE_ENV_LABEL),
+          "Pay for season passes",
           class = "btn btn-primary btn-lg btn-block"
         ),
         tags$br(),
@@ -705,7 +704,7 @@ admin_tab <- tabPanel(
 )
 
 ui_core <- navbarPage(
-  title = "Bulkley Valley Cross Country Ski Club – Passes",
+  title = "Bulkley Valley Cross Country Ski Club",
   day_tab,
   christmas_tab,
   season_tab,
@@ -726,6 +725,7 @@ app_ui <- tagList(
   tags$head(
     tags$script(HTML(js)),
     tags$style(HTML("
+      /* Datepicker tweaks */
       .datepicker.dropdown-menu {
         font-size: 14px;
         padding: 4px;
@@ -733,6 +733,34 @@ app_ui <- tagList(
       }
       .datepicker .datepicker-switch {
         width: 190px;
+      }
+
+      /* Make the top nav tabs more obviously clickable */
+      .navbar-default {
+        background-color: #f8f8f8;
+        border-bottom: 2px solid #ddd;
+      }
+
+      .navbar-nav > li > a {
+        font-weight: 600;
+        padding-top: 14px;
+        padding-bottom: 14px;
+        border-bottom: 3px solid transparent;
+        cursor: pointer;
+      }
+
+      .navbar-nav > li > a:hover,
+      .navbar-nav > .active > a,
+      .navbar-nav > .active > a:focus,
+      .navbar-nav > .active > a:hover {
+        border-bottom-color: #337ab7;
+        background-color: #f5f5f5;
+      }
+
+      /* Slightly larger brand title for context */
+      .navbar-brand {
+        font-size: 16px;
+        font-weight: 600;
       }
     "))
   ),
@@ -838,15 +866,12 @@ server <- function(input, output, session) {
   })
 
   output$season_price_line <- renderUI({
-    # Show "(sandbox demo)" only when using Square sandbox
-    env_note <- if (identical(SQUARE_ENV, "sandbox")) " (sandbox demo)" else ""
     tags$p(
       sprintf(
-        "Adult $%0.2f · Youth $%0.2f · Family $%0.2f%s",
+        "Adult $%0.2f · Youth $%0.2f · Family $%0.2f",
         rv_config$price_season_adult / 100,
         rv_config$price_season_youth / 100,
-        rv_config$price_season_family / 100,
-        env_note
+        rv_config$price_season_family / 100
       )
     )
   })
@@ -865,13 +890,10 @@ server <- function(input, output, session) {
   })
 
   output$christmas_price_line <- renderUI({
-    # Same conditional note for Christmas passes
-    env_note <- if (identical(SQUARE_ENV, "sandbox")) " (sandbox demo)" else ""
     tags$p(
       sprintf(
-        "Christmas 2-week pass: $%0.2f%s per person",
-        rv_config$price_christmas_pass / 100,
-        env_note
+        "Christmas 2-week pass: $%0.2f per person",
+        rv_config$price_christmas_pass / 100
       )
     )
   })
@@ -962,7 +984,7 @@ server <- function(input, output, session) {
 
     lines <- c(lines, list(
       tags$p(
-        sprintf("Total to pay: $%0.2f CAD%s", total_dollars, SQUARE_ENV_LABEL),
+        sprintf("Total to pay: $%0.2f CAD", total_dollars),
         style = "font-weight: 700; font-size: 1.2rem;"
       )
     ))
@@ -1023,11 +1045,7 @@ server <- function(input, output, session) {
       }
 
       if (is.na(new_date) || new_date > max_date || new_date %in% current_blocked) {
-        if (!(today %in% current_blocked)) {
-          new_date <- today
-        } else {
-          new_date <- today
-        }
+        new_date <- today
       }
 
       updateDateInput(session, "ski_date", value = new_date)
@@ -1128,8 +1146,8 @@ server <- function(input, output, session) {
       validate(
         need(t$total_cents > 0, "Please select at least one paid pass."),
         need(!is.na(d), "Please select a ski date."),
-        need(nchar(input$name)  > 0, "Please enter your name."),
-        need(nchar(input$email) > 0, "Please enter your email."),
+        need(nchar(trimws(input$name)) > 0, "Please enter your name."),
+        need(is_valid_email(input$email), "Please enter a valid email address."),
         need(t$adults   <= rv_config$max_day_adult,
              sprintf("Maximum %d adult day passes per transaction.",  as.integer(rv_config$max_day_adult))),
         need(t$youths   <= rv_config$max_day_youth,
@@ -1280,9 +1298,19 @@ server <- function(input, output, session) {
     tagList(
       tags$p(sprintf("Donation amount: $%0.2f CAD", total_dollars)),
       tags$p(
-        sprintf("Total to pay: $%0.2f CAD%s", total_dollars, SQUARE_ENV_LABEL),
+        sprintf("Total to pay: $%0.2f CAD", total_dollars),
         style = "font-weight: 700; font-size: 1.2rem;"
       )
+    )
+  })
+
+  output$donation_limits_text <- renderUI({
+    tags$p(
+      sprintf(
+        "Per transaction limit: maximum online donation of $%0.2f.",
+        rv_config$max_donation_amount
+      ),
+      style = "font-size:0.9em; color:#666;"
     )
   })
 
@@ -1326,8 +1354,8 @@ server <- function(input, output, session) {
         need(t$donation_cents > 0, "Please enter a positive donation amount."),
         need(t$donation_dollars <= MAX_DONATION_DOLL,
              sprintf("Maximum online donation is $%0.2f per transaction.", MAX_DONATION_DOLL)),
-        need(nchar(input$donation_only_name)  > 0, "Please enter a name."),
-        need(nchar(input$donation_only_email) > 0, "Please enter an email.")
+        need(nchar(trimws(input$donation_only_name))  > 0, "Please enter a name."),
+        need(is_valid_email(input$donation_only_email), "Please enter a valid email address.")
       )
 
       return_url <- build_return_url(session)
@@ -1424,7 +1452,7 @@ server <- function(input, output, session) {
     tagList(
       tags$p(sprintf("Christmas 2-week passes: %d", t$christmas)),
       tags$p(
-        sprintf("Total for Christmas passes: $%0.2f CAD%s", total_dollars, SQUARE_ENV_LABEL),
+        sprintf("Total for Christmas passes: $%0.2f CAD", total_dollars),
         style = "font-weight: 700; font-size: 1.2rem;"
       )
     )
@@ -1506,8 +1534,8 @@ server <- function(input, output, session) {
         need(t$christmas > 0, "Please select at least one Christmas pass."),
         need(t$christmas <= MAX_CHRISTMAS_PASSES,
              sprintf("Maximum %d Christmas passes per transaction.", as.integer(MAX_CHRISTMAS_PASSES))),
-        need(nchar(input$christmas_name)  > 0, "Please enter a name."),
-        need(nchar(input$christmas_email) > 0, "Please enter an email."),
+        need(nchar(trimws(input$christmas_name))  > 0, "Please enter a name."),
+        need(is_valid_email(input$christmas_email), "Please enter a valid email address."),
         need(all(nzchar(holder_names)), "Please enter a name for each Christmas pass.")
       )
 
@@ -1753,7 +1781,7 @@ server <- function(input, output, session) {
         )
       ),
       tags$p(
-        sprintf("Total for season passes: $%0.2f CAD%s", total_dollars, SQUARE_ENV_LABEL),
+        sprintf("Total for season passes: $%0.2f CAD", total_dollars),
         style = "font-weight: 700; font-size: 1.2rem;"
       )
     )
@@ -1886,8 +1914,8 @@ server <- function(input, output, session) {
       validate(
         need(na > 0 || ny > 0 || nf > 0,
              "Please select at least one season pass."),
-        need(nchar(input$season_name)  > 0, "Please enter a name."),
-        need(nchar(input$season_email) > 0, "Please enter an email."),
+        need(nchar(trimws(input$season_name))  > 0, "Please enter a name."),
+        need(is_valid_email(input$season_email), "Please enter a valid email address."),
         need(na <= MAX_SEASON_ADULT,
              sprintf("Maximum %d adult season passes per transaction.",  as.integer(MAX_SEASON_ADULT))),
         need(ny <= MAX_SEASON_YOUTH,
@@ -2045,14 +2073,14 @@ server <- function(input, output, session) {
       }
     }
 
-    if (!is.null(input$admin_name) && nchar(trimws(input$admin_name)) > 0) {
-      pattern <- tolower(trimws(input$admin_name))
-      df <- df[grepl(pattern, tolower(df$name)), , drop = FALSE]
+    # Product type filter
+    if (!is.null(input$admin_product_filter) && input$admin_product_filter != "Any") {
+      df <- df[df$product_type == input$admin_product_filter, , drop = FALSE]
     }
 
-    if (!is.null(input$admin_status) && nchar(trimws(input$admin_status)) > 0) {
-      pattern <- tolower(trimws(input$admin_status))
-      df <- df[grepl(pattern, tolower(df$status)), , drop = FALSE]
+    # Status filter
+    if (!is.null(input$admin_status_filter) && input$admin_status_filter != "Any") {
+      df <- df[df$status == input$admin_status_filter, , drop = FALSE]
     }
 
     df[order(df$created, decreasing = TRUE), , drop = FALSE]
@@ -2239,42 +2267,6 @@ server <- function(input, output, session) {
     set_blocked_dates(new_bd)
   })
 
-  # Admin manual status update (for reconciliation)
-  observeEvent(input$admin_update_status_btn, {
-    req(admin_ok())
-
-    tx_id <- input$admin_update_tx_id
-    new_status <- input$admin_update_status_value %||% ""
-
-    if (is.null(tx_id) || is.na(tx_id) || tx_id <= 0) {
-      output$admin_update_status_message <- renderText("Please enter a valid transaction ID.")
-      return()
-    }
-    if (!nzchar(new_status)) {
-      output$admin_update_status_message <- renderText("Please choose a new status.")
-      return()
-    }
-
-    con <- get_db_connection()
-    on.exit(dbDisconnect(con), add = TRUE)
-
-    n_updated <- dbExecute(
-      con,
-      "UPDATE transactions SET status = ? WHERE id = ?",
-      params = list(new_status, as.integer(tx_id))
-    )
-
-    if (n_updated > 0) {
-      output$admin_update_status_message <- renderText(
-        sprintf("Updated transaction ID %d to status '%s'.", as.integer(tx_id), new_status)
-      )
-    } else {
-      output$admin_update_status_message <- renderText(
-        sprintf("No transaction found with ID %d.", as.integer(tx_id))
-      )
-    }
-  })
-
   # Admin body UI
   output$admin_body <- renderUI({
     if (!admin_ok()) return(NULL)
@@ -2287,23 +2279,41 @@ server <- function(input, output, session) {
         h4("Filters"),
         fluidRow(
           column(
-            4,
+            6,
             dateRangeInput(
               "admin_daterange",
               "Date range",
-              start = Sys.Date(),
+              start = Sys.Date() - 30,
               end   = Sys.Date()
             )
           ),
           column(
-            4,
-            textInput("admin_name", "Filter by name (optional)")
-          ),
+            6,
+            selectInput(
+              "admin_product_filter",
+              "Product type",
+              choices  = c("Any", "day", "season", "christmas", "donation"),
+              selected = "Any"
+            )
+          )
+        ),
+        fluidRow(
           column(
             4,
-            textInput(
-              "admin_status",
-              "Filter by status (optional, e.g. day_link_created)"
+            selectInput(
+              "admin_status_filter",
+              "Status",
+              choices  = c(
+                "Any",
+                "day_link_created",
+                "season_link_created",
+                "christmas_link_created",
+                "donation_link_created",
+                "paid_confirmed",
+                "cancelled",
+                "refunded"
+              ),
+              selected = "Any"
             )
           )
         ),
@@ -2327,47 +2337,7 @@ server <- function(input, output, session) {
         p("Download the current filtered view or the full log as CSV for Excel/Sheets."),
         downloadButton("download_filtered", "Download filtered CSV"),
         tags$span(" "),
-        downloadButton("download_all", "Download full CSV"),
-        tags$hr(),
-        h4("Update transaction status (manual reconciliation)"),
-        p("After confirming payment status in Square, you can manually update the status field here."),
-        fluidRow(
-          column(
-            4,
-            numericInput(
-              "admin_update_tx_id",
-              "Transaction ID (from table above)",
-              value = NA,
-              min   = 1,
-              step  = 1
-            )
-          ),
-          column(
-            4,
-            selectInput(
-              "admin_update_status_value",
-              "New status",
-              choices = c(
-                "day_link_created",
-                "season_link_created",
-                "christmas_link_created",
-                "donation_link_created",
-                "paid_confirmed",
-                "cancelled",
-                "refunded"
-              ),
-              selected = "paid_confirmed"
-            )
-          ),
-          column(
-            4,
-            actionButton(
-              "admin_update_status_btn",
-              "Update status"
-            )
-          )
-        ),
-        verbatimTextOutput("admin_update_status_message")
+        downloadButton("download_all", "Download full CSV")
       ),
       tabPanel(
         "Prices / limits / tabs",
@@ -2524,7 +2494,7 @@ server <- function(input, output, session) {
     output$season_price_line <- renderUI({
       tags$p(
         sprintf(
-          "Adult $%0.2f · Youth $%0.2f · Family $%0.2f (sandbox demo)",
+          "Adult $%0.2f · Youth $%0.2f · Family $%0.2f",
           rv_config$price_season_adult / 100,
           rv_config$price_season_youth / 100,
           rv_config$price_season_family / 100
@@ -2535,7 +2505,7 @@ server <- function(input, output, session) {
     output$christmas_price_line <- renderUI({
       tags$p(
         sprintf(
-          "Christmas 2-week pass: $%0.2f (sandbox demo, per person)",
+          "Christmas 2-week pass: $%0.2f per person",
           rv_config$price_christmas_pass / 100
         )
       )

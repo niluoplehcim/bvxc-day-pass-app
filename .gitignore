@@ -31,3 +31,8 @@ rsconnect/
 
 # CSV logs / exports
 *.csv
+.Renviron
+bvxc.sqlite
+*.bak
+app copy.R
+rsconnect/
