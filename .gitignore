@@ -1,54 +1,32 @@
-.Rhistory
-.RData
-.Rproj.user
-.Ruserdata
-.Rproj
-
-.Renviron
-bvxc.sqlite
-tab_flags.csv
-
-rsconnect/
 # macOS
 .DS_Store
 
-# R history / session junk
+# R / RStudio
 .Rhistory
+.RData
 .Rapp.history
-
-# RStudio project files
 .Rproj.user/
 *.Rproj
 
-# Local config / secrets
+# Local secrets
 .Renviron
+.env
+
+# Local databases
+*.sqlite
+
+# Local scratch / backups
+*.bak
+*~
+app copy.R
 
 # Shiny deployment metadata
 rsconnect/
 
-# SQLite databases
-*.sqlite
+# Legacy file (no longer used if tab flags moved to SQLite)
+tab_flags.csv
 
-# CSV logs / exports
-*.csv
-.Renviron
-bvxc.sqlite
-*.bak
-app copy.R
-rsconnect/
-
-# Local secrets
-.Renviron
-.env
-
-# Local databases
-*.sqlite
-
-
-# Local secrets
-.Renviron
-.env
-
-# Local databases
-*.sqlite
+# Optional: ignore local logs/exports (adjust if needed)
+passes_log.csv
+pass_registrations.csv
 
