@@ -918,7 +918,7 @@ server <- function(input, output, session) {
       showModal(
         modalDialog(
           title = "Payment complete",
-          "Thank you. Your payment appears to have completed successfully. Please keep your Square email receipt as proof of payment. (Note: the club may still verify final payment status via Square.)",
+          "Thank you. Your payment appears to have completed successfully. Please keep your Square email receipt as proof of payment. The club may still verify final payment status directly in Square if needed.",
           easyClose = TRUE,
           footer = NULL
         )
@@ -1250,7 +1250,7 @@ server <- function(input, output, session) {
         name             = sanitize_for_storage(input$name),
         email            = sanitize_for_storage(input$email),
         checkout_id      = info$id,
-        status           = "day_link_created",
+        status           = NA_character_,
         stringsAsFactors = FALSE
       )
       save_transaction(row_df)
@@ -1396,7 +1396,7 @@ server <- function(input, output, session) {
         name             = sanitize_for_storage(input$donation_only_name),
         email            = sanitize_for_storage(input$donation_only_email),
         checkout_id      = info$id,
-        status           = "donation_link_created",
+        status           = NA_character_,
         stringsAsFactors = FALSE
       )
       save_transaction(row_df)
@@ -1621,7 +1621,7 @@ server <- function(input, output, session) {
         name             = sanitize_for_storage(input$christmas_name),
         email            = sanitize_for_storage(input$christmas_email),
         checkout_id      = info$id,
-        status           = "christmas_link_created",
+        status           = NA_character_,
         stringsAsFactors = FALSE
       )
       save_transaction(row_df)
@@ -1994,7 +1994,7 @@ server <- function(input, output, session) {
         name             = sanitize_for_storage(input$season_name),
         email            = sanitize_for_storage(input$season_email),
         checkout_id      = info$id,
-        status           = "season_link_created",
+        status           = NA_character_,
         stringsAsFactors = FALSE
       )
       save_transaction(row_df)
@@ -2078,11 +2078,6 @@ server <- function(input, output, session) {
       df <- df[df$product_type == input$admin_product_filter, , drop = FALSE]
     }
 
-    # Status filter
-    if (!is.null(input$admin_status_filter) && input$admin_status_filter != "Any") {
-      df <- df[df$status == input$admin_status_filter, , drop = FALSE]
-    }
-
     df[order(df$created, decreasing = TRUE), , drop = FALSE]
   })
 
@@ -2110,7 +2105,7 @@ server <- function(input, output, session) {
            "product_type",
            "adults", "youths", "under9", "families", "christmas_passes",
            "total_dollars", "donation_dollars",
-           "name", "email", "status", "checkout_id")]
+           "name", "email", "checkout_id")]
   })
 
   output$admin_overall_summary <- renderTable({
@@ -2293,26 +2288,6 @@ server <- function(input, output, session) {
               "admin_product_filter",
               "Product type",
               choices  = c("Any", "day", "season", "christmas", "donation"),
-              selected = "Any"
-            )
-          )
-        ),
-        fluidRow(
-          column(
-            4,
-            selectInput(
-              "admin_status_filter",
-              "Status",
-              choices  = c(
-                "Any",
-                "day_link_created",
-                "season_link_created",
-                "christmas_link_created",
-                "donation_link_created",
-                "paid_confirmed",
-                "cancelled",
-                "refunded"
-              ),
               selected = "Any"
             )
           )
