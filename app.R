@@ -1,5 +1,15 @@
 # app.R
 # Bulkley Valley Cross Country Ski Club – passes, donations, programs, special events (Square)
+# Updated to address:
+# 1) Admin password no longer hard-stops public app
+# 2) Special events can be disabled/archived via is_active
+# 3) Indexes for faster reports
+# 4) More robust return URL (ports / proxies)
+# 5) Store payment_link_id; safer payment confirmation path
+# 6) (Operational note) SQLite + WAL; keep single-process deployment
+# 7) Admin health panel
+# 8) Pre-empt negative special-event ticket counts
+# 9) More explicit config numeric coercion
 
 library(shiny)
 library(httr)
@@ -13,7 +23,7 @@ library(jsonlite)
 # -----------------------------------------------------------------------------
 
 Sys.setenv(TZ = "America/Vancouver")
-APP_VERSION       <- "BVXC passes v3.1 – 2025-12-09"
+APP_VERSION       <- "BVXC passes v3.2 – 2025-12-09"
 
 # Hard-coded early-bird cutoff (season passes + programs)
 EARLY_BIRD_CUTOFF <- as.Date("2025-12-01")
@@ -22,10 +32,10 @@ if (file.exists(".Renviron")) {
   readRenviron(".Renviron")
 }
 
-SQUARE_ENV          <- Sys.getenv("SQUARE_ENV",           unset = NA_character_)
-SQUARE_ACCESS_TOKEN <- Sys.getenv("SQUARE_ACCESS_TOKEN", unset = NA_character_)
-SQUARE_LOCATION_ID  <- Sys.getenv("SQUARE_LOCATION_ID",  unset = NA_character_)
-ADMIN_PASSWORD      <- Sys.getenv("BVXC_ADMIN_PASSWORD", unset = NA_character_)
+SQUARE_ENV          <- Sys.getenv("SQUARE_ENV",            unset = NA_character_)
+SQUARE_ACCESS_TOKEN <- Sys.getenv("SQUARE_ACCESS_TOKEN",  unset = NA_character_)
+SQUARE_LOCATION_ID  <- Sys.getenv("SQUARE_LOCATION_ID",   unset = NA_character_)
+ADMIN_PASSWORD      <- Sys.getenv("BVXC_ADMIN_PASSWORD",  unset = NA_character_)
 RETURN_BASE_URL     <- Sys.getenv("BVXC_RETURN_BASE_URL", unset = NA_character_)
 
 ALLOWED_SQUARE_ENVS <- c("sandbox", "production")
@@ -40,21 +50,25 @@ square_base_url <- if (identical(SQUARE_ENV, "production")) {
   "https://connect.squareupsandbox.com"
 }
 
-missing_vars <- c(
+# --- safer env validation -----------------------------------------------------
+missing_square <- c(
   if (is.na(SQUARE_ENV)          || SQUARE_ENV          == "") "SQUARE_ENV"          else NULL,
   if (is.na(SQUARE_ACCESS_TOKEN) || SQUARE_ACCESS_TOKEN == "") "SQUARE_ACCESS_TOKEN" else NULL,
-  if (is.na(SQUARE_LOCATION_ID)  || SQUARE_LOCATION_ID  == "") "SQUARE_LOCATION_ID"  else NULL,
-  if (is.na(ADMIN_PASSWORD)      || ADMIN_PASSWORD      == "") "BVXC_ADMIN_PASSWORD" else NULL
+  if (is.na(SQUARE_LOCATION_ID)  || SQUARE_LOCATION_ID  == "") "SQUARE_LOCATION_ID"  else NULL
 )
 
-if (length(missing_vars) > 0) {
+if (length(missing_square) > 0) {
   stop(
     paste0(
       "Missing required environment variables: ",
-      paste(missing_vars, collapse = ", "),
+      paste(missing_square, collapse = ", "),
       ". Check your .Renviron in the app directory or server configuration."
     )
   )
+}
+
+if (is.na(ADMIN_PASSWORD) || ADMIN_PASSWORD == "") {
+  message("Warning: BVXC_ADMIN_PASSWORD not set. Admin tab will remain locked.")
 }
 
 CURRENT_YEAR <- as.integer(format(Sys.Date(), "%Y"))
@@ -255,7 +269,8 @@ init_db <- function() {
       email            TEXT,
       checkout_id      TEXT,
       square_order_id  TEXT,
-      status           TEXT
+      status           TEXT,
+      payment_link_id  TEXT
     )
   ")
 
@@ -266,6 +281,9 @@ init_db <- function() {
   }
   if (!"status" %in% cols) {
     dbExecute(con, "ALTER TABLE transactions ADD COLUMN status TEXT")
+  }
+  if (!"payment_link_id" %in% cols) {
+    dbExecute(con, "ALTER TABLE transactions ADD COLUMN payment_link_id TEXT")
   }
 
   dbExecute(con, "
@@ -305,9 +323,21 @@ init_db <- function() {
       event_date         TEXT,
       price_cents        INTEGER,
       max_tickets_per_tx INTEGER,
-      max_amount_dollars REAL
+      max_amount_dollars REAL,
+      is_active          INTEGER DEFAULT 1
     )
   ")
+
+  # Add is_active if older DB already exists
+  se_cols <- dbGetQuery(con, "PRAGMA table_info(special_events)")$name
+  if (!"is_active" %in% se_cols) {
+    dbExecute(con, "ALTER TABLE special_events ADD COLUMN is_active INTEGER DEFAULT 1")
+  }
+
+  # Performance indexes
+  dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_transactions_created ON transactions(created)")
+  dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_transactions_ski_date ON transactions(ski_date)")
+  dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_transactions_product_type ON transactions(product_type)")
 }
 
 save_transaction <- function(row_df) {
@@ -395,11 +425,45 @@ set_blocked_dates <- function(dates) {
   dbWriteTable(con, "blocked_dates", df, overwrite = TRUE)
 }
 
-load_special_events <- function() {
+load_special_events <- function(active_only = FALSE) {
   con <- get_db_connection()
   on.exit(dbDisconnect(con), add = TRUE)
   if (!"special_events" %in% dbListTables(con)) return(data.frame())
-  dbReadTable(con, "special_events")
+  df <- dbReadTable(con, "special_events")
+  if (!is.data.frame(df) || nrow(df) == 0) return(df)
+
+  if (!"is_active" %in% names(df)) {
+    df$is_active <- 1L
+  }
+
+  if (isTRUE(active_only)) {
+    df <- df[as_int0(df$is_active) == 1L, , drop = FALSE]
+  }
+  df
+}
+
+set_special_event_active <- function(event_id, is_active) {
+  con <- get_db_connection()
+  on.exit(dbDisconnect(con), add = TRUE)
+  dbExecute(
+    con,
+    "UPDATE special_events SET is_active = ? WHERE id = ?",
+    params = list(as.integer(isTRUE(is_active)), as.integer(event_id))
+  )
+}
+
+load_event_log <- function(limit = 5L) {
+  con <- get_db_connection()
+  on.exit(dbDisconnect(con), add = TRUE)
+  if (!"event_log" %in% dbListTables(con)) return(data.frame())
+  df <- dbGetQuery(
+    con,
+    sprintf(
+      "SELECT ts, event_type, details FROM event_log ORDER BY id DESC LIMIT %d",
+      as.integer(limit)
+    )
+  )
+  df
 }
 
 # -----------------------------------------------------------------------------
@@ -472,6 +536,30 @@ DEFAULT_CONFIG <- list(
   tab_special_enabled   = 1L
 )
 
+# Explicit numeric coercion map (addresses issue #9)
+INT_KEYS <- c(
+  # prices (cents)
+  grep("^price_", names(DEFAULT_CONFIG), value = TRUE),
+
+  # tabs
+  grep("^tab_", names(DEFAULT_CONFIG), value = TRUE),
+
+  # count-style limits
+  "max_day_adult", "max_day_youth", "max_day_under9", "max_day_family",
+  "max_christmas_passes",
+  "max_season_adult", "max_season_youth",
+  "max_program_participants"
+)
+
+NUM_KEYS <- c(
+  # dollar caps
+  "max_day_amount",
+  "max_donation_amount",
+  "max_christmas_amount",
+  "max_season_amount",
+  "max_program_amount"
+)
+
 load_config <- function() {
   con <- get_db_connection()
   on.exit(dbDisconnect(con), add = TRUE)
@@ -485,24 +573,26 @@ load_config <- function() {
       k <- df$key[i]
       v <- df$value[i]
       if (!nzchar(k)) next
-      if (k %in% names(cfg)) {
-        if (grepl("^price_", k) || grepl("^max_", k) || grepl("^tab_", k)) {
-          num <- suppressWarnings(as.numeric(v))
-          if (!is.na(num)) {
-            if (grepl("^price_", k)) {
-              cfg[[k]] <- as.integer(round(num))
-            } else if (grepl("^tab_", k)) {
-              cfg[[k]] <- as.integer(ifelse(num > 0, 1, 0))
-            } else {
-              cfg[[k]] <- num
-            }
+      if (!k %in% names(cfg)) next
+
+      if (k %in% INT_KEYS) {
+        num <- suppressWarnings(as.numeric(v))
+        if (!is.na(num)) {
+          if (grepl("^tab_", k)) {
+            cfg[[k]] <- as.integer(ifelse(num > 0, 1, 0))
+          } else {
+            cfg[[k]] <- as.integer(round(num))
           }
-        } else {
-          cfg[[k]] <- v
         }
+      } else if (k %in% NUM_KEYS) {
+        num <- suppressWarnings(as.numeric(v))
+        if (!is.na(num)) cfg[[k]] <- num
+      } else {
+        cfg[[k]] <- v
       }
     }
   }
+
   cfg
 }
 
@@ -557,13 +647,13 @@ build_return_url <- function(session) {
     return(paste0(base, base_path, "?success=1"))
   }
 
-  paste0(
-    session$clientData$url_protocol,
-    "//",
-    session$clientData$url_hostname,
-    base_path,
-    "?success=1"
-  )
+  host  <- session$clientData$url_hostname
+  port  <- session$clientData$url_port
+  proto <- session$clientData$url_protocol
+
+  host_port <- if (!is.null(port) && nzchar(port)) paste0(host, ":", port) else host
+
+  paste0(proto, "//", host_port, base_path, "?success=1")
 }
 
 create_square_checkout <- function(total_cents, item_name, return_url) {
@@ -634,14 +724,14 @@ create_square_checkout <- function(total_cents, item_name, return_url) {
     log_event(
       "square_api_error",
       list(
-        phase        = "http_error",
-        status_code  = status$status_code,
-        category     = status$category,
-        reason       = status$reason,
-        item_name    = item_name,
-        total_cents  = total_cents,
-        location_id  = SQUARE_LOCATION_ID,
-        env          = SQUARE_ENV,
+        phase         = "http_error",
+        status_code   = status$status_code,
+        category      = status$category,
+        reason        = status$reason,
+        item_name     = item_name,
+        total_cents   = total_cents,
+        location_id   = SQUARE_LOCATION_ID,
+        env           = SQUARE_ENV,
         response_body = substr(body, 1, 2000)
       )
     )
@@ -827,15 +917,13 @@ ui_limits_donation <- function(cfg) {
   )
 }
 
-# New helper: show "please wait" while app loads, then enabled/disabled content
+# Show "please wait" while app loads, then enabled/disabled content
 ui_when_enabled <- function(output_flag, enabled_ui, disabled_title, disabled_msg) {
   tagList(
-    # App loaded AND tab enabled
     conditionalPanel(
       condition = sprintf("output.app_loaded && output.%s", output_flag),
       enabled_ui
     ),
-    # App loaded AND tab explicitly disabled
     conditionalPanel(
       condition = sprintf("output.app_loaded && !output.%s", output_flag),
       tagList(
@@ -843,7 +931,6 @@ ui_when_enabled <- function(output_flag, enabled_ui, disabled_title, disabled_ms
         p(disabled_msg, style = "color:#555; margin-top:0.75rem;")
       )
     ),
-    # App not fully loaded yet
     conditionalPanel(
       condition = "!output.app_loaded",
       tagList(
@@ -1264,7 +1351,13 @@ server <- function(input, output, session) {
   admin_ok <- reactiveVal(FALSE)
 
   # Special events cache
-  special_events_rv <- reactiveVal(load_special_events())
+  special_events_all_rv    <- reactiveVal(load_special_events(active_only = FALSE))
+  special_events_active_rv <- reactiveVal(load_special_events(active_only = TRUE))
+
+  refresh_special_events <- function() {
+    special_events_all_rv(load_special_events(active_only = FALSE))
+    special_events_active_rv(load_special_events(active_only = TRUE))
+  }
 
   # --- admin rate limiter -----------------------------------------------------
 
@@ -1361,6 +1454,7 @@ server <- function(input, output, session) {
           client        = ctx
         )
       )
+      refresh_special_events()
       return()
     }
 
@@ -1506,23 +1600,46 @@ server <- function(input, output, session) {
 
       tx_id    <- pending$id[1]
       order_id <- pending$square_order_id[1]
-      actual   <- check_square_payment_status(order_id)
 
-      if (actual == "PAID") {
-        dbExecute(con, "UPDATE transactions SET status = 'PAID' WHERE id = ?", params = list(tx_id))
+      # If order_id is missing, do not attempt API check
+      if (is.na(order_id) || !nzchar(order_id)) {
+        log_event("payment_return_no_order_id", list(tx_id = tx_id))
         showModal(
           modalDialog(
-            title = "Payment confirmed",
-            "Thank you – your payment has been verified with Square and recorded as PAID.",
+            title = "Return from Square",
+            tagList(
+              p("We received your return from Square, but could not automatically confirm the order yet."),
+              p("If you have a Square email receipt, your payment went through."),
+              p("The treasurer can reconcile this transaction if needed.")
+            ),
             easyClose = TRUE,
             footer = NULL
           )
         )
+        return()
+      }
+
+      actual   <- check_square_payment_status(order_id)
+
+      if (actual == "PAID") {
+        dbExecute(con, "UPDATE transactions SET status = 'PAID' WHERE id = ?", params = list(tx_id))
+        log_event("payment_confirmed", list(tx_id = tx_id, order_id = order_id))
+        showModal(modalDialog(
+          title = "Payment confirmed",
+          tagList(
+            p("Thank you — your payment has been verified with Square."),
+            p("You will receive an email receipt."),
+            tags$hr(),
+            p(strong("Next step:"), " Take a ticket from the box at the trailhead and write your name and 'PAID ONLINE' on it.")
+          ),
+          easyClose = TRUE,
+          footer = NULL
+        ))
       } else {
         showModal(
           modalDialog(
             title = "Return from Square",
-            "We could not automatically confirm the payment. If you have a Square email receipt, your payment went through. The treasurer can reconcile PENDING transactions against Square as needed.",
+            "We could not automatically confirm the payment yet. If you have a Square email receipt, your payment went through. The treasurer can reconcile PENDING transactions against Square as needed.",
             easyClose = TRUE,
             footer = NULL
           )
@@ -1589,7 +1706,13 @@ server <- function(input, output, session) {
       donation_cents   = as.integer(donation_cents),
       name             = sanitize_for_storage(name),
       email            = sanitize_for_storage(email),
-      checkout_id      = info_id,
+
+      # Keep existing column for backwards compatibility
+      checkout_id      = sanitize_for_storage(info_id),
+
+      # New explicit storage
+      payment_link_id  = sanitize_for_storage(info_id),
+
       square_order_id  = sanitize_for_storage(order_id),
       status           = status,
       stringsAsFactors = FALSE
@@ -1820,8 +1943,8 @@ server <- function(input, output, session) {
       )
 
       write_tx(
-        info_id    = info$id,
-        order_id   = info$order_id,
+        info_id      = info$id,
+        order_id     = info$order_id,
         product_type = "day",
         total_cents  = calc$total_cents,
         name         = input$name,
@@ -2044,13 +2167,13 @@ server <- function(input, output, session) {
       )
 
       write_tx(
-        info_id         = info$id,
-        order_id        = info$order_id,
-        product_type    = "christmas",
-        total_cents     = calc$total_cents,
-        name            = input$christmas_name,
-        email           = input$christmas_email,
-        christmas_passes= calc$christmas
+        info_id          = info$id,
+        order_id         = info$order_id,
+        product_type     = "christmas",
+        total_cents      = calc$total_cents,
+        name             = input$christmas_name,
+        email            = input$christmas_email,
+        christmas_passes = calc$christmas
       )
 
       if (length(holder_names) > 0L) {
@@ -2246,14 +2369,14 @@ server <- function(input, output, session) {
       ) else as.Date(character(0))
 
       validate_season_purchase(
-        calc           = calc,
-        adult_names    = adult_names,
-        youth_names    = youth_names,
-        adult_dobs     = adult_dobs,
-        youth_dobs     = youth_dobs,
-        purchaser_name = input$season_name,
-        purchaser_email= input$season_email,
-        cfg            = cfg
+        calc            = calc,
+        adult_names     = adult_names,
+        youth_names     = youth_names,
+        adult_dobs      = adult_dobs,
+        youth_dobs      = youth_dobs,
+        purchaser_name  = input$season_name,
+        purchaser_email = input$season_email,
+        cfg             = cfg
       )
 
       info <- safe_checkout(
@@ -2537,9 +2660,16 @@ server <- function(input, output, session) {
   # SPECIAL EVENTS
   # ============================================================================
 
-  # Update dropdown choices when special_events_rv changes
+  # Pre-empt negative entries (issue #8)
+  observeEvent(input$special_n_tickets, ignoreInit = TRUE, {
+    if (as_int0(input$special_n_tickets) < 0) {
+      updateNumericInput(session, "special_n_tickets", value = 0)
+    }
+  })
+
+  # Update public dropdown choices when active list changes
   observe({
-    df <- special_events_rv()
+    df <- special_events_active_rv()
     if (!is.data.frame(df) || nrow(df) == 0) {
       updateSelectInput(
         session,
@@ -2549,7 +2679,7 @@ server <- function(input, output, session) {
       return()
     }
 
-    labels <- paste0(df$name, " (", df$event_date, ")")
+    labels  <- paste0(df$name, " (", df$event_date, ")")
     choices <- setNames(as.character(df$id), labels)
 
     updateSelectInput(
@@ -2559,8 +2689,27 @@ server <- function(input, output, session) {
     )
   })
 
+  # Admin dropdown for managing status
+  observe({
+    df <- special_events_all_rv()
+    if (!isTRUE(admin_ok())) return()
+
+    if (!is.data.frame(df) || nrow(df) == 0) {
+      updateSelectInput(session, "special_admin_event_id", choices = c("No events" = ""))
+      return()
+    }
+
+    labels <- paste0(
+      df$name, " (", df$event_date, ") ",
+      ifelse(as_int0(df$is_active) == 1L, "[ACTIVE]", "[INACTIVE]")
+    )
+    choices <- setNames(as.character(df$id), labels)
+
+    updateSelectInput(session, "special_admin_event_id", choices = choices)
+  })
+
   special_selected <- reactive({
-    df <- special_events_rv()
+    df <- special_events_active_rv()
     if (!is.data.frame(df) || nrow(df) == 0) return(NULL)
     id_raw <- input$special_event_id
     if (is.null(id_raw) || id_raw == "") return(NULL)
@@ -2659,7 +2808,6 @@ server <- function(input, output, session) {
         item_name   = item_name
       )
 
-      # Use event date as ski_date for reporting
       event_date <- as.Date(ev$event_date[1])
 
       write_tx(
@@ -2727,13 +2875,18 @@ server <- function(input, output, session) {
     df$created  <- as.character(df$created)
     df$ski_date <- as.character(df$ski_date)
 
+    # Ensure column exists for older rows
+    if (!"payment_link_id" %in% names(df)) df$payment_link_id <- df$checkout_id
+
     df[, c(
       "id", "created", "ski_date",
       "product_type",
       "adults", "youths", "under9", "families", "christmas_passes",
       "total_dollars", "donation_dollars",
       "status",
-      "name", "email", "checkout_id", "square_order_id"
+      "name", "email",
+      "payment_link_id", "checkout_id",
+      "square_order_id"
     )]
   })
 
@@ -2848,6 +3001,73 @@ server <- function(input, output, session) {
     }
   )
 
+  # --- database backup download (includes WAL/SHM if present) ----------------
+
+  output$download_db_backup <- downloadHandler(
+    filename = function() {
+      paste0("bvxc_db_backup_", Sys.Date(), ".zip")
+    },
+    content = function(file) {
+      req(admin_ok())
+
+      base_db <- "bvxc.sqlite"
+      wal_db  <- "bvxc.sqlite-wal"
+      shm_db  <- "bvxc.sqlite-shm"
+
+      if (!file.exists(base_db)) {
+        stop("Database file bvxc.sqlite not found in app directory.")
+      }
+
+      # Try to checkpoint WAL so the main db is as current as possible
+      tryCatch({
+        con <- get_db_connection()
+        on.exit(dbDisconnect(con), add = TRUE)
+        dbExecute(con, "PRAGMA wal_checkpoint(FULL);")
+      }, error = function(e) {
+        log_event("db_backup_warning", list(message = e$message))
+      })
+
+      db_files <- c(base_db)
+      if (file.exists(wal_db)) db_files <- c(db_files, wal_db)
+      if (file.exists(shm_db)) db_files <- c(db_files, shm_db)
+
+      tmpdir <- tempfile("bvxc_db_backup_")
+      dir.create(tmpdir, recursive = TRUE, showWarnings = FALSE)
+
+      file.copy(db_files, file.path(tmpdir, basename(db_files)), overwrite = TRUE)
+
+      oldwd <- getwd()
+      on.exit(setwd(oldwd), add = TRUE)
+      setwd(tmpdir)
+
+      utils::zip(zipfile = file, files = basename(db_files))
+    }
+  )
+
+  # --- Admin health panel outputs (issue #7) ---------------------------------
+
+  output$admin_db_health <- renderText({
+    req(admin_ok())
+    if (file.exists("bvxc.sqlite")) "OK – bvxc.sqlite present" else "WARNING – bvxc.sqlite missing"
+  })
+
+  output$admin_square_env_health <- renderText({
+    req(admin_ok())
+    paste0("Square environment: ", SQUARE_ENV)
+  })
+
+  output$admin_early_bird_health <- renderText({
+    req(admin_ok())
+    paste0("Early-bird cutoff (hard-coded): ", format(EARLY_BIRD_CUTOFF, "%Y-%m-%d"))
+  })
+
+  output$admin_recent_events <- renderTable({
+    req(admin_ok())
+    df <- load_event_log(5L)
+    if (!is.data.frame(df) || nrow(df) == 0) return(NULL)
+    df
+  })
+
   # --- blocked dates ----------------------------------------------------------
 
   output$blocked_dates_table <- renderTable({
@@ -2891,13 +3111,13 @@ server <- function(input, output, session) {
     set_blocked_dates(new_bd)
   })
 
-  # --- Admin: special events table + add --------------------------------------
+  # --- Admin: special events table + add + enable/disable --------------------
 
   output$special_events_admin_table <- renderTable({
     req(admin_ok())
-    df <- special_events_rv()
+    df <- special_events_all_rv()
     if (!is.data.frame(df) || nrow(df) == 0) return(NULL)
-    df
+    df[order(as.Date(df$event_date), decreasing = FALSE), ]
   })
 
   observeEvent(input$special_add_event, {
@@ -2928,17 +3148,56 @@ server <- function(input, output, session) {
         price_cents        = to_cents(price),
         max_tickets_per_tx = as.integer(max_t),
         max_amount_dollars = max_a,
+        is_active          = 1L,
         stringsAsFactors   = FALSE
       ),
       append = TRUE
     )
 
-    special_events_rv(load_special_events())
+    refresh_special_events()
 
     showModal(
       modalDialog(
         title = "Special event added",
         "The event has been added and is available in the SPECIAL EVENTS tab.",
+        easyClose = TRUE,
+        footer = NULL
+      )
+    )
+  })
+
+  # When admin selects an event, populate active checkbox
+  observeEvent(input$special_admin_event_id, {
+    req(admin_ok())
+    df <- special_events_all_rv()
+    id_raw <- input$special_admin_event_id
+    if (is.null(id_raw) || id_raw == "") {
+      updateCheckboxInput(session, "special_admin_active", value = TRUE)
+      return()
+    }
+    id <- as_int0(id_raw)
+    ev <- df[df$id == id, , drop = FALSE]
+    if (nrow(ev) == 0) return()
+    updateCheckboxInput(session, "special_admin_active", value = as_int0(ev$is_active[1]) == 1L)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$special_admin_update_active, {
+    req(admin_ok())
+    id_raw <- input$special_admin_event_id
+    validate(need(!is.null(id_raw) && nzchar(id_raw), "Please select a special event."))
+    id <- as_int0(id_raw)
+
+    set_special_event_active(id, isTRUE(input$special_admin_active))
+    refresh_special_events()
+
+    showModal(
+      modalDialog(
+        title = "Special event updated",
+        if (isTRUE(input$special_admin_active)) {
+          "Event marked ACTIVE. It will be visible in the public SPECIAL EVENTS tab."
+        } else {
+          "Event marked INACTIVE. It will be hidden from the public SPECIAL EVENTS tab."
+        },
         easyClose = TRUE,
         footer = NULL
       )
@@ -2955,6 +3214,18 @@ server <- function(input, output, session) {
       tabPanel(
         "Reports",
         br(),
+
+        h4("System health"),
+        p("Quick checks for treasurer handover and troubleshooting."),
+        tags$ul(
+          tags$li(strong("Database: "), textOutput("admin_db_health", inline = TRUE)),
+          tags$li(strong("Environment: "), textOutput("admin_square_env_health", inline = TRUE)),
+          tags$li(strong("Early-bird cutoff: "), textOutput("admin_early_bird_health", inline = TRUE))
+        ),
+        h5("Recent system events"),
+        tableOutput("admin_recent_events"),
+
+        tags$hr(),
         h4("Filters"),
         fluidRow(
           column(
@@ -2996,7 +3267,12 @@ server <- function(input, output, session) {
         p("Download the current filtered view or the full log as CSV for Excel/Sheets."),
         downloadButton("download_filtered", "Download filtered CSV"),
         tags$span(" "),
-        downloadButton("download_all", "Download full CSV")
+        downloadButton("download_all", "Download full CSV"),
+
+        tags$hr(),
+        h4("Database backup"),
+        p("Download a backup of the SQLite database for safe-keeping or handover to a new treasurer."),
+        downloadButton("download_db_backup", "Download database backup")
       ),
       tabPanel(
         "Prices / limits / tabs",
@@ -3066,7 +3342,7 @@ server <- function(input, output, session) {
 
         tags$hr(),
         h4("Special events"),
-        p("Create special events that appear in the SPECIAL EVENTS tab."),
+        p("Create special events that appear in the SPECIAL EVENTS tab. You can also set events active/inactive."),
         fluidRow(
           column(4, textInput("special_name_new", "Event name")),
           column(4, dateInput("special_date_new", "Event date", value = Sys.Date())),
@@ -3078,6 +3354,14 @@ server <- function(input, output, session) {
         ),
         actionButton("special_add_event", "Add special event"),
         tags$br(), tags$br(),
+
+        h5("Enable / disable existing event"),
+        fluidRow(
+          column(6, selectInput("special_admin_event_id", "Select event", choices = c("No events" = ""))),
+          column(3, checkboxInput("special_admin_active", "Event active", value = TRUE)),
+          column(3, actionButton("special_admin_update_active", "Update status", style = "margin-top: 25px;"))
+        ),
+        tags$br(),
         tableOutput("special_events_admin_table"),
 
         tags$hr(),
