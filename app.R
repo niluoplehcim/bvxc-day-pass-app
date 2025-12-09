@@ -1,40 +1,33 @@
 # app.R
-# Bulkley Valley Cross Country Ski Club – passes + donations (Square)
-# DAY, CHRISTMAS, SEASON, DONATION, with admin-set prices and limits.
-# Logging + config via SQLite.
+# Bulkley Valley Cross Country Ski Club – passes, donations, programs, special events (Square)
 
 library(shiny)
 library(httr)
 library(DBI)
 library(RSQLite)
 library(uuid)
+library(jsonlite)
 
-# Alias for Shiny's validate/need
-validate <- shiny::validate
-need     <- shiny::need
-
-# =============================================================================
-# GLOBAL SETTINGS
-# =============================================================================
+# -----------------------------------------------------------------------------
+# GLOBAL SETTINGS / ENV
+# -----------------------------------------------------------------------------
 
 Sys.setenv(TZ = "America/Vancouver")
-APP_VERSION <- "BVXC passes v2.8 – 2025-12-09"
+APP_VERSION       <- "BVXC passes v3.1 – 2025-12-09"
 
-# Load .Renviron if present (for local + shinyapps.io bundle)
+# Hard-coded early-bird cutoff (season passes + programs)
+EARLY_BIRD_CUTOFF <- as.Date("2025-12-01")
+
 if (file.exists(".Renviron")) {
   readRenviron(".Renviron")
 }
 
-# Read required environment variables
-SQUARE_ENV           <- Sys.getenv("SQUARE_ENV",           unset = NA_character_)
-SQUARE_ACCESS_TOKEN  <- Sys.getenv("SQUARE_ACCESS_TOKEN", unset = NA_character_)
-SQUARE_LOCATION_ID   <- Sys.getenv("SQUARE_LOCATION_ID",  unset = NA_character_)
-ADMIN_PASSWORD       <- Sys.getenv("BVXC_ADMIN_PASSWORD", unset = NA_character_)
+SQUARE_ENV          <- Sys.getenv("SQUARE_ENV",           unset = NA_character_)
+SQUARE_ACCESS_TOKEN <- Sys.getenv("SQUARE_ACCESS_TOKEN", unset = NA_character_)
+SQUARE_LOCATION_ID  <- Sys.getenv("SQUARE_LOCATION_ID",  unset = NA_character_)
+ADMIN_PASSWORD      <- Sys.getenv("BVXC_ADMIN_PASSWORD", unset = NA_character_)
+RETURN_BASE_URL     <- Sys.getenv("BVXC_RETURN_BASE_URL", unset = NA_character_)
 
-# Optional override for return URL base (useful on shinyapps.io / reverse proxy)
-RETURN_BASE_URL <- Sys.getenv("BVXC_RETURN_BASE_URL", unset = NA_character_)
-
-# ---- Validate Square environment ----
 ALLOWED_SQUARE_ENVS <- c("sandbox", "production")
 
 if (is.na(SQUARE_ENV) || !nzchar(SQUARE_ENV) || !(SQUARE_ENV %in% ALLOWED_SQUARE_ENVS)) {
@@ -47,12 +40,11 @@ square_base_url <- if (identical(SQUARE_ENV, "production")) {
   "https://connect.squareupsandbox.com"
 }
 
-# Enforce that everything is set – fail fast if not
 missing_vars <- c(
-  if (is.na(SQUARE_ENV)           || SQUARE_ENV           == "") "SQUARE_ENV"           else NULL,
-  if (is.na(SQUARE_ACCESS_TOKEN) || SQUARE_ACCESS_TOKEN  == "") "SQUARE_ACCESS_TOKEN" else NULL,
-  if (is.na(SQUARE_LOCATION_ID)  || SQUARE_LOCATION_ID   == "") "SQUARE_LOCATION_ID"  else NULL,
-  if (is.na(ADMIN_PASSWORD)      || ADMIN_PASSWORD       == "") "BVXC_ADMIN_PASSWORD" else NULL
+  if (is.na(SQUARE_ENV)          || SQUARE_ENV          == "") "SQUARE_ENV"          else NULL,
+  if (is.na(SQUARE_ACCESS_TOKEN) || SQUARE_ACCESS_TOKEN == "") "SQUARE_ACCESS_TOKEN" else NULL,
+  if (is.na(SQUARE_LOCATION_ID)  || SQUARE_LOCATION_ID  == "") "SQUARE_LOCATION_ID"  else NULL,
+  if (is.na(ADMIN_PASSWORD)      || ADMIN_PASSWORD      == "") "BVXC_ADMIN_PASSWORD" else NULL
 )
 
 if (length(missing_vars) > 0) {
@@ -60,14 +52,19 @@ if (length(missing_vars) > 0) {
     paste0(
       "Missing required environment variables: ",
       paste(missing_vars, collapse = ", "),
-      ". Check your .Renviron in the app directory or your server configuration."
+      ". Check your .Renviron in the app directory or server configuration."
     )
   )
 }
 
-# =============================================================================
-# CONSTANTS
-# =============================================================================
+CURRENT_YEAR <- as.integer(format(Sys.Date(), "%Y"))
+CHRISTMAS_DAY_THIS_YEAR <- as.Date(sprintf("%d-12-25", CURRENT_YEAR))
+CHRISTMAS_START_MIN <- CHRISTMAS_DAY_THIS_YEAR - 13
+CHRISTMAS_START_MAX <- CHRISTMAS_DAY_THIS_YEAR
+
+# -----------------------------------------------------------------------------
+# CONSTANTS / HELPERS
+# -----------------------------------------------------------------------------
 
 CONST <- list(
   youth_min_age = 9L,
@@ -81,14 +78,8 @@ CONST <- list(
   max_ski_date_offset_days = 183L
 )
 
-CURRENT_YEAR <- as.integer(format(Sys.Date(), "%Y"))
-CHRISTMAS_DAY_THIS_YEAR <- as.Date(paste0(CURRENT_YEAR, "-12-25"))
-CHRISTMAS_START_MIN <- CHRISTMAS_DAY_THIS_YEAR - 13
-CHRISTMAS_START_MAX <- CHRISTMAS_DAY_THIS_YEAR
-
-# =============================================================================
-# SMALL UTILS
-# =============================================================================
+validate <- shiny::validate
+need     <- shiny::need
 
 `%||%` <- function(a, b) if (!is.null(a) && !is.na(a)) a else b
 
@@ -106,7 +97,6 @@ as_num0 <- function(x) {
   x
 }
 
-# ---- Money helpers (all human-facing dollars show 2 decimals) ----
 to_cents <- function(dollars) {
   as.integer(round(as_num0(dollars) * 100))
 }
@@ -125,21 +115,17 @@ fmt_cad_cents <- function(cents) {
 
 sanitize_for_storage <- function(x) {
   x <- trimws(as.character(x %||% ""))
-
   if (length(x) == 0) return(x)
-
   first_char <- substr(x, 1, 1)
   bad_start  <- first_char %in% c("=", "+", "-", "@")
-
-  bad_idx <- which(bad_start & !is.na(x))
+  bad_idx    <- which(bad_start & !is.na(x))
   if (length(bad_idx) > 0) {
     x[bad_idx] <- paste0("'", x[bad_idx])
   }
-
   x
 }
 
-compute_age_years <- function(dob, ref_date = Sys.Date()) {
+compute_age_years <- function(dob, ref_date) {
   if (length(dob) == 0) return(integer(0))
   dob <- as.Date(dob)
   dif <- as.numeric(ref_date - dob)
@@ -152,17 +138,27 @@ is_valid_email <- function(x) {
   grepl("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", x)
 }
 
+# Program age → group key
+program_group_for_age <- function(age) {
+  if (is.na(age)) return(NA_character_)
+  if (age >= 4  && age <= 5)  return("4_5")
+  if (age >= 6  && age <= 10) return("6_10")
+  if (age >= 11 && age <= 12) return("11_12")
+  if (age >= 13 && age <= 14) return("13_14")
+  if (age >= 15 && age <= 16) return("15_16")
+  if (age >= 17 && age <= 18) return("17_18")
+  if (age >= 19)              return("masters")
+  NA_character_
+}
+
 # -----------------------------------------------------------------------------
-# LOGGING HELPERS (event_log + config change logging)
+# LOGGING
 # -----------------------------------------------------------------------------
 
 log_event <- function(event_type, details) {
   ts <- as.character(Sys.time())
-
   details_json <- tryCatch(
-    {
-      jsonlite::toJSON(details %||% list(), auto_unbox = TRUE, null = "null")
-    },
+    jsonlite::toJSON(details %||% list(), auto_unbox = TRUE, null = "null"),
     error = function(e) {
       paste0(
         '{"error":"failed_to_encode_details","message":"',
@@ -175,7 +171,6 @@ log_event <- function(event_type, details) {
   tryCatch({
     con <- get_db_connection()
     on.exit(dbDisconnect(con), add = TRUE)
-
     dbWriteTable(
       con,
       "event_log",
@@ -188,7 +183,6 @@ log_event <- function(event_type, details) {
       append = TRUE
     )
   }, error = function(e) {
-    # Do not crash the app because logging failed.
     message("Failed to write to event_log: ", e$message)
   })
 
@@ -197,56 +191,23 @@ log_event <- function(event_type, details) {
 
 log_config_changes <- function(before, after, context = list()) {
   if (is.null(before) || is.null(after)) return(invisible(NULL))
-
   keys <- intersect(names(before), names(after))
   for (k in keys) {
     old_val <- before[[k]]
     new_val <- after[[k]]
     if (identical(old_val, new_val)) next
-
-    details <- c(
-      list(
-        key = k,
-        old = old_val,
-        new = new_val
-      ),
-      context
-    )
-
+    details <- c(list(key = k, old = old_val, new = new_val), context)
     log_event("config_change", details)
   }
-
   invisible(NULL)
 }
 
-# Helper to build the redirect URL after payment
-build_return_url <- function(session) {
-  if (!is.na(RETURN_BASE_URL) && nzchar(RETURN_BASE_URL)) {
-    base <- sub("/+$", "", RETURN_BASE_URL)
-    path <- session$clientData$url_pathname %||% "/"
-    if (!startsWith(path, "/")) path <- paste0("/", path)
-    return(paste0(base, path, "?success=1"))
-  }
+# -----------------------------------------------------------------------------
+# ADMIN AUTH
+# -----------------------------------------------------------------------------
 
-  paste0(
-    session$clientData$url_protocol,
-    "//",
-    session$clientData$url_hostname,
-    session$clientData$url_pathname,
-    "?success=1"
-  )
-}
-
-# =============================================================================
-# ADMIN AUTH HELPERS
-# =============================================================================
-
-# ADMIN_PASSWORD may be either:
-# 1) plain text, OR
-# 2) "sha256:<hex>"
 admin_password_matches <- function(input_pw, stored_pw) {
   if (is.na(stored_pw) || !nzchar(stored_pw)) return(FALSE)
-
   input_pw  <- as.character(input_pw %||% "")
   stored_pw <- as.character(stored_pw)
 
@@ -262,12 +223,12 @@ admin_password_matches <- function(input_pw, stored_pw) {
   identical(input_pw, stored_pw)
 }
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # DB
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 get_db_connection <- function() {
-  con <- dbConnect(RSQLite::SQLite(), "bvxc.sqlite")
+  con <- dbConnect(SQLite(), "bvxc.sqlite")
   dbExecute(con, "PRAGMA journal_mode = WAL;")
   dbExecute(con, "PRAGMA busy_timeout = 5000;")
   con
@@ -292,9 +253,20 @@ init_db <- function() {
       donation_cents   INTEGER,
       name             TEXT,
       email            TEXT,
-      checkout_id      TEXT
+      checkout_id      TEXT,
+      square_order_id  TEXT,
+      status           TEXT
     )
   ")
+
+  # Backwards compatibility: add missing columns if DB already existed
+  cols <- dbGetQuery(con, "PRAGMA table_info(transactions)")$name
+  if (!"square_order_id" %in% cols) {
+    dbExecute(con, "ALTER TABLE transactions ADD COLUMN square_order_id TEXT")
+  }
+  if (!"status" %in% cols) {
+    dbExecute(con, "ALTER TABLE transactions ADD COLUMN status TEXT")
+  }
 
   dbExecute(con, "
     CREATE TABLE IF NOT EXISTS registrations (
@@ -308,11 +280,7 @@ init_db <- function() {
     )
   ")
 
-  dbExecute(con, "
-    CREATE TABLE IF NOT EXISTS blocked_dates (
-      date TEXT PRIMARY KEY
-    )
-  ")
+  dbExecute(con, "CREATE TABLE IF NOT EXISTS blocked_dates (date TEXT PRIMARY KEY)")
 
   dbExecute(con, "
     CREATE TABLE IF NOT EXISTS config (
@@ -329,46 +297,53 @@ init_db <- function() {
       details    TEXT
     )
   ")
+
+  dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS special_events (
+      id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+      name               TEXT,
+      event_date         TEXT,
+      price_cents        INTEGER,
+      max_tickets_per_tx INTEGER,
+      max_amount_dollars REAL
+    )
+  ")
 }
 
 save_transaction <- function(row_df) {
   con <- get_db_connection()
   on.exit(dbDisconnect(con), add = TRUE)
-
   dbWriteTable(con, "transactions", row_df, append = TRUE)
 
-  # Unusual transaction pattern detection:
-  # per-email per-day, >5 tx or >$500 total.
+  # Simple anomaly check: many tx or high total per email per day
   email_val   <- row_df$email[1]
   created_val <- row_df$created[1]
 
   if (!is.na(email_val) && nzchar(email_val) &&
       !is.na(created_val) && nzchar(created_val)) {
+
     res <- tryCatch(
-      {
-        dbGetQuery(
-          con,
-          "
-          SELECT
-            email,
-            date(created) AS day,
-            COUNT(*)      AS n_tx,
-            SUM(total_cents) AS total_cents
-          FROM transactions
-          WHERE email = ? AND date(created) = date(?)
-          GROUP BY email, date(created)
-          ",
-          params = list(email_val, created_val)
-        )
-      },
+      dbGetQuery(
+        con,
+        "
+        SELECT
+          email,
+          date(created) AS day,
+          COUNT(*)      AS n_tx,
+          SUM(total_cents) AS total_cents
+        FROM transactions
+        WHERE email = ? AND date(created) = date(?)
+        GROUP BY email, date(created)
+        ",
+        params = list(email_val, created_val)
+      ),
       error = function(e) NULL
     )
 
     if (!is.null(res) && nrow(res) > 0) {
       n_tx        <- as_int0(res$n_tx[1])
       total_cents <- as_int0(res$total_cents[1])
-
-      if (n_tx > 5L || total_cents > 50000L) { # > $500
+      if (n_tx > 5L || total_cents > 50000L) { # >$500
         log_event(
           "unusual_tx_pattern",
           list(
@@ -420,9 +395,16 @@ set_blocked_dates <- function(dates) {
   dbWriteTable(con, "blocked_dates", df, overwrite = TRUE)
 }
 
-# =============================================================================
-# CONFIG (PRICES + LIMITS + TAB FLAGS)
-# =============================================================================
+load_special_events <- function() {
+  con <- get_db_connection()
+  on.exit(dbDisconnect(con), add = TRUE)
+  if (!"special_events" %in% dbListTables(con)) return(data.frame())
+  dbReadTable(con, "special_events")
+}
+
+# -----------------------------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------------------------
 
 DEFAULT_CONFIG <- list(
   # Day prices (cents)
@@ -431,12 +413,32 @@ DEFAULT_CONFIG <- list(
   price_under9_day   = 0L,
   price_family_day   = 3000L,
 
-  # Season + Christmas prices (cents)
-  price_season_adult   = 25000L,
-  price_season_youth   = 18000L,
-  price_season_family  = 45000L,
+  # Season prices (regular & early bird) in cents
+  price_season_adult        = 25000L, # regular
+  price_season_youth        = 18000L, # regular
+  price_season_adult_early  = 22000L, # early-bird
+  price_season_youth_early  = 16000L, # early-bird
+
+  # Christmas price (cents)
   price_christmas_pass = 7500L,
-  season_label         = "2025–2026 season",
+
+  season_label = "2025–2026 season",
+
+  # Programs prices – regular & early bird (cents)
+  price_program_4_5           = 8000L,
+  price_program_4_5_early     = 7000L,
+  price_program_6_10          = 9000L,
+  price_program_6_10_early    = 8000L,
+  price_program_11_12         = 10000L,
+  price_program_11_12_early   = 9000L,
+  price_program_13_14         = 11000L,
+  price_program_13_14_early   = 10000L,
+  price_program_15_16         = 12000L,
+  price_program_15_16_early   = 11000L,
+  price_program_17_18         = 13000L,
+  price_program_17_18_early   = 12000L,
+  price_program_masters       = 14000L,
+  price_program_masters_early = 13000L,
 
   # Day limits
   max_day_adult    = 10L,
@@ -455,14 +457,19 @@ DEFAULT_CONFIG <- list(
   # Season limits
   max_season_adult   = 6L,
   max_season_youth   = 6L,
-  max_season_family  = 4L,
   max_season_amount  = 2000,  # dollars
 
-  # Tab flags (1 = enabled, 0 = disabled)
+  # Programs limits
+  max_program_participants = 20L,
+  max_program_amount       = 3000, # dollars
+
+  # Tab flags
   tab_day_enabled       = 1L,
   tab_christmas_enabled = 1L,
   tab_season_enabled    = 1L,
-  tab_donation_enabled  = 1L
+  tab_donation_enabled  = 1L,
+  tab_programs_enabled  = 1L,
+  tab_special_enabled   = 1L
 )
 
 load_config <- function() {
@@ -470,7 +477,7 @@ load_config <- function() {
   on.exit(dbDisconnect(con), add = TRUE)
   if (!"config" %in% dbListTables(con)) return(DEFAULT_CONFIG)
 
-  df <- dbReadTable(con, "config")
+  df  <- dbReadTable(con, "config")
   cfg <- DEFAULT_CONFIG
 
   if (nrow(df) > 0) {
@@ -478,7 +485,6 @@ load_config <- function() {
       k <- df$key[i]
       v <- df$value[i]
       if (!nzchar(k)) next
-
       if (k %in% names(cfg)) {
         if (grepl("^price_", k) || grepl("^max_", k) || grepl("^tab_", k)) {
           num <- suppressWarnings(as.numeric(v))
@@ -497,14 +503,12 @@ load_config <- function() {
       }
     }
   }
-
   cfg
 }
 
 save_config <- function(cfg) {
   con <- get_db_connection()
   on.exit(dbDisconnect(con), add = TRUE)
-
   df <- data.frame(
     key   = names(cfg),
     value = vapply(cfg, function(x) as.character(x %||% ""), character(1)),
@@ -516,32 +520,51 @@ save_config <- function(cfg) {
 load_tab_flags <- function() {
   cfg <- load_config()
   list(
-    day       = isTRUE(as.integer(cfg$tab_day_enabled) == 1L),
+    day       = isTRUE(as.integer(cfg$tab_day_enabled)       == 1L),
     christmas = isTRUE(as.integer(cfg$tab_christmas_enabled) == 1L),
-    season    = isTRUE(as.integer(cfg$tab_season_enabled) == 1L),
-    donation  = isTRUE(as.integer(cfg$tab_donation_enabled) == 1L)
+    season    = isTRUE(as.integer(cfg$tab_season_enabled)    == 1L),
+    donation  = isTRUE(as.integer(cfg$tab_donation_enabled)  == 1L),
+    programs  = isTRUE(as.integer(cfg$tab_programs_enabled)  == 1L),
+    special   = isTRUE(as.integer(cfg$tab_special_enabled)   == 1L)
   )
 }
 
 save_tab_flags <- function(flags, cfg = NULL) {
   if (is.null(cfg)) cfg <- load_config()
-
   before <- cfg
 
   cfg$tab_day_enabled       <- as.integer(isTRUE(flags$day))
   cfg$tab_christmas_enabled <- as.integer(isTRUE(flags$christmas))
   cfg$tab_season_enabled    <- as.integer(isTRUE(flags$season))
   cfg$tab_donation_enabled  <- as.integer(isTRUE(flags$donation))
+  cfg$tab_programs_enabled  <- as.integer(isTRUE(flags$programs))
+  cfg$tab_special_enabled   <- as.integer(isTRUE(flags$special))
 
   save_config(cfg)
-
-  # Log that tab availability changed
   log_config_changes(before, cfg, context = list(source = "save_tab_flags"))
 }
 
-# =============================================================================
-# SQUARE CHECKOUT
-# =============================================================================
+# -----------------------------------------------------------------------------
+# SQUARE CHECKOUT + STATUS CHECK
+# -----------------------------------------------------------------------------
+
+build_return_url <- function(session) {
+  base_path <- session$clientData$url_pathname %||% "/"
+  if (!startsWith(base_path, "/")) base_path <- paste0("/", base_path)
+
+  if (!is.na(RETURN_BASE_URL) && nzchar(RETURN_BASE_URL)) {
+    base <- sub("/+$", "", RETURN_BASE_URL)
+    return(paste0(base, base_path, "?success=1"))
+  }
+
+  paste0(
+    session$clientData$url_protocol,
+    "//",
+    session$clientData$url_hostname,
+    base_path,
+    "?success=1"
+  )
+}
 
 create_square_checkout <- function(total_cents, item_name, return_url) {
   if (is.null(total_cents) || is.na(total_cents) || total_cents <= 0) {
@@ -566,19 +589,16 @@ create_square_checkout <- function(total_cents, item_name, return_url) {
   )
 
   resp <- tryCatch(
-    {
-      httr::POST(
-        url = paste0(square_base_url, "/v2/online-checkout/payment-links"),
-        httr::add_headers(
-          "Authorization" = paste("Bearer", SQUARE_ACCESS_TOKEN),
-          "Content-Type"  = "application/json"
-        ),
-        body   = body_list,
-        encode = "json"
-      )
-    },
+    httr::POST(
+      url = paste0(square_base_url, "/v2/online-checkout/payment-links"),
+      httr::add_headers(
+        "Authorization" = paste("Bearer", SQUARE_ACCESS_TOKEN),
+        "Content-Type"  = "application/json"
+      ),
+      body   = body_list,
+      encode = "json"
+    ),
     error = function(e) {
-      msg <- sprintf("Square API call failed: %s", e$message)
       log_event(
         "square_api_error",
         list(
@@ -590,8 +610,7 @@ create_square_checkout <- function(total_cents, item_name, return_url) {
           env          = SQUARE_ENV
         )
       )
-      message(msg)
-      stop(msg)
+      stop(sprintf("Square API call failed: %s", e$message))
     }
   )
 
@@ -627,9 +646,6 @@ create_square_checkout <- function(total_cents, item_name, return_url) {
       )
     )
 
-    message("Square HTTP error: ", status$status_code, " ", status$reason)
-    message("Square error body (first 500 chars): ", substr(body, 1, 500))
-
     if (grepl("^\\s*<", body)) {
       stop(
         sprintf(
@@ -644,7 +660,8 @@ create_square_checkout <- function(total_cents, item_name, return_url) {
 
   content_list <- httr::content(resp, as = "parsed", type = "application/json")
 
-  if (is.null(content_list$payment_link$url) || is.null(content_list$payment_link$id)) {
+  pl <- content_list$payment_link
+  if (is.null(pl$url) || is.null(pl$id)) {
     log_event(
       "square_api_error",
       list(
@@ -659,20 +676,67 @@ create_square_checkout <- function(total_cents, item_name, return_url) {
   }
 
   list(
-    url = content_list$payment_link$url,
-    id  = content_list$payment_link$id
+    url      = pl$url,
+    id       = pl$id,
+    order_id = pl$order_id %||% NA_character_
   )
 }
 
-# =============================================================================
+check_square_payment_status <- function(order_id) {
+  if (is.na(order_id) || !nzchar(order_id)) return("UNKNOWN")
+
+  url <- paste0(square_base_url, "/v2/orders/", order_id)
+
+  resp <- tryCatch(
+    httr::GET(
+      url,
+      httr::add_headers(
+        "Authorization" = paste("Bearer", SQUARE_ACCESS_TOKEN),
+        "Content-Type"  = "application/json"
+      )
+    ),
+    error = function(e) {
+      log_event(
+        "square_order_check_error",
+        list(message = e$message, order_id = order_id)
+      )
+      return("ERROR")
+    }
+  )
+
+  if (!inherits(resp, "response") || httr::http_error(resp)) {
+    log_event(
+      "square_order_check_http_error",
+      list(
+        status   = if (inherits(resp, "response")) httr::http_status(resp)$status_code else NA_integer_,
+        order_id = order_id
+      )
+    )
+    return("PENDING")
+  }
+
+  content <- httr::content(resp, as = "parsed")
+  state   <- content$order$state %||% "UNKNOWN"
+
+  is_paid <- FALSE
+  if (state == "COMPLETED") {
+    is_paid <- TRUE
+  } else if (state == "OPEN" && !is.null(content$order$tenders)) {
+    is_paid <- TRUE
+  }
+
+  if (is_paid) "PAID" else "PENDING"
+}
+
+# -----------------------------------------------------------------------------
 # INIT DB
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 init_db()
 
-# =============================================================================
-# SMALL UI HELPERS
-# =============================================================================
+# -----------------------------------------------------------------------------
+# UI HELPERS
+# -----------------------------------------------------------------------------
 
 ui_price_line_day <- function(cfg) {
   tags$p(
@@ -700,24 +764,33 @@ ui_limits_day <- function(cfg) {
   )
 }
 
-ui_price_line_season <- function(cfg) {
-  tags$p(
-    sprintf(
-      "Adult %s · Youth %s · Family %s",
-      fmt_cad_cents(cfg$price_season_adult),
-      fmt_cad_cents(cfg$price_season_youth),
-      fmt_cad_cents(cfg$price_season_family)
+ui_price_line_season <- function(cfg, early) {
+  if (early) {
+    tags$p(
+      sprintf(
+        "Early-bird until %s – Adult %s · Youth %s",
+        format(EARLY_BIRD_CUTOFF, "%Y-%m-%d"),
+        fmt_cad_cents(cfg$price_season_adult_early),
+        fmt_cad_cents(cfg$price_season_youth_early)
+      )
     )
-  )
+  } else {
+    tags$p(
+      sprintf(
+        "Adult %s · Youth %s",
+        fmt_cad_cents(cfg$price_season_adult),
+        fmt_cad_cents(cfg$price_season_youth)
+      )
+    )
+  }
 }
 
 ui_limits_season <- function(cfg) {
   tags$p(
     sprintf(
-      "Per transaction limits: up to %d adult, %d youth, %d family season passes, and a maximum of %s total.",
+      "Per transaction limits: up to %d adult and %d youth season passes, and a maximum of %s total.",
       as.integer(cfg$max_season_adult),
       as.integer(cfg$max_season_youth),
-      as.integer(cfg$max_season_family),
       fmt_cad(cfg$max_season_amount)
     ),
     style = "font-size:0.9em; color:#666;"
@@ -754,24 +827,35 @@ ui_limits_donation <- function(cfg) {
   )
 }
 
-# Reduce duplicated enabled/disabled UI
+# New helper: show "please wait" while app loads, then enabled/disabled content
 ui_when_enabled <- function(output_flag, enabled_ui, disabled_title, disabled_msg) {
   tagList(
+    # App loaded AND tab enabled
     conditionalPanel(
-      condition = sprintf("output.%s", output_flag),
+      condition = sprintf("output.app_loaded && output.%s", output_flag),
       enabled_ui
     ),
+    # App loaded AND tab explicitly disabled
     conditionalPanel(
-      condition = sprintf("!output.%s", output_flag),
-      h2(disabled_title),
-      p(disabled_msg, style = "color:#555; margin-top:0.75rem;")
+      condition = sprintf("output.app_loaded && !output.%s", output_flag),
+      tagList(
+        h2(disabled_title),
+        p(disabled_msg, style = "color:#555; margin-top:0.75rem;")
+      )
+    ),
+    # App not fully loaded yet
+    conditionalPanel(
+      condition = "!output.app_loaded",
+      tagList(
+        h2("Please wait while the payment app loads"),
+        p(
+          "If this message does not disappear after a few seconds, please refresh the page.",
+          style = "color:#555; margin-top:0.75rem;"
+        )
+      )
     )
   )
 }
-
-# =============================================================================
-# UI
-# =============================================================================
 
 sandbox_banner <- if (SQUARE_ENV == "sandbox") {
   div(
@@ -782,23 +866,8 @@ sandbox_banner <- if (SQUARE_ENV == "sandbox") {
   NULL
 }
 
-# JS + CSS
 js <- "
-Shiny.addCustomMessageHandler('redirectToSquare', function(message) {
-  if (!message) return;
-
-  var url      = message.url;
-  var buttonId = message.buttonId;
-
-  if (buttonId) {
-    var btn = document.getElementById(buttonId);
-    if (btn) {
-      btn.disabled = true;
-      btn.classList.add('disabled');
-      btn.innerText = 'Redirecting to secure payment...';
-    }
-  }
-
+Shiny.addCustomMessageHandler('redirectToSquare', function(url) {
   if (url && typeof url === 'string') {
     window.location.href = url;
   }
@@ -808,22 +877,17 @@ Shiny.addCustomMessageHandler('redirectToSquare', function(message) {
 base_head <- tags$head(
   tags$script(HTML(js)),
   tags$style(HTML("
-    /* Datepicker tweaks */
     .datepicker.dropdown-menu {
       font-size: 14px;
       padding: 4px;
       margin-top: 40px;
     }
-    .datepicker .datepicker-switch {
-      width: 190px;
-    }
+    .datepicker .datepicker-switch { width: 190px; }
 
-    /* Make the top nav tabs more obviously clickable */
     .navbar-default {
       background-color: #f8f8f8;
       border-bottom: 2px solid #ddd;
     }
-
     .navbar-nav > li > a {
       font-weight: 600;
       padding-top: 14px;
@@ -831,7 +895,6 @@ base_head <- tags$head(
       border-bottom: 3px solid transparent;
       cursor: pointer;
     }
-
     .navbar-nav > li > a:hover,
     .navbar-nav > .active > a,
     .navbar-nav > .active > a:focus,
@@ -839,31 +902,19 @@ base_head <- tags$head(
       border-bottom-color: #337ab7;
       background-color: #f5f5f5;
     }
-
     .navbar-brand {
       font-size: 16px;
       font-weight: 600;
     }
-
-    /* Mobile form tweaks */
-    @media (max-width: 768px) {
-      .shiny-input-container {
-        width: 100% !important;
-      }
-
-      .form-control,
-      .btn {
-        font-size: 16px;
-        padding: 10px 12px;
-      }
-
-      .container-fluid {
-        padding-left: 10px;
-        padding-right: 10px;
-      }
+    input[type='text'], input[type='number'], .form-control {
+      font-size: 14px;
     }
   "))
 )
+
+# -----------------------------------------------------------------------------
+# UI TABS
+# -----------------------------------------------------------------------------
 
 day_tab <- tabPanel(
   "DAY PASS",
@@ -879,11 +930,11 @@ day_tab <- tabPanel(
         "day_tab_enabled",
         tagList(
           h2("Day passes"),
-         p(
-  "Pay for your day passes here. At the kiosk or lodge, take a ticket from the box and write 'Paid online with your name' on the registration form. Keep your Square email receipt as proof of payment.",
-  style = "color:#555; margin-bottom:0.75rem;"
-),
-  uiOutput("price_line"),
+          p(
+            "Pay for your day passes here, then take a ticket from the box at the trailhead and write that you paid online with your name.",
+            style = "color:#555; margin-bottom:0.75rem;"
+          ),
+          uiOutput("price_line"),
           uiOutput("day_limits_text"),
           dateInput(
             "ski_date",
@@ -1022,15 +1073,14 @@ season_tab <- tabPanel(
         tagList(
           h2(textOutput("season_header")),
           p(
-            "Purchase adult, youth, or family season passes and register each pass holder by name and date of birth.",
+            "Purchase adult or youth season passes and register each pass holder by name and date of birth.",
             style = "color:#555; margin-bottom:0.75rem;"
           ),
           uiOutput("season_price_line"),
           uiOutput("season_limits_text"),
           h4("Number of season passes"),
-          numericInput("n_season_adult",  "Adult season passes",  value = 1, min = 0, max = 100, step = 1),
-          numericInput("n_season_youth",  "Youth season passes",  value = 0, min = 0, max = 100, step = 1),
-          numericInput("n_season_family", "Family season passes", value = 0, min = 0, max = 100, step = 1),
+          numericInput("n_season_adult",  "Adult season passes", value = 1, min = 0, max = 100, step = 1),
+          numericInput("n_season_youth",  "Youth season passes", value = 0, min = 0, max = 100, step = 1),
           uiOutput("season_holder_form"),
           tags$hr(),
           uiOutput("season_summary"),
@@ -1052,6 +1102,91 @@ season_tab <- tabPanel(
   )
 )
 
+programs_tab <- tabPanel(
+  "PROGRAMS",
+  fluidPage(
+    div(
+      style = "max-width: 750px; margin: 0 auto; padding: 1.5rem;",
+      sandbox_banner,
+      ui_when_enabled(
+        "programs_tab_enabled",
+        tagList(
+          h2("Programs"),
+          p(
+            "Register skiers for club programs. Age categories are based on age at December 31 of the ski season.",
+            style = "color:#555; margin-bottom:0.75rem;"
+          ),
+          uiOutput("programs_price_line"),
+          uiOutput("programs_limits_text"),
+          numericInput("n_program_participants",
+                       "Number of participants to register",
+                       value = 1, min = 0, max = 100, step = 1),
+          uiOutput("programs_holder_form"),
+          tags$hr(),
+          uiOutput("programs_summary"),
+          textInput("programs_name",  "Purchaser name (for records)"),
+          textInput("programs_email", "Purchaser email (for Square receipt)"),
+          tags$hr(),
+          actionButton(
+            "programs_pay",
+            "Pay for programs",
+            class = "btn btn-primary btn-lg btn-block"
+          ),
+          tags$br(),
+          uiOutput("programs_status")
+        ),
+        "Programs – not available",
+        "Online registration for programs is currently disabled. Please contact the club for details."
+      )
+    )
+  )
+)
+
+special_events_tab <- tabPanel(
+  "SPECIAL EVENTS",
+  fluidPage(
+    div(
+      style = "max-width: 650px; margin: 0 auto; padding: 1.5rem;",
+      sandbox_banner,
+      ui_when_enabled(
+        "special_tab_enabled",
+        tagList(
+          h2("Special events"),
+          p(
+            "Register and pay for special events organized by the club.",
+            style = "color:#555; margin-bottom:0.75rem;"
+          ),
+          selectInput(
+            "special_event_id",
+            "Choose event",
+            choices = c("No special events available" = "")
+          ),
+          uiOutput("special_event_details"),
+          numericInput(
+            "special_n_tickets",
+            "Number of entries",
+            value = 1, min = 0, max = 100, step = 1
+          ),
+          tags$hr(),
+          uiOutput("special_summary"),
+          textInput("special_name",  "Purchaser name (for records)"),
+          textInput("special_email", "Purchaser email (for Square receipt)"),
+          tags$hr(),
+          actionButton(
+            "special_pay",
+            "Pay for special event",
+            class = "btn btn-primary btn-lg btn-block"
+          ),
+          tags$br(),
+          uiOutput("special_status")
+        ),
+        "Special events – not available",
+        "There are currently no special events available for online registration."
+      )
+    )
+  )
+)
+
 admin_tab <- tabPanel(
   "ADMIN",
   fluidPage(
@@ -1060,7 +1195,7 @@ admin_tab <- tabPanel(
       sandbox_banner,
       h3("Bulkley Valley XC – Admin"),
       p(
-        "View pass logs, adjust prices and limits, manage blocked dates, and control which public tabs are live.",
+        "View logs, adjust prices and limits, manage blocked dates, special events, and control which public tabs are live.",
         style = "color:#555; margin-bottom:0.75rem;"
       ),
       h4("Admin access"),
@@ -1080,6 +1215,8 @@ ui_core <- navbarPage(
   christmas_tab,
   season_tab,
   donation_tab,
+  programs_tab,
+  special_events_tab,
   admin_tab
 )
 
@@ -1088,16 +1225,18 @@ app_ui <- tagList(
   ui_core
 )
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # SERVER
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 server <- function(input, output, session) {
 
-  # Unique ID for this admin/browser session (for logs)
+  # App loaded flag – used by ui_when_enabled to show a friendly loading message
+  output$app_loaded <- reactive({ TRUE })
+  outputOptions(output, "app_loaded", suspendWhenHidden = FALSE)
+
   admin_session_id <- uuid::UUIDgenerate()
 
-  # Simple client context for logging
   client_context <- reactive({
     list(
       host = session$clientData$url_hostname,
@@ -1106,13 +1245,8 @@ server <- function(input, output, session) {
     )
   })
 
-  # ---------------------------------------------------------------------------
-  # Config + flags + blocked dates
-  # ---------------------------------------------------------------------------
-
   config_initial <- load_config()
   config_rv <- do.call(reactiveValues, config_initial)
-
   get_cfg <- function() reactiveValuesToList(config_rv)
 
   blocked_dates <- reactiveVal(get_blocked_dates())
@@ -1122,14 +1256,17 @@ server <- function(input, output, session) {
     day       = isTRUE(flags_initial$day),
     christmas = isTRUE(flags_initial$christmas),
     season    = isTRUE(flags_initial$season),
-    donation  = isTRUE(flags_initial$donation)
+    donation  = isTRUE(flags_initial$donation),
+    programs  = isTRUE(flags_initial$programs),
+    special   = isTRUE(flags_initial$special)
   )
 
   admin_ok <- reactiveVal(FALSE)
 
-  # ---------------------------------------------------------------------------
-  # Admin rate limiter
-  # ---------------------------------------------------------------------------
+  # Special events cache
+  special_events_rv <- reactiveVal(load_special_events())
+
+  # --- admin rate limiter -----------------------------------------------------
 
   admin_rl <- reactiveValues(
     fail_times = as.POSIXct(character(0)),
@@ -1148,7 +1285,6 @@ server <- function(input, output, session) {
 
   output$admin_login_ui <- renderUI({
     locked <- isTRUE(admin_is_locked())
-
     tagList(
       passwordInput("admin_password", "Admin password"),
       if (locked) {
@@ -1170,18 +1306,16 @@ server <- function(input, output, session) {
 
     if (isTRUE(admin_is_locked())) {
       remaining <- ceiling(as.numeric(difftime(admin_rl$lock_until, now, units = "secs")))
-
       log_event(
         "admin_login_attempt",
         list(
-          status          = "blocked",
-          reason          = "lockout_active",
-          remaining_secs  = max(0, remaining),
-          admin_session   = admin_session_id,
-          client          = ctx
+          status         = "blocked",
+          reason         = "lockout_active",
+          remaining_secs = max(0, remaining),
+          admin_session  = admin_session_id,
+          client         = ctx
         )
       )
-
       output$admin_auth_message <- renderText(
         sprintf("Too many failed attempts. Try again in ~%d seconds.", max(0, remaining))
       )
@@ -1190,7 +1324,6 @@ server <- function(input, output, session) {
     }
 
     admin_rl$fail_times <- prune_fail_times(admin_rl$fail_times, now)
-
     err_msg <- NULL
     ok <- tryCatch(
       admin_password_matches(input$admin_password, ADMIN_PASSWORD),
@@ -1203,7 +1336,6 @@ server <- function(input, output, session) {
     if (!is.null(err_msg)) {
       admin_ok(FALSE)
       output$admin_auth_message <- renderText(err_msg)
-
       log_event(
         "admin_login_attempt",
         list(
@@ -1213,7 +1345,6 @@ server <- function(input, output, session) {
           client        = ctx
         )
       )
-
       return()
     }
 
@@ -1222,7 +1353,6 @@ server <- function(input, output, session) {
       admin_rl$fail_times <- as.POSIXct(character(0))
       admin_rl$lock_until <- as.POSIXct(NA)
       output$admin_auth_message <- renderText("Admin unlocked for this session.")
-
       log_event(
         "admin_login_attempt",
         list(
@@ -1231,21 +1361,18 @@ server <- function(input, output, session) {
           client        = ctx
         )
       )
-
       return()
     }
 
-    # Password incorrect
+    # wrong password
     admin_rl$fail_times <- c(admin_rl$fail_times, now)
     n_fails <- length(admin_rl$fail_times)
-
     if (n_fails >= CONST$admin_max_attempts) {
       admin_rl$lock_until <- now + CONST$admin_lock_secs
       admin_ok(FALSE)
       output$admin_auth_message <- renderText(
         "Too many failed attempts. Admin login is temporarily locked."
       )
-
       log_event(
         "admin_login_attempt",
         list(
@@ -1256,7 +1383,6 @@ server <- function(input, output, session) {
           client        = ctx
         )
       )
-
       return()
     }
 
@@ -1264,7 +1390,6 @@ server <- function(input, output, session) {
     output$admin_auth_message <- renderText(
       sprintf("Incorrect password. Attempt %d of %d.", n_fails, CONST$admin_max_attempts)
     )
-
     log_event(
       "admin_login_attempt",
       list(
@@ -1277,88 +1402,151 @@ server <- function(input, output, session) {
     )
   })
 
-  # ---------------------------------------------------------------------------
-  # Expose tab flags
-  # ---------------------------------------------------------------------------
+  # --- expose tab flags -------------------------------------------------------
 
   output$day_tab_enabled       <- reactive({ tab_flags$day })
   output$christmas_tab_enabled <- reactive({ tab_flags$christmas })
   output$season_tab_enabled    <- reactive({ tab_flags$season })
   output$donation_tab_enabled  <- reactive({ tab_flags$donation })
+  output$programs_tab_enabled  <- reactive({ tab_flags$programs })
+  output$special_tab_enabled   <- reactive({ tab_flags$special })
 
   outputOptions(output, "day_tab_enabled",       suspendWhenHidden = FALSE)
   outputOptions(output, "christmas_tab_enabled", suspendWhenHidden = FALSE)
   outputOptions(output, "season_tab_enabled",    suspendWhenHidden = FALSE)
   outputOptions(output, "donation_tab_enabled",  suspendWhenHidden = FALSE)
+  outputOptions(output, "programs_tab_enabled",  suspendWhenHidden = FALSE)
+  outputOptions(output, "special_tab_enabled",   suspendWhenHidden = FALSE)
 
-  # ---------------------------------------------------------------------------
-  # Season header
-  # ---------------------------------------------------------------------------
+  # --- season header ----------------------------------------------------------
 
   output$season_header <- renderText({
     paste("Season passes –", config_rv$season_label)
   })
 
-  # ---------------------------------------------------------------------------
-  # Centralized price/limits UI bindings
-  # ---------------------------------------------------------------------------
+  # --- early-bird reactive ----------------------------------------------------
 
-  ui_bindings <- list(
-    price_line            = function() ui_price_line_day(get_cfg()),
-    day_limits_text       = function() ui_limits_day(get_cfg()),
-    season_price_line     = function() ui_price_line_season(get_cfg()),
-    season_limits_text    = function() ui_limits_season(get_cfg()),
-    christmas_price_line  = function() ui_price_line_christmas(get_cfg()),
-    christmas_limits_text = function() ui_limits_christmas(get_cfg()),
-    donation_limits_text  = function() ui_limits_donation(get_cfg())
-  )
-
-  lapply(names(ui_bindings), function(id) {
-    output[[id]] <- renderUI(ui_bindings[[id]]())
+  is_early_bird <- reactive({
+    Sys.Date() <= EARLY_BIRD_CUTOFF
   })
 
-  # ---------------------------------------------------------------------------
-  # Querystring success popup (UI only)
-  # ---------------------------------------------------------------------------
+  # --- central UI bindings ----------------------------------------------------
+
+  output$price_line <- renderUI({ ui_price_line_day(get_cfg()) })
+  output$day_limits_text <- renderUI({ ui_limits_day(get_cfg()) })
+  output$season_limits_text <- renderUI({ ui_limits_season(get_cfg()) })
+  output$christmas_price_line <- renderUI({ ui_price_line_christmas(get_cfg()) })
+  output$christmas_limits_text <- renderUI({ ui_limits_christmas(get_cfg()) })
+  output$donation_limits_text <- renderUI({ ui_limits_donation(get_cfg()) })
+
+  output$season_price_line <- renderUI({
+    cfg <- get_cfg()
+    ui_price_line_season(cfg, early = is_early_bird())
+  })
+
+  output$programs_price_line <- renderUI({
+    cfg <- get_cfg()
+    early <- is_early_bird()
+    tagList(
+      h4(if (early) "Early-bird program prices" else "Regular program prices"),
+      tags$ul(
+        tags$li(sprintf("4–5 yrs: %s", fmt_cad_cents(if (early) cfg$price_program_4_5_early else cfg$price_program_4_5))),
+        tags$li(sprintf("6–10 yrs: %s", fmt_cad_cents(if (early) cfg$price_program_6_10_early else cfg$price_program_6_10))),
+        tags$li(sprintf("11–12 yrs: %s", fmt_cad_cents(if (early) cfg$price_program_11_12_early else cfg$price_program_11_12))),
+        tags$li(sprintf("13–14 yrs: %s", fmt_cad_cents(if (early) cfg$price_program_13_14_early else cfg$price_program_13_14))),
+        tags$li(sprintf("15–16 yrs: %s", fmt_cad_cents(if (early) cfg$price_program_15_16_early else cfg$price_program_15_16))),
+        tags$li(sprintf("17–18 yrs: %s", fmt_cad_cents(if (early) cfg$price_program_17_18_early else cfg$price_program_17_18))),
+        tags$li(sprintf("Masters: %s", fmt_cad_cents(if (early) cfg$price_program_masters_early else cfg$price_program_masters)))
+      )
+    )
+  })
+
+  output$programs_limits_text <- renderUI({
+    cfg <- get_cfg()
+    tags$p(
+      sprintf(
+        "Per transaction limits: up to %d participants and a maximum of %s total.",
+        as.integer(cfg$max_program_participants),
+        fmt_cad(cfg$max_program_amount)
+      ),
+      style = "font-size:0.9em; color:#666;"
+    )
+  })
+
+  # --- querystring success → payment check -----------------------------------
 
   observe({
     query <- shiny::getQueryString()
     if (isTRUE(query[["success"]] == "1")) {
-      showModal(
-        modalDialog(
-          title = "Payment return received",
-          "If your payment completed, you will receive a Square email receipt. Please keep it as proof of payment.",
-          easyClose = TRUE,
-          footer = NULL
-        )
+      con <- get_db_connection()
+      on.exit(dbDisconnect(con), add = TRUE)
+
+      pending <- dbGetQuery(
+        con,
+        "
+        SELECT id, square_order_id
+        FROM transactions
+        WHERE status IS NULL OR status = 'PENDING'
+        ORDER BY id DESC
+        LIMIT 1
+        "
       )
+
+      if (nrow(pending) == 0) {
+        showModal(
+          modalDialog(
+            title = "Payment return received",
+            "If your payment completed, you will receive a Square email receipt. If you do not see a receipt, please contact the club.",
+            easyClose = TRUE,
+            footer = NULL
+          )
+        )
+        return()
+      }
+
+      tx_id    <- pending$id[1]
+      order_id <- pending$square_order_id[1]
+      actual   <- check_square_payment_status(order_id)
+
+      if (actual == "PAID") {
+        dbExecute(con, "UPDATE transactions SET status = 'PAID' WHERE id = ?", params = list(tx_id))
+        showModal(
+          modalDialog(
+            title = "Payment confirmed",
+            "Thank you – your payment has been verified with Square and recorded as PAID.",
+            easyClose = TRUE,
+            footer = NULL
+          )
+        )
+      } else {
+        showModal(
+          modalDialog(
+            title = "Return from Square",
+            "We could not automatically confirm the payment. If you have a Square email receipt, your payment went through. The treasurer can reconcile PENDING transactions against Square as needed.",
+            easyClose = TRUE,
+            footer = NULL
+          )
+        )
+      }
     }
   })
 
-  # ---------------------------------------------------------------------------
-  # Generic enforce-max observer
-  # ---------------------------------------------------------------------------
+  # --- generic helpers --------------------------------------------------------
 
   enforce_max <- function(input_id, max_getter, msg_fmt) {
     observeEvent(input[[input_id]], ignoreInit = TRUE, {
       val  <- as_int0(input[[input_id]])
       maxv <- as.integer(max_getter())
-
       if (val > maxv) {
         updateNumericInput(session, input_id, value = maxv)
         showNotification(sprintf(msg_fmt, maxv), type = "error", duration = 4)
         return()
       }
-
       if (val < 0) {
         updateNumericInput(session, input_id, value = 0)
       }
     })
   }
-
-  # ---------------------------------------------------------------------------
-  # Shared helpers: checkout + tx write + redirect + error wrapper
-  # ---------------------------------------------------------------------------
 
   with_ui_error <- function(output_id, expr) {
     tryCatch(
@@ -1380,12 +1568,13 @@ server <- function(input, output, session) {
     )
   }
 
-  write_tx <- function(info_id, product_type, total_cents,
+  write_tx <- function(info_id, order_id, product_type, total_cents,
                        name, email,
                        ski_date = Sys.Date(),
                        adults = 0L, youths = 0L, under9 = 0L, families = 0L,
                        christmas_passes = 0L,
-                       donation_cents = 0L) {
+                       donation_cents = 0L,
+                       status = "PENDING") {
 
     row_df <- data.frame(
       created          = as.character(Sys.time()),
@@ -1401,28 +1590,24 @@ server <- function(input, output, session) {
       name             = sanitize_for_storage(name),
       email            = sanitize_for_storage(email),
       checkout_id      = info_id,
+      square_order_id  = sanitize_for_storage(order_id),
+      status           = status,
       stringsAsFactors = FALSE
     )
 
     save_transaction(row_df)
   }
 
-  redirect_square <- function(info_url, status_output_id, msg, button_id = NULL) {
-    session$sendCustomMessage(
-      "redirectToSquare",
-      list(
-        url      = info_url,
-        buttonId = button_id
-      )
-    )
+  redirect_square <- function(info_url, status_output_id, msg) {
+    session$sendCustomMessage("redirectToSquare", info_url)
     output[[status_output_id]] <- renderUI({
-      tags$p(msg, style = "margin-top: 1rem; font-style: italic;")
+      tags$p(msg, style = "margin-top: 1rem;")
     })
   }
 
-  # =============================================================================
+  # ============================================================================
   # DAY PASSES
-  # =============================================================================
+  # ============================================================================
 
   day_total <- reactive({
     adults   <- as_int0(input$n_adult)
@@ -1445,23 +1630,16 @@ server <- function(input, output, session) {
     )
   })
 
-  # Blocked-date UX strategy:
-  # - Show inline warning immediately.
-  # - If user selects a blocked date, show a modal and auto-advance to next valid date.
   output$ski_date_warning <- renderUI({
     d  <- as.Date(input$ski_date)
     bd <- blocked_dates()
-
     if (is.na(d) || length(bd) == 0) return(NULL)
-
     if (d %in% bd) {
       tags$p(
         "This date is blocked for online day-pass sales. Please choose another date.",
         style = "color:#b00; font-weight:600; margin-top: -6px;"
       )
-    } else {
-      NULL
-    }
+    } else NULL
   })
 
   output$day_name_hint <- renderUI({
@@ -1489,29 +1667,21 @@ server <- function(input, output, session) {
         sprintf("Total exceeds the %s day-pass limit.", fmt_cad(config_rv$max_day_amount)),
         style = "color:#b00; font-weight:600;"
       )
-    } else {
-      NULL
-    }
+    } else NULL
   })
 
   output$summary <- renderUI({
     t <- day_total()
-
     if (t$adults == 0 && t$youths == 0 && t$families == 0 && t$under9 == 0) {
       return(tags$p("No passes selected.", style = "font-weight: 600;"))
     }
 
-    name_val  <- trimws(input$name %||% "")
-    email_val <- trimws(input$email %||% "")
-
-    lines <- list(
-      tags$p(
-        sprintf(
-          "Adult: %d, Youth: %d, Under 9: %d, Family passes: %d",
-          t$adults, t$youths, t$under9, t$families
-        )
+    lines <- list(tags$p(
+      sprintf(
+        "Adult: %d, Youth: %d, Under 9: %d, Family passes: %d",
+        t$adults, t$youths, t$under9, t$families
       )
-    )
+    ))
 
     if (t$passes_cents > 0) {
       lines <- c(lines, list(
@@ -1525,34 +1695,12 @@ server <- function(input, output, session) {
         style = "font-weight: 700; font-size: 1.2rem;"
       )
     ))
-
-    if (nzchar(name_val) || nzchar(email_val)) {
-      lines <- c(
-        lines,
-        list(
-          tags$hr(),
-          tags$strong("Confirm contact details:"),
-          if (nzchar(name_val)) {
-            tags$p(sprintf("Name: %s", name_val))
-          } else {
-            NULL
-          },
-          if (nzchar(email_val)) {
-            tags$p(sprintf("Email: %s", email_val))
-          } else {
-            NULL
-          }
-        )
-      )
-    }
-
     do.call(tagList, lines)
   })
 
   observeEvent(input$ski_date, {
     ski_date <- as.Date(input$ski_date)
     if (is.na(ski_date)) return()
-
     today    <- Sys.Date()
     max_date <- today + CONST$max_ski_date_offset_days
 
@@ -1644,17 +1792,15 @@ server <- function(input, output, session) {
 
   observeEvent(input$pay, {
     with_ui_error("status", {
-
       if (!tab_flags$day) {
         output$status <- renderUI(tags$p("Day-pass payments are currently disabled.", style = "color:#b00;"))
         return()
       }
 
-      cfg <- get_cfg()
-      calc <- day_total()
-      d <- as.Date(input$ski_date)
-
-      today    <- Sys.Date()
+      cfg   <- get_cfg()
+      calc  <- day_total()
+      d     <- as.Date(input$ski_date)
+      today <- Sys.Date()
       max_date <- today + CONST$max_ski_date_offset_days
 
       validate_day_purchase(
@@ -1674,25 +1820,26 @@ server <- function(input, output, session) {
       )
 
       write_tx(
-        info_id = info$id,
+        info_id    = info$id,
+        order_id   = info$order_id,
         product_type = "day",
-        total_cents = calc$total_cents,
-        name = input$name,
-        email = input$email,
-        ski_date = d,
-        adults = calc$adults,
-        youths = calc$youths,
-        under9 = calc$under9,
-        families = calc$families
+        total_cents  = calc$total_cents,
+        name         = input$name,
+        email        = input$email,
+        ski_date     = d,
+        adults       = calc$adults,
+        youths       = calc$youths,
+        under9       = calc$under9,
+        families     = calc$families
       )
 
-      redirect_square(info$url, "status", "Redirecting to Square payment page...", "pay")
+      redirect_square(info$url, "status", "Redirecting to Square payment page...")
     })
   })
 
-  # =============================================================================
+  # ============================================================================
   # DONATIONS
-  # =============================================================================
+  # ============================================================================
 
   donation_only_total <- reactive({
     donation_dollars <- as_num0(input$donation_only_amount)
@@ -1705,43 +1852,17 @@ server <- function(input, output, session) {
 
   output$donation_only_summary <- renderUI({
     t <- donation_only_total()
-
     if (t$donation_cents <= 0) {
       return(tags$p("No donation amount entered.", style = "font-weight: 600;"))
     }
 
-    name_val  <- trimws(input$donation_only_name %||% "")
-    email_val <- trimws(input$donation_only_email %||% "")
-
-    lines <- list(
+    tagList(
       tags$p(sprintf("Donation amount: %s", fmt_cad(t$donation_dollars))),
       tags$p(
         sprintf("Total to pay: %s", fmt_cad(t$donation_dollars)),
         style = "font-weight: 700; font-size: 1.2rem;"
       )
     )
-
-    if (nzchar(name_val) || nzchar(email_val)) {
-      lines <- c(
-        lines,
-        list(
-          tags$hr(),
-          tags$strong("Confirm donor details:"),
-          if (nzchar(name_val)) {
-            tags$p(sprintf("Name: %s", name_val))
-          } else {
-            NULL
-          },
-          if (nzchar(email_val)) {
-            tags$p(sprintf("Email: %s", email_val))
-          } else {
-            NULL
-          }
-        )
-      )
-    }
-
-    do.call(tagList, lines)
   })
 
   observeEvent(input$donation_only_amount, ignoreInit = TRUE, {
@@ -1771,13 +1892,12 @@ server <- function(input, output, session) {
 
   observeEvent(input$donation_only_pay, {
     with_ui_error("donation_only_status", {
-
       if (!tab_flags$donation) {
         output$donation_only_status <- renderUI(tags$p("Online donations are currently disabled.", style = "color:#b00;"))
         return()
       }
 
-      cfg <- get_cfg()
+      cfg  <- get_cfg()
       calc <- donation_only_total()
 
       validate_donation_purchase(
@@ -1793,26 +1913,26 @@ server <- function(input, output, session) {
       )
 
       write_tx(
-        info_id = info$id,
-        product_type = "donation",
-        total_cents = calc$donation_cents,
-        name = input$donation_only_name,
-        email = input$donation_only_email,
+        info_id        = info$id,
+        order_id       = info$order_id,
+        product_type   = "donation",
+        total_cents    = calc$donation_cents,
+        name           = input$donation_only_name,
+        email          = input$donation_only_email,
         donation_cents = calc$donation_cents
       )
 
       redirect_square(
         info$url,
         "donation_only_status",
-        "Redirecting to Square payment page for donation...",
-        "donation_only_pay"
+        "Redirecting to Square payment page for donation..."
       )
     })
   })
 
-  # =============================================================================
+  # ============================================================================
   # CHRISTMAS PASSES
-  # =============================================================================
+  # ============================================================================
 
   christmas_total <- reactive({
     christmas <- as_int0(input$n_christmas)
@@ -1825,49 +1945,21 @@ server <- function(input, output, session) {
 
   output$christmas_summary <- renderUI({
     t <- christmas_total()
-
     if (t$christmas == 0) {
       return(tags$p("No Christmas passes selected.", style = "font-weight: 600;"))
     }
-
-    name_val  <- trimws(input$christmas_name %||% "")
-    email_val <- trimws(input$christmas_email %||% "")
-
-    lines <- list(
+    tagList(
       tags$p(sprintf("Christmas 2-week passes: %d", t$christmas)),
       tags$p(
         sprintf("Total for Christmas passes: %s", fmt_cad_cents(t$total_cents)),
         style = "font-weight: 700; font-size: 1.2rem;"
       )
     )
-
-    if (nzchar(name_val) || nzchar(email_val)) {
-      lines <- c(
-        lines,
-        list(
-          tags$hr(),
-          tags$strong("Confirm purchaser details:"),
-          if (nzchar(name_val)) {
-            tags$p(sprintf("Name: %s", name_val))
-          } else {
-            NULL
-          },
-          if (nzchar(email_val)) {
-            tags$p(sprintf("Email: %s", email_val))
-          } else {
-            NULL
-          }
-        )
-      )
-    }
-
-    do.call(tagList, lines)
   })
 
   output$christmas_holder_form <- renderUI({
     n <- as_int0(input$n_christmas)
     if (n <= 0L) return(NULL)
-
     tagList(
       h4("Pass holder details"),
       lapply(seq_len(n), function(i) {
@@ -1905,7 +1997,6 @@ server <- function(input, output, session) {
 
   observeEvent(input$christmas_pay, {
     with_ui_error("christmas_status", {
-
       if (!tab_flags$christmas) {
         output$christmas_status <- renderUI(tags$p("Christmas pass payments are currently disabled.", style = "color:#b00;"))
         return()
@@ -1913,7 +2004,6 @@ server <- function(input, output, session) {
 
       cfg  <- get_cfg()
       calc <- christmas_total()
-
       n_passes <- calc$christmas
 
       holder_names <- if (n_passes > 0L) {
@@ -1927,16 +2017,16 @@ server <- function(input, output, session) {
       christmas_start <- as.Date(input$christmas_start)
 
       validate_christmas_purchase(
-        calc = calc,
-        holder_names = holder_names,
-        start_date = christmas_start,
-        purchaser_name = input$christmas_name,
-        purchaser_email = input$christmas_email,
-        cfg = cfg
+        calc             = calc,
+        holder_names     = holder_names,
+        start_date       = christmas_start,
+        purchaser_name   = input$christmas_name,
+        purchaser_email  = input$christmas_email,
+        cfg              = cfg
       )
 
       year          <- as.integer(format(christmas_start, "%Y"))
-      christmas_day <- as.Date(paste0(year, "-12-25"))
+      christmas_day <- as.Date(sprintf("%d-12-25", year))
       period_end    <- christmas_start + 13
 
       if (!(christmas_start <= christmas_day && christmas_day <= period_end)) {
@@ -1954,12 +2044,13 @@ server <- function(input, output, session) {
       )
 
       write_tx(
-        info_id = info$id,
-        product_type = "christmas",
-        total_cents = calc$total_cents,
-        name = input$christmas_name,
-        email = input$christmas_email,
-        christmas_passes = calc$christmas
+        info_id         = info$id,
+        order_id        = info$order_id,
+        product_type    = "christmas",
+        total_cents     = calc$total_cents,
+        name            = input$christmas_name,
+        email           = input$christmas_email,
+        christmas_passes= calc$christmas
       )
 
       if (length(holder_names) > 0L) {
@@ -1975,32 +2066,28 @@ server <- function(input, output, session) {
         append_registrations(regs_df)
       }
 
-      redirect_square(
-        info$url,
-        "christmas_status",
-        "Redirecting to Square payment page for Christmas passes...",
-        "christmas_pay"
-      )
+      redirect_square(info$url, "christmas_status",
+                      "Redirecting to Square payment page for Christmas passes...")
     })
   })
 
-  # =============================================================================
-  # SEASON PASSES
-  # =============================================================================
+  # ============================================================================
+  # SEASON PASSES (NO FAMILY SEASON)
+  # ============================================================================
 
   season_total <- reactive({
-    adults   <- as_int0(input$n_season_adult)
-    youths   <- as_int0(input$n_season_youth)
-    families <- as_int0(input$n_season_family)
+    adults <- as_int0(input$n_season_adult)
+    youths <- as_int0(input$n_season_youth)
+    cfg    <- get_cfg()
 
-    passes_cents <- adults   * config_rv$price_season_adult +
-      youths   * config_rv$price_season_youth +
-      families * config_rv$price_season_family
+    price_adult <- if (is_early_bird()) cfg$price_season_adult_early else cfg$price_season_adult
+    price_youth <- if (is_early_bird()) cfg$price_season_youth_early else cfg$price_season_youth
+
+    passes_cents <- adults * price_adult + youths * price_youth
 
     list(
       adults       = adults,
       youths       = youths,
-      families     = families,
       passes_cents = passes_cents
     )
   })
@@ -2008,9 +2095,7 @@ server <- function(input, output, session) {
   output$season_holder_form <- renderUI({
     na <- as_int0(input$n_season_adult)
     ny <- as_int0(input$n_season_youth)
-    nf <- as_int0(input$n_season_family)
-
-    if (na <= 0L && ny <= 0L && nf <= 0L) return(NULL)
+    if (na <= 0L && ny <= 0L) return(NULL)
 
     out <- list(h4("Season pass holder details"))
 
@@ -2056,45 +2141,20 @@ server <- function(input, output, session) {
       ))
     }
 
-    if (nf > 0L) {
-      out <- c(out, list(
-        h5("Family passes"),
-        lapply(seq_len(nf), function(i) {
-          tagList(
-            textInput(
-              paste0("season_family_name_", i),
-              paste("Family pass", i, "- family / household name")
-            ),
-            dateInput(
-              paste0("season_family_dob_", i),
-              "Date of birth (main holder)",
-              value  = NULL,
-              format = "yyyy-mm-dd"
-            ),
-            tags$hr()
-          )
-        })
-      ))
-    }
-
     do.call(tagList, out)
   })
 
   output$season_summary <- renderUI({
     calc <- season_total()
-
-    if (calc$adults == 0 && calc$youths == 0 && calc$families == 0) {
+    if (calc$adults == 0 && calc$youths == 0) {
       return(tags$p("No season passes selected.", style = "font-weight: 600;"))
     }
 
-    name_val  <- trimws(input$season_name %||% "")
-    email_val <- trimws(input$season_email %||% "")
-
-    lines <- list(
+    tagList(
       tags$p(
         sprintf(
-          "Adult season: %d, Youth season: %d, Family season: %d",
-          calc$adults, calc$youths, calc$families
+          "Adult season: %d, Youth season: %d",
+          calc$adults, calc$youths
         )
       ),
       tags$p(
@@ -2102,39 +2162,15 @@ server <- function(input, output, session) {
         style = "font-weight: 700; font-size: 1.2rem;"
       )
     )
-
-    if (nzchar(name_val) || nzchar(email_val)) {
-      lines <- c(
-        lines,
-        list(
-          tags$hr(),
-          tags$strong("Confirm purchaser details:"),
-          if (nzchar(name_val)) {
-            tags$p(sprintf("Name: %s", name_val))
-          } else {
-            NULL
-          },
-          if (nzchar(email_val)) {
-            tags$p(sprintf("Email: %s", email_val))
-          } else {
-            NULL
-          }
-        )
-      )
-    }
-
-    do.call(tagList, lines)
   })
 
   enforce_max("n_season_adult",  function() config_rv$max_season_adult,
               "Maximum %d adult season passes per transaction.")
   enforce_max("n_season_youth",  function() config_rv$max_season_youth,
               "Maximum %d youth season passes per transaction.")
-  enforce_max("n_season_family", function() config_rv$max_season_family,
-              "Maximum %d family season passes per transaction.")
 
-  validate_season_purchase <- function(calc, adult_names, youth_names, family_names,
-                                       adult_dobs, youth_dobs, family_dobs,
+  validate_season_purchase <- function(calc, adult_names, youth_names,
+                                       adult_dobs, youth_dobs,
                                        purchaser_name, purchaser_email, cfg) {
 
     ref_date   <- Sys.Date()
@@ -2143,29 +2179,23 @@ server <- function(input, output, session) {
 
     invalid_youth <- length(youth_ages) > 0 &&
       any(youth_ages < CONST$youth_min_age | youth_ages > CONST$youth_max_age, na.rm = TRUE)
-
     invalid_adult <- length(adult_ages) > 0 &&
       any(adult_ages < CONST$adult_min_age, na.rm = TRUE)
 
     validate(
-      need(calc$adults > 0 || calc$youths > 0 || calc$families > 0, "Please select at least one season pass."),
+      need(calc$adults > 0 || calc$youths > 0, "Please select at least one season pass."),
       need(nchar(trimws(purchaser_name))  > 0, "Please enter a name."),
       need(is_valid_email(purchaser_email), "Please enter a valid email address."),
       need(calc$adults <= cfg$max_season_adult,
            sprintf("Maximum %d adult season passes per transaction.", as.integer(cfg$max_season_adult))),
       need(calc$youths <= cfg$max_season_youth,
            sprintf("Maximum %d youth season passes per transaction.", as.integer(cfg$max_season_youth))),
-      need(calc$families <= cfg$max_season_family,
-           sprintf("Maximum %d family season passes per transaction.", as.integer(cfg$max_season_family))),
       need(all(nzchar(adult_names)),  "Please enter a name for each adult season pass."),
       need(all(nzchar(youth_names)),  "Please enter a name for each youth season pass."),
-      need(all(nzchar(family_names)), "Please enter a name for each family season pass."),
       need(length(adult_dobs)  == 0 || all(!is.na(adult_dobs)),
            "Please enter a date of birth for each adult season pass holder."),
       need(length(youth_dobs)  == 0 || all(!is.na(youth_dobs)),
            "Please enter a date of birth for each youth season pass holder."),
-      need(length(family_dobs) == 0 || all(!is.na(family_dobs)),
-           "Please enter a date of birth for each family season pass holder (main holder)."),
       need(!invalid_youth,
            sprintf("One or more youth season passes have a DOB outside the youth age range (%d–%d).",
                    CONST$youth_min_age, CONST$youth_max_age)),
@@ -2181,7 +2211,6 @@ server <- function(input, output, session) {
 
   observeEvent(input$season_pay, {
     with_ui_error("season_status", {
-
       if (!tab_flags$season) {
         output$season_status <- renderUI(tags$p("Season pass payments are currently disabled.", style = "color:#b00;"))
         return()
@@ -2189,10 +2218,8 @@ server <- function(input, output, session) {
 
       cfg  <- get_cfg()
       calc <- season_total()
-
       na <- calc$adults
       ny <- calc$youths
-      nf <- calc$families
 
       adult_names <- if (na > 0L) vapply(
         seq_len(na),
@@ -2203,12 +2230,6 @@ server <- function(input, output, session) {
       youth_names <- if (ny > 0L) vapply(
         seq_len(ny),
         function(i) sanitize_for_storage(input[[paste0("season_youth_name_", i)]] %||% ""),
-        FUN.VALUE = character(1)
-      ) else character(0)
-
-      family_names <- if (nf > 0L) vapply(
-        seq_len(nf),
-        function(i) sanitize_for_storage(input[[paste0("season_family_name_", i)]] %||% ""),
         FUN.VALUE = character(1)
       ) else character(0)
 
@@ -2224,23 +2245,15 @@ server <- function(input, output, session) {
         FUN.VALUE = as.Date(NA)
       ) else as.Date(character(0))
 
-      family_dobs <- if (nf > 0L) vapply(
-        seq_len(nf),
-        function(i) as.Date(input[[paste0("season_family_dob_", i)]]),
-        FUN.VALUE = as.Date(NA)
-      ) else as.Date(character(0))
-
       validate_season_purchase(
-        calc = calc,
-        adult_names = adult_names,
-        youth_names = youth_names,
-        family_names = family_names,
-        adult_dobs = adult_dobs,
-        youth_dobs = youth_dobs,
-        family_dobs = family_dobs,
+        calc           = calc,
+        adult_names    = adult_names,
+        youth_names    = youth_names,
+        adult_dobs     = adult_dobs,
+        youth_dobs     = youth_dobs,
         purchaser_name = input$season_name,
-        purchaser_email = input$season_email,
-        cfg = cfg
+        purchaser_email= input$season_email,
+        cfg            = cfg
       )
 
       info <- safe_checkout(
@@ -2249,14 +2262,15 @@ server <- function(input, output, session) {
       )
 
       write_tx(
-        info_id = info$id,
+        info_id      = info$id,
+        order_id     = info$order_id,
         product_type = "season",
-        total_cents = calc$passes_cents,
-        name = input$season_name,
-        email = input$season_email,
-        adults = na,
-        youths = ny,
-        families = nf
+        total_cents  = calc$passes_cents,
+        name         = input$season_name,
+        email        = input$season_email,
+        adults       = na,
+        youths       = ny,
+        families     = 0L
       )
 
       regs_rows <- list()
@@ -2285,45 +2299,396 @@ server <- function(input, output, session) {
         )
       }
 
-      if (length(family_names) > 0L) {
-        regs_rows[[length(regs_rows) + 1]] <- data.frame(
-          checkout_id  = info$id,
-          product_type = "season",
-          holder_name  = family_names,
-          holder_type  = "family",
-          holder_dob   = as.character(family_dobs),
-          notes        = "",
-          stringsAsFactors = FALSE
-        )
-      }
-
       if (length(regs_rows) > 0L) {
         append_registrations(do.call(rbind, regs_rows))
       }
 
+      redirect_square(info$url, "season_status",
+                      "Redirecting to Square payment page for season passes...")
+    })
+  })
+
+  # ============================================================================
+  # PROGRAMS
+  # ============================================================================
+
+  program_ref_date <- reactive({
+    label <- config_rv$season_label %||% ""
+    m <- regexpr("\\d{4}", label)
+    year <- if (m[1] > 0) {
+      as.integer(substr(label, m[1], m[1] + 3))
+    } else {
+      as.integer(format(Sys.Date(), "%Y"))
+    }
+    as.Date(sprintf("%d-12-31", year))
+  })
+
+  output$programs_holder_form <- renderUI({
+    n <- as_int0(input$n_program_participants)
+    if (n <= 0L) return(NULL)
+
+    tagList(
+      h4("Program participants"),
+      lapply(seq_len(n), function(i) {
+        tagList(
+          h5(paste("Participant", i)),
+          textInput(
+            paste0("program_name_", i),
+            "Full name"
+          ),
+          dateInput(
+            paste0("program_dob_", i),
+            "Date of birth",
+            value  = NULL,
+            format = "yyyy-mm-dd"
+          ),
+          textInput(
+            paste0("program_notes_", i),
+            "Notes (optional)"
+          ),
+          tags$hr()
+        )
+      })
+    )
+  })
+
+  programs_total <- reactive({
+    n <- as_int0(input$n_program_participants)
+    cfg <- get_cfg()
+    if (n <= 0L) {
+      return(list(
+        total_cents = 0L,
+        groups = character(0),
+        ages   = integer(0),
+        names  = character(0)
+      ))
+    }
+
+    ref_date <- program_ref_date()
+    early <- is_early_bird()
+
+    ages <- vapply(
+      seq_len(n),
+      function(i) {
+        dob <- as.Date(input[[paste0("program_dob_", i)]])
+        if (is.na(dob)) NA_integer_ else compute_age_years(dob, ref_date)
+      },
+      integer(1)
+    )
+
+    groups <- vapply(
+      ages,
+      program_group_for_age,
+      FUN.VALUE = character(1)
+    )
+
+    invalid <- is.na(groups)
+    if (any(invalid)) {
+      return(list(
+        total_cents = NA_integer_,
+        groups      = groups,
+        ages        = ages,
+        names       = vapply(seq_len(n),
+                             function(i) sanitize_for_storage(input[[paste0("program_name_", i)]] %||% ""),
+                             FUN.VALUE = character(1)),
+        invalid     = TRUE
+      ))
+    }
+
+    get_price_for_group <- function(g) {
+      key <- if (early) {
+        paste0("price_program_", g, "_early")
+      } else {
+        paste0("price_program_", g)
+      }
+      cfg[[key]]
+    }
+
+    prices <- vapply(groups, get_price_for_group, integer(1))
+    total_cents <- sum(as.integer(prices), na.rm = TRUE)
+
+    list(
+      total_cents = total_cents,
+      groups      = groups,
+      ages        = ages,
+      names       = vapply(seq_len(n),
+                           function(i) sanitize_for_storage(input[[paste0("program_name_", i)]] %||% ""),
+                           FUN.VALUE = character(1)),
+      invalid     = FALSE
+    )
+  })
+
+  output$programs_summary <- renderUI({
+    res <- programs_total()
+    n <- as_int0(input$n_program_participants)
+    if (n <= 0L) {
+      return(tags$p("No program participants entered.", style = "font-weight: 600;"))
+    }
+
+    if (isTRUE(res$invalid) || is.na(res$total_cents)) {
+      return(tags$p(
+        "One or more participants are missing a DOB or are outside the supported age range (minimum 4 years).",
+        style = "color:#b00; font-weight:600;"
+      ))
+    }
+
+    groups <- res$groups
+    counts <- table(groups)
+    lines <- list(
+      tags$p("Assigned program categories (based on age at Dec 31):"),
+      tags$ul(
+        lapply(names(counts), function(g) {
+          age_label <- switch(
+            g,
+            "4_5"     = "4–5 yrs",
+            "6_10"    = "6–10 yrs",
+            "11_12"   = "11–12 yrs",
+            "13_14"   = "13–14 yrs",
+            "15_16"   = "15–16 yrs",
+            "17_18"   = "17–18 yrs",
+            "masters" = "Masters",
+            g
+          )
+          tags$li(sprintf("%s: %d", age_label, as.integer(counts[[g]])))
+        })
+      ),
+      tags$p(
+        sprintf("Total for programs: %s", fmt_cad_cents(res$total_cents)),
+        style = "font-weight:700; font-size:1.2rem;"
+      )
+    )
+    do.call(tagList, lines)
+  })
+
+  validate_programs_purchase <- function(res, purchaser_name, purchaser_email, cfg) {
+    n <- length(res$groups)
+    validate(
+      need(n > 0, "Please add at least one participant."),
+      need(!isTRUE(res$invalid) && !is.na(res$total_cents),
+           "Please check DOBs – all participants must be at least 4 years old with valid dates."),
+      need(all(nzchar(res$names)), "Please enter a name for each participant."),
+      need(nchar(trimws(purchaser_name)) > 0, "Please enter a purchaser name."),
+      need(is_valid_email(purchaser_email), "Please enter a valid email address."),
+      need(n <= cfg$max_program_participants,
+           sprintf("Maximum %d program participants per transaction.", as.integer(cfg$max_program_participants))),
+      need(res$total_cents <= cfg$max_program_amount * 100,
+           sprintf("Program transactions are limited to %s per purchase.", fmt_cad(cfg$max_program_amount)))
+    )
+  }
+
+  observeEvent(input$programs_pay, {
+    with_ui_error("programs_status", {
+      if (!tab_flags$programs) {
+        output$programs_status <- renderUI(tags$p("Programs payments are currently disabled.", style = "color:#b00;"))
+        return()
+      }
+
+      cfg <- get_cfg()
+      res <- programs_total()
+      validate_programs_purchase(
+        res             = res,
+        purchaser_name  = input$programs_name,
+        purchaser_email = input$programs_email,
+        cfg             = cfg
+      )
+
+      info <- safe_checkout(
+        total_cents = res$total_cents,
+        item_name   = "Bulkley Valley XC programs"
+      )
+
+      write_tx(
+        info_id      = info$id,
+        order_id     = info$order_id,
+        product_type = "programs",
+        total_cents  = res$total_cents,
+        name         = input$programs_name,
+        email        = input$programs_email
+      )
+
+      n <- length(res$groups)
+      if (n > 0) {
+        regs_df <- data.frame(
+          checkout_id  = rep(info$id, n),
+          product_type = rep("programs", n),
+          holder_name  = res$names,
+          holder_type  = paste0("program_", res$groups),
+          holder_dob   = vapply(
+            seq_len(n),
+            function(i) as.character(as.Date(input[[paste0("program_dob_", i)]])),
+            FUN.VALUE = character(1)
+          ),
+          notes        = vapply(
+            seq_len(n),
+            function(i) sanitize_for_storage(input[[paste0("program_notes_", i)]] %||% ""),
+            FUN.VALUE = character(1)
+          ),
+          stringsAsFactors = FALSE
+        )
+        append_registrations(regs_df)
+      }
+
+      redirect_square(info$url, "programs_status",
+                      "Redirecting to Square payment page for programs...")
+    })
+  })
+
+  # ============================================================================
+  # SPECIAL EVENTS
+  # ============================================================================
+
+  # Update dropdown choices when special_events_rv changes
+  observe({
+    df <- special_events_rv()
+    if (!is.data.frame(df) || nrow(df) == 0) {
+      updateSelectInput(
+        session,
+        "special_event_id",
+        choices = c("No special events available" = "")
+      )
+      return()
+    }
+
+    labels <- paste0(df$name, " (", df$event_date, ")")
+    choices <- setNames(as.character(df$id), labels)
+
+    updateSelectInput(
+      session,
+      "special_event_id",
+      choices = choices
+    )
+  })
+
+  special_selected <- reactive({
+    df <- special_events_rv()
+    if (!is.data.frame(df) || nrow(df) == 0) return(NULL)
+    id_raw <- input$special_event_id
+    if (is.null(id_raw) || id_raw == "") return(NULL)
+    id <- as_int0(id_raw)
+    ev <- df[df$id == id, , drop = FALSE]
+    if (nrow(ev) == 0) return(NULL)
+    ev
+  })
+
+  output$special_event_details <- renderUI({
+    ev <- special_selected()
+    if (is.null(ev)) {
+      return(tags$p("No special event selected.", style = "color:#555; font-style:italic;"))
+    }
+    tagList(
+      tags$p(strong(ev$name)),
+      tags$p(sprintf("Event date: %s", ev$event_date)),
+      tags$p(sprintf("Price per entry: %s", fmt_cad_cents(ev$price_cents))),
+      tags$p(
+        sprintf(
+          "Per transaction: up to %d entries and a maximum of %s.",
+          as_int0(ev$max_tickets_per_tx),
+          fmt_cad(as_num0(ev$max_amount_dollars))
+        ),
+        style = "font-size:0.9em; color:#666;"
+      )
+    )
+  })
+
+  special_total <- reactive({
+    ev <- special_selected()
+    n  <- as_int0(input$special_n_tickets)
+    if (is.null(ev) || n <= 0) {
+      return(list(valid = FALSE, total_cents = 0L, n = n, ev = ev))
+    }
+    total_cents <- n * as_int0(ev$price_cents[1])
+    list(valid = TRUE, total_cents = total_cents, n = n, ev = ev)
+  })
+
+  output$special_summary <- renderUI({
+    res <- special_total()
+    if (!res$valid || is.null(res$ev)) {
+      return(tags$p("No entries selected.", style = "font-weight: 600;"))
+    }
+    ev <- res$ev
+    tagList(
+      tags$p(sprintf("Event: %s", ev$name)),
+      tags$p(sprintf("Entries: %d", res$n)),
+      tags$p(
+        sprintf("Total to pay: %s", fmt_cad_cents(res$total_cents)),
+        style = "font-weight: 700; font-size: 1.2rem;"
+      )
+    )
+  })
+
+  validate_special_purchase <- function(res, purchaser_name, purchaser_email) {
+    ev <- res$ev
+    validate(
+      need(res$valid && !is.null(ev), "Please select an event and at least one entry."),
+      need(nchar(trimws(purchaser_name)) > 0, "Please enter a purchaser name."),
+      need(is_valid_email(purchaser_email), "Please enter a valid email address.")
+    )
+
+    max_t <- as_int0(ev$max_tickets_per_tx[1])
+    max_a <- as_num0(ev$max_amount_dollars[1])
+
+    if (res$n > max_t) {
+      stop(sprintf("Maximum %d entries per transaction for this event.", max_t))
+    }
+    if (res$total_cents > max_a * 100) {
+      stop(sprintf("This event is limited to %s per transaction.", fmt_cad(max_a)))
+    }
+  }
+
+  observeEvent(input$special_pay, {
+    with_ui_error("special_status", {
+      if (!tab_flags$special) {
+        output$special_status <- renderUI(
+          tags$p("Special events payments are currently disabled.", style = "color:#b00;")
+        )
+        return()
+      }
+
+      res <- special_total()
+      validate_special_purchase(
+        res             = res,
+        purchaser_name  = input$special_name,
+        purchaser_email = input$special_email
+      )
+
+      ev <- res$ev
+      item_name <- paste("Bulkley Valley XC special event –", ev$name[1])
+
+      info <- safe_checkout(
+        total_cents = res$total_cents,
+        item_name   = item_name
+      )
+
+      # Use event date as ski_date for reporting
+      event_date <- as.Date(ev$event_date[1])
+
+      write_tx(
+        info_id      = info$id,
+        order_id     = info$order_id,
+        product_type = "special_event",
+        total_cents  = res$total_cents,
+        name         = input$special_name,
+        email        = input$special_email,
+        ski_date     = event_date
+      )
+
       redirect_square(
         info$url,
-        "season_status",
-        "Redirecting to Square payment page for season passes...",
-        "season_pay"
+        "special_status",
+        "Redirecting to Square payment page for special event..."
       )
     })
   })
 
-  # =============================================================================
+  # ============================================================================
   # ADMIN: REPORTS + SETTINGS
-  # =============================================================================
+  # ============================================================================
 
   filtered_log <- reactive({
-    # If admin is not authenticated, return an empty data frame
-    if (!isTRUE(admin_ok())) {
-      return(data.frame())
-    }
+    if (!isTRUE(admin_ok())) return(data.frame())
 
     df <- load_transactions()
-    if (!is.data.frame(df) || nrow(df) == 0) {
-      return(data.frame())
-    }
+    if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
 
     if (!is.null(input$admin_daterange) && length(input$admin_daterange) == 2) {
       start_date <- as.Date(input$admin_daterange[1])
@@ -2336,18 +2701,6 @@ server <- function(input, output, session) {
 
     if (!is.null(input$admin_product_filter) && input$admin_product_filter != "Any") {
       df <- df[df$product_type == input$admin_product_filter, , drop = FALSE]
-    }
-
-    if (!is.null(input$admin_email_filter)) {
-      email_filter <- trimws(input$admin_email_filter)
-      if (nzchar(email_filter)) {
-        df <- df[
-          !is.na(df$email) &
-            grepl(email_filter, df$email, ignore.case = TRUE),
-          ,
-          drop = FALSE
-        ]
-      }
     }
 
     df[order(df$created, decreasing = TRUE), , drop = FALSE]
@@ -2363,7 +2716,6 @@ server <- function(input, output, session) {
   })
 
   output$admin_table <- renderTable({
-    # If admin not logged in, show nothing
     if (!isTRUE(admin_ok())) return(NULL)
 
     df <- filtered_log()
@@ -2380,7 +2732,8 @@ server <- function(input, output, session) {
       "product_type",
       "adults", "youths", "under9", "families", "christmas_passes",
       "total_dollars", "donation_dollars",
-      "name", "email", "checkout_id"
+      "status",
+      "name", "email", "checkout_id", "square_order_id"
     )]
   })
 
@@ -2460,7 +2813,6 @@ server <- function(input, output, session) {
 
     agg$total_amount    <- agg$total_cents    / 100
     agg$total_donations <- agg$donation_cents / 100
-
     agg$ski_date <- as.character(agg$ski_date)
 
     agg[, c("ski_date",
@@ -2496,9 +2848,7 @@ server <- function(input, output, session) {
     }
   )
 
-  # ---------------------------------------------------------------------------
-  # Blocked dates display + controls
-  # ---------------------------------------------------------------------------
+  # --- blocked dates ----------------------------------------------------------
 
   output$blocked_dates_table <- renderTable({
     req(admin_ok())
@@ -2523,10 +2873,8 @@ server <- function(input, output, session) {
     req(admin_ok())
     d <- as.Date(input$admin_block_date)
     if (is.na(d)) return()
-
     bd <- blocked_dates()
     if (d %in% bd) return()
-
     new_bd <- sort(unique(c(bd, d)))
     blocked_dates(new_bd)
     set_blocked_dates(new_bd)
@@ -2536,18 +2884,68 @@ server <- function(input, output, session) {
     req(admin_ok())
     d_str <- input$blocked_date_to_remove
     if (is.null(d_str) || d_str == "") return()
-
     d  <- as.Date(d_str)
     bd <- blocked_dates()
-
     new_bd <- bd[bd != d]
     blocked_dates(new_bd)
     set_blocked_dates(new_bd)
   })
 
-  # ---------------------------------------------------------------------------
-  # Admin body UI
-  # ---------------------------------------------------------------------------
+  # --- Admin: special events table + add --------------------------------------
+
+  output$special_events_admin_table <- renderTable({
+    req(admin_ok())
+    df <- special_events_rv()
+    if (!is.data.frame(df) || nrow(df) == 0) return(NULL)
+    df
+  })
+
+  observeEvent(input$special_add_event, {
+    req(admin_ok())
+
+    name  <- trimws(input$special_name_new %||% "")
+    date  <- as.Date(input$special_date_new)
+    price <- as_num0(input$special_price_new)
+    max_t <- as_int0(input$special_max_tickets_new)
+    max_a <- as_num0(input$special_max_amount_new)
+
+    validate(
+      need(nzchar(name), "Please enter an event name."),
+      need(!is.na(date), "Please choose an event date."),
+      need(!is.na(price) && price >= 0, "Price cannot be negative."),
+      need(max_t > 0, "Max entries per transaction must be at least 1."),
+      need(!is.na(max_a) && max_a >= 0, "Max amount per transaction cannot be negative.")
+    )
+
+    con <- get_db_connection()
+    on.exit(dbDisconnect(con), add = TRUE)
+    dbWriteTable(
+      con,
+      "special_events",
+      data.frame(
+        name               = sanitize_for_storage(name),
+        event_date         = as.character(date),
+        price_cents        = to_cents(price),
+        max_tickets_per_tx = as.integer(max_t),
+        max_amount_dollars = max_a,
+        stringsAsFactors   = FALSE
+      ),
+      append = TRUE
+    )
+
+    special_events_rv(load_special_events())
+
+    showModal(
+      modalDialog(
+        title = "Special event added",
+        "The event has been added and is available in the SPECIAL EVENTS tab.",
+        easyClose = TRUE,
+        footer = NULL
+      )
+    )
+  })
+
+  # --- admin body -------------------------------------------------------------
 
   output$admin_body <- renderUI({
     if (!admin_ok()) return(NULL)
@@ -2573,13 +2971,8 @@ server <- function(input, output, session) {
             selectInput(
               "admin_product_filter",
               "Product type",
-              choices  = c("Any", "day", "season", "christmas", "donation"),
+              choices  = c("Any", "day", "season", "christmas", "donation", "programs", "special_event"),
               selected = "Any"
-            ),
-            textInput(
-              "admin_email_filter",
-              "Filter by purchaser email (optional)",
-              value = ""
             )
           )
         ),
@@ -2620,18 +3013,75 @@ server <- function(input, output, session) {
 
         tags$hr(),
         h4("Season / Christmas prices (CAD)"),
+        p(sprintf("Early-bird cutoff: %s (hard-coded)", format(EARLY_BIRD_CUTOFF, "%Y-%m-%d"))),
         fluidRow(
-          column(3, numericInput("season_price_adult",     "Adult season ($)",     value = to_dollars(config_rv$price_season_adult),   min = 0, step = 1)),
-          column(3, numericInput("season_price_youth",     "Youth season ($)",     value = to_dollars(config_rv$price_season_youth),   min = 0, step = 1)),
-          column(3, numericInput("season_price_family",    "Family season ($)",    value = to_dollars(config_rv$price_season_family),  min = 0, step = 1)),
-          column(3, numericInput("season_price_christmas", "Christmas 2-week ($)", value = to_dollars(config_rv$price_christmas_pass), min = 0, step = 1))
+          column(3, numericInput("season_price_adult_early", "Adult season – early ($)", value = to_dollars(config_rv$price_season_adult_early), min = 0, step = 1)),
+          column(3, numericInput("season_price_youth_early", "Youth season – early ($)", value = to_dollars(config_rv$price_season_youth_early), min = 0, step = 1)),
+          column(3, numericInput("season_price_adult_reg",   "Adult season – regular ($)", value = to_dollars(config_rv$price_season_adult), min = 0, step = 1)),
+          column(3, numericInput("season_price_youth_reg",   "Youth season – regular ($)", value = to_dollars(config_rv$price_season_youth), min = 0, step = 1))
         ),
-        textInput("season_label_edit", "Season label", value = config_rv$season_label),
+        fluidRow(
+          column(4, numericInput("season_price_christmas", "Christmas 2-week ($)", value = to_dollars(config_rv$price_christmas_pass), min = 0, step = 1)),
+          column(8, textInput("season_label_edit", "Season label", value = config_rv$season_label))
+        ),
         actionButton("save_season_prices", "Save season/Christmas prices"),
 
         tags$hr(),
+        h4("Program prices (CAD)"),
+        p("Adjust early-bird and regular prices for each age group."),
+        fluidRow(
+          column(6, h5("Early-bird prices")),
+          column(6, h5("Regular prices"))
+        ),
+        fluidRow(
+          column(3, numericInput("price_program_4_5_early", "4–5 yrs ($)", value = to_dollars(config_rv$price_program_4_5_early), min = 0, step = 1)),
+          column(3, numericInput("price_program_6_10_early","6–10 yrs ($)", value = to_dollars(config_rv$price_program_6_10_early), min = 0, step = 1)),
+          column(3, numericInput("price_program_11_12_early","11–12 yrs ($)", value = to_dollars(config_rv$price_program_11_12_early), min = 0, step = 1)),
+          column(3, numericInput("price_program_13_14_early","13–14 yrs ($)", value = to_dollars(config_rv$price_program_13_14_early), min = 0, step = 1))
+        ),
+        fluidRow(
+          column(3, numericInput("price_program_15_16_early","15–16 yrs ($)", value = to_dollars(config_rv$price_program_15_16_early), min = 0, step = 1)),
+          column(3, numericInput("price_program_17_18_early","17–18 yrs ($)", value = to_dollars(config_rv$price_program_17_18_early), min = 0, step = 1)),
+          column(3, numericInput("price_program_masters_early","Masters ($)", value = to_dollars(config_rv$price_program_masters_early), min = 0, step = 1))
+        ),
+        tags$br(),
+        fluidRow(
+          column(3, numericInput("price_program_4_5", "4–5 yrs ($)", value = to_dollars(config_rv$price_program_4_5), min = 0, step = 1)),
+          column(3, numericInput("price_program_6_10","6–10 yrs ($)", value = to_dollars(config_rv$price_program_6_10), min = 0, step = 1)),
+          column(3, numericInput("price_program_11_12","11–12 yrs ($)", value = to_dollars(config_rv$price_program_11_12), min = 0, step = 1)),
+          column(3, numericInput("price_program_13_14","13–14 yrs ($)", value = to_dollars(config_rv$price_program_13_14), min = 0, step = 1))
+        ),
+        fluidRow(
+          column(3, numericInput("price_program_15_16","15–16 yrs ($)", value = to_dollars(config_rv$price_program_15_16), min = 0, step = 1)),
+          column(3, numericInput("price_program_17_18","17–18 yrs ($)", value = to_dollars(config_rv$price_program_17_18), min = 0, step = 1)),
+          column(3, numericInput("price_program_masters","Masters ($)", value = to_dollars(config_rv$price_program_masters), min = 0, step = 1))
+        ),
+        tags$br(),
+        h5("Program limits"),
+        fluidRow(
+          column(6, numericInput("max_program_participants_edit", "Max participants / transaction", value = config_rv$max_program_participants, min = 0, step = 1)),
+          column(6, numericInput("max_program_amount_edit", "Max program transaction amount ($)", value = config_rv$max_program_amount, min = 0, step = 1))
+        ),
+        actionButton("save_program_prices", "Save program prices/limits"),
+
+        tags$hr(),
+        h4("Special events"),
+        p("Create special events that appear in the SPECIAL EVENTS tab."),
+        fluidRow(
+          column(4, textInput("special_name_new", "Event name")),
+          column(4, dateInput("special_date_new", "Event date", value = Sys.Date())),
+          column(4, numericInput("special_price_new", "Price per entry ($)", value = 10, min = 0, step = 0.5))
+        ),
+        fluidRow(
+          column(6, numericInput("special_max_tickets_new", "Max entries per transaction", value = 10, min = 1, step = 1)),
+          column(6, numericInput("special_max_amount_new", "Max amount per transaction ($)", value = 500, min = 0, step = 1))
+        ),
+        actionButton("special_add_event", "Add special event"),
+        tags$br(), tags$br(),
+        tableOutput("special_events_admin_table"),
+
+        tags$hr(),
         h4("Transaction limits"),
-        p("Adjust maximum number of passes per transaction and maximum dollar amounts."),
         h5("Day passes"),
         fluidRow(
           column(3, numericInput("max_day_adult_edit",   "Max adult day passes",   value = config_rv$max_day_adult,   min = 0, step = 1)),
@@ -2652,12 +3102,11 @@ server <- function(input, output, session) {
 
         h5("Season passes"),
         fluidRow(
-          column(3, numericInput("max_season_adult_edit",   "Max adult season passes",   value = config_rv$max_season_adult,   min = 0, step = 1)),
-          column(3, numericInput("max_season_youth_edit",   "Max youth season passes",   value = config_rv$max_season_youth,   min = 0, step = 1)),
-          column(3, numericInput("max_season_family_edit",  "Max family season passes",  value = config_rv$max_season_family,  min = 0, step = 1)),
-          column(3, numericInput("max_season_amount_edit",  "Max season transaction ($)", value = config_rv$max_season_amount, min = 0, step = 1))
+          column(4, numericInput("max_season_adult_edit",   "Max adult season passes",   value = config_rv$max_season_adult,   min = 0, step = 1)),
+          column(4, numericInput("max_season_youth_edit",   "Max youth season passes",   value = config_rv$max_season_youth,   min = 0, step = 1)),
+          column(4, numericInput("max_season_amount_edit",  "Max season transaction ($)", value = config_rv$max_season_amount, min = 0, step = 1))
         ),
-        actionButton("save_limits", "Save all limits"),
+        actionButton("save_limits", "Save day/donation/Christmas/season limits"),
 
         tags$hr(),
         h4("Tab availability (live / disabled)"),
@@ -2666,6 +3115,10 @@ server <- function(input, output, session) {
           column(3, checkboxInput("enable_christmas_tab", "CHRISTMAS PASS tab live", value = isTRUE(tab_flags$christmas))),
           column(3, checkboxInput("enable_season_tab",    "SEASON PASS tab live",    value = isTRUE(tab_flags$season))),
           column(3, checkboxInput("enable_donation_tab",  "DONATION tab live",       value = isTRUE(tab_flags$donation)))
+        ),
+        fluidRow(
+          column(3, checkboxInput("enable_programs_tab",  "PROGRAMS tab live",       value = isTRUE(tab_flags$programs))),
+          column(3, checkboxInput("enable_special_tab",   "SPECIAL EVENTS tab live", value = isTRUE(tab_flags$special)))
         ),
         actionButton("save_tab_flags", "Save tab availability"),
 
@@ -2686,9 +3139,7 @@ server <- function(input, output, session) {
     )
   })
 
-  # ---------------------------------------------------------------------------
-  # Save day prices
-  # ---------------------------------------------------------------------------
+  # --- save day prices --------------------------------------------------------
 
   observeEvent(input$save_prices, {
     req(admin_ok())
@@ -2728,33 +3179,34 @@ server <- function(input, output, session) {
     )
   })
 
-  # ---------------------------------------------------------------------------
-  # Save season / Christmas prices + label
-  # ---------------------------------------------------------------------------
+  # --- save season / christmas prices ----------------------------------------
 
   observeEvent(input$save_season_prices, {
     req(admin_ok())
 
     cfg_before <- load_config()
 
-    sa <- as_num0(input$season_price_adult)
-    sy <- as_num0(input$season_price_youth)
-    sf <- as_num0(input$season_price_family)
-    sc <- as_num0(input$season_price_christmas)
+    sa_e <- as_num0(input$season_price_adult_early)
+    sy_e <- as_num0(input$season_price_youth_early)
+    sa_r <- as_num0(input$season_price_adult_reg)
+    sy_r <- as_num0(input$season_price_youth_reg)
+    sc   <- as_num0(input$season_price_christmas)
     label <- input$season_label_edit %||% config_rv$season_label
 
-    if (!is.na(sa) && sa >= 0) config_rv$price_season_adult   <- to_cents(sa)
-    if (!is.na(sy) && sy >= 0) config_rv$price_season_youth   <- to_cents(sy)
-    if (!is.na(sf) && sf >= 0) config_rv$price_season_family  <- to_cents(sf)
-    if (!is.na(sc) && sc >= 0) config_rv$price_christmas_pass <- to_cents(sc)
+    if (!is.na(sa_e) && sa_e >= 0) config_rv$price_season_adult_early  <- to_cents(sa_e)
+    if (!is.na(sy_e) && sy_e >= 0) config_rv$price_season_youth_early  <- to_cents(sy_e)
+    if (!is.na(sa_r) && sa_r >= 0) config_rv$price_season_adult        <- to_cents(sa_r)
+    if (!is.na(sy_r) && sy_r >= 0) config_rv$price_season_youth        <- to_cents(sy_r)
+    if (!is.na(sc)   && sc   >= 0) config_rv$price_christmas_pass      <- to_cents(sc)
     config_rv$season_label <- label
 
     cfg <- cfg_before
-    cfg$price_season_adult   <- config_rv$price_season_adult
-    cfg$price_season_youth   <- config_rv$price_season_youth
-    cfg$price_season_family  <- config_rv$price_season_family
-    cfg$price_christmas_pass <- config_rv$price_christmas_pass
-    cfg$season_label         <- config_rv$season_label
+    cfg$price_season_adult_early  <- config_rv$price_season_adult_early
+    cfg$price_season_youth_early  <- config_rv$price_season_youth_early
+    cfg$price_season_adult        <- config_rv$price_season_adult
+    cfg$price_season_youth        <- config_rv$price_season_youth
+    cfg$price_christmas_pass      <- config_rv$price_christmas_pass
+    cfg$season_label              <- config_rv$season_label
     save_config(cfg)
 
     log_config_changes(
@@ -2773,9 +3225,91 @@ server <- function(input, output, session) {
     )
   })
 
-  # ---------------------------------------------------------------------------
-  # Save limits
-  # ---------------------------------------------------------------------------
+  # --- save program prices / limits ------------------------------------------
+
+  observeEvent(input$save_program_prices, {
+    req(admin_ok())
+
+    cfg_before <- load_config()
+
+    # early
+    e_4_5  <- as_num0(input$price_program_4_5_early)
+    e_6_10 <- as_num0(input$price_program_6_10_early)
+    e_11_12<- as_num0(input$price_program_11_12_early)
+    e_13_14<- as_num0(input$price_program_13_14_early)
+    e_15_16<- as_num0(input$price_program_15_16_early)
+    e_17_18<- as_num0(input$price_program_17_18_early)
+    e_m    <- as_num0(input$price_program_masters_early)
+
+    # regular
+    r_4_5  <- as_num0(input$price_program_4_5)
+    r_6_10 <- as_num0(input$price_program_6_10)
+    r_11_12<- as_num0(input$price_program_11_12)
+    r_13_14<- as_num0(input$price_program_13_14)
+    r_15_16<- as_num0(input$price_program_15_16)
+    r_17_18<- as_num0(input$price_program_17_18)
+    r_m    <- as_num0(input$price_program_masters)
+
+    if (!is.na(e_4_5)   && e_4_5   >= 0) config_rv$price_program_4_5_early       <- to_cents(e_4_5)
+    if (!is.na(e_6_10)  && e_6_10  >= 0) config_rv$price_program_6_10_early      <- to_cents(e_6_10)
+    if (!is.na(e_11_12) && e_11_12 >= 0) config_rv$price_program_11_12_early     <- to_cents(e_11_12)
+    if (!is.na(e_13_14) && e_13_14 >= 0) config_rv$price_program_13_14_early     <- to_cents(e_13_14)
+    if (!is.na(e_15_16) && e_15_16 >= 0) config_rv$price_program_15_16_early     <- to_cents(e_15_16)
+    if (!is.na(e_17_18) && e_17_18 >= 0) config_rv$price_program_17_18_early     <- to_cents(e_17_18)
+    if (!is.na(e_m)     && e_m     >= 0) config_rv$price_program_masters_early   <- to_cents(e_m)
+
+    if (!is.na(r_4_5)   && r_4_5   >= 0) config_rv$price_program_4_5             <- to_cents(r_4_5)
+    if (!is.na(r_6_10)  && r_6_10  >= 0) config_rv$price_program_6_10            <- to_cents(r_6_10)
+    if (!is.na(r_11_12) && r_11_12 >= 0) config_rv$price_program_11_12           <- to_cents(r_11_12)
+    if (!is.na(r_13_14) && r_13_14 >= 0) config_rv$price_program_13_14           <- to_cents(r_13_14)
+    if (!is.na(r_15_16) && r_15_16 >= 0) config_rv$price_program_15_16           <- to_cents(r_15_16)
+    if (!is.na(r_17_18) && r_17_18 >= 0) config_rv$price_program_17_18           <- to_cents(r_17_18)
+    if (!is.na(r_m)     && r_m     >= 0) config_rv$price_program_masters         <- to_cents(r_m)
+
+    mp <- as_num0(input$max_program_participants_edit)
+    ma <- as_num0(input$max_program_amount_edit)
+    if (!is.na(mp) && mp >= 0) config_rv$max_program_participants <- mp
+    if (!is.na(ma) && ma >= 0) config_rv$max_program_amount       <- ma
+
+    cfg <- cfg_before
+    cfg$price_program_4_5_early     <- config_rv$price_program_4_5_early
+    cfg$price_program_6_10_early    <- config_rv$price_program_6_10_early
+    cfg$price_program_11_12_early   <- config_rv$price_program_11_12_early
+    cfg$price_program_13_14_early   <- config_rv$price_program_13_14_early
+    cfg$price_program_15_16_early   <- config_rv$price_program_15_16_early
+    cfg$price_program_17_18_early   <- config_rv$price_program_17_18_early
+    cfg$price_program_masters_early <- config_rv$price_program_masters_early
+
+    cfg$price_program_4_5           <- config_rv$price_program_4_5
+    cfg$price_program_6_10          <- config_rv$price_program_6_10
+    cfg$price_program_11_12         <- config_rv$price_program_11_12
+    cfg$price_program_13_14         <- config_rv$price_program_13_14
+    cfg$price_program_15_16         <- config_rv$price_program_15_16
+    cfg$price_program_17_18         <- config_rv$price_program_17_18
+    cfg$price_program_masters       <- config_rv$price_program_masters
+
+    cfg$max_program_participants    <- config_rv$max_program_participants
+    cfg$max_program_amount          <- config_rv$max_program_amount
+
+    save_config(cfg)
+
+    log_config_changes(
+      cfg_before,
+      cfg,
+      context = list(source = "save_program_prices", admin_session = admin_session_id)
+    )
+
+    showModal(
+      modalDialog(
+        title = "Program prices / limits updated",
+        "New program prices and limits will apply to future registrations.",
+        easyClose = TRUE,
+        footer = NULL
+      )
+    )
+  })
+
+  # --- save general limits ----------------------------------------------------
 
   observeEvent(input$save_limits, {
     req(admin_ok())
@@ -2804,12 +3338,10 @@ server <- function(input, output, session) {
 
     msa     <- as_num0(input$max_season_adult_edit)
     msy     <- as_num0(input$max_season_youth_edit)
-    msf     <- as_num0(input$max_season_family_edit)
     msa_amt <- as_num0(input$max_season_amount_edit)
 
     if (!is.na(msa)     && msa >= 0)      config_rv$max_season_adult  <- msa
     if (!is.na(msy)     && msy >= 0)      config_rv$max_season_youth  <- msy
-    if (!is.na(msf)     && msf >= 0)      config_rv$max_season_family <- msf
     if (!is.na(msa_amt) && msa_amt >= 0) config_rv$max_season_amount <- msa_amt
 
     cfg <- cfg_before
@@ -2823,8 +3355,8 @@ server <- function(input, output, session) {
     cfg$max_christmas_amount <- config_rv$max_christmas_amount
     cfg$max_season_adult     <- config_rv$max_season_adult
     cfg$max_season_youth     <- config_rv$max_season_youth
-    cfg$max_season_family    <- config_rv$max_season_family
     cfg$max_season_amount    <- config_rv$max_season_amount
+
     save_config(cfg)
 
     log_config_changes(
@@ -2843,9 +3375,7 @@ server <- function(input, output, session) {
     )
   })
 
-  # ---------------------------------------------------------------------------
-  # Save tab flags
-  # ---------------------------------------------------------------------------
+  # --- save tab flags ---------------------------------------------------------
 
   observeEvent(input$save_tab_flags, {
     req(admin_ok())
@@ -2854,17 +3384,20 @@ server <- function(input, output, session) {
       day       = isTRUE(input$enable_day_tab),
       christmas = isTRUE(input$enable_christmas_tab),
       season    = isTRUE(input$enable_season_tab),
-      donation  = isTRUE(input$enable_donation_tab)
+      donation  = isTRUE(input$enable_donation_tab),
+      programs  = isTRUE(input$enable_programs_tab),
+      special   = isTRUE(input$enable_special_tab)
     )
 
     tab_flags$day       <- flags$day
     tab_flags$christmas <- flags$christmas
     tab_flags$season    <- flags$season
     tab_flags$donation  <- flags$donation
+    tab_flags$programs  <- flags$programs
+    tab_flags$special   <- flags$special
 
     cfg_before <- load_config()
     save_tab_flags(flags, cfg = cfg_before)
-    # save_tab_flags() calls save_config() and log_config_changes()
 
     showModal(
       modalDialog(
@@ -2877,7 +3410,4 @@ server <- function(input, output, session) {
   })
 }
 
-shinyApp(
-  ui     = app_ui,
-  server = server
-)
+shinyApp(ui = app_ui, server = server)
