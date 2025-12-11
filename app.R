@@ -1021,6 +1021,8 @@ Shiny.addCustomMessageHandler('redirectToSquare', function(url) {
 "
 
 base_head <- tags$head(
+  tags$meta(name = "viewport", content = "width=device-width, initial-scale=1"),
+  tags$title("BVXC – Online passes"),
   tags$script(HTML(js)),
   tags$style(HTML("
     .datepicker.dropdown-menu {
@@ -1065,10 +1067,6 @@ base_head <- tags$head(
 day_tab <- tabPanel(
   "DAY PASS",
   fluidPage(
-    tags$head(
-      tags$meta(name = "viewport", content = "width=device-width, initial-scale=1"),
-      tags$title("BVXC – Day Passes")
-    ),
     div(
       style = "max-width: 650px; margin: 0 auto; padding: 1.5rem;",
       sandbox_banner,
