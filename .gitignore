@@ -1,32 +1,24 @@
-# macOS
-.DS_Store
-
-# R / RStudio
-.Rhistory
-.RData
-.Rapp.history
-.Rproj.user/
-*.Rproj
-
-# Local secrets
+# Secrets
 .Renviron
 .env
+*.pem
+*.key
 
-# Local databases
-*.sqlite
-
-# Local scratch / backups
-*.bak
-*~
-app copy.R
-
-# Shiny deployment metadata
+# R / Shiny
+.Rhistory
+.RData
+.Rproj.user/
 rsconnect/
 
-# Legacy file (no longer used if tab flags moved to SQLite)
-tab_flags.csv
+# Local backups
+*.bak
+*.bak.*
+*backup*.R
+app_pre_cart_backup.R
+app.R.bak*
 
-# Optional: ignore local logs/exports (adjust if needed)
-passes_log.csv
-pass_registrations.csv
-
+# Local databases / backups / logs
+*.sqlite
+*.sqlite-journal
+*.sqlite.bak
+*.db
