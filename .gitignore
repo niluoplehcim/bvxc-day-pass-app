@@ -22,3 +22,13 @@ app.R.bak*
 *.sqlite-journal
 *.sqlite.bak
 *.db
+
+# macOS / RStudio noise
+.DS_Store
+.Rapp.history
+
+# local scratch copies
+app copy.R
+
+# local runtime data (don’t commit)
+tab_flags.csv
