@@ -1,6 +1,6 @@
 # app.R
 # BVXC – Passes, Programs, Events + Cart + Admin Controls (Square)
-# v5.3 – NO shinyWidgets dependency (base Shiny dateInput) – 2025-12-12
+# v5.4 – Season/Christmas: NO family option (season removed); Donation adds to cart – 2025-12-13
 
 library(shiny)
 library(httr)
@@ -15,7 +15,7 @@ library(qrcode)
 # -----------------------------------------------------------------------------
 
 Sys.setenv(TZ = "America/Vancouver")
-APP_VERSION <- "BVXC v5.3 – admin-controlled – 2025-12-12 (no shinyWidgets)"
+APP_VERSION <- "BVXC v5.4 – admin-controlled – 2025-12-13 (no shinyWidgets)"
 
 if (file.exists(".Renviron")) readRenviron(".Renviron")
 
@@ -61,7 +61,6 @@ get_season_window <- function(today = Sys.Date()) {
     start <- as.Date(sprintf("%d-11-01", y - 1))
     end   <- as.Date(sprintf("%d-05-01", y))
   } else {
-    # Off-season (Jun–Oct): “current season” is the upcoming one
     start <- as.Date(sprintf("%d-11-01", y))
     end   <- as.Date(sprintf("%d-05-01", y + 1))
   }
@@ -105,6 +104,7 @@ init_db <- function() {
     )
   ")
 
+  # Kept for backward compatibility; not used by Donation tab anymore (donations now go in cart)
   DBI::dbExecute(con, "
     CREATE TABLE IF NOT EXISTS donation_details (
       id TEXT PRIMARY KEY,
@@ -121,7 +121,7 @@ init_db <- function() {
   DBI::dbExecute(con, "
     CREATE TABLE IF NOT EXISTS blocked_dates (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      date TEXT NOT NULL UNIQUE,  -- YYYY-MM-DD
+      date TEXT NOT NULL UNIQUE,
       reason TEXT
     )
   ")
@@ -130,8 +130,8 @@ init_db <- function() {
     CREATE TABLE IF NOT EXISTS special_events (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
-      event_date TEXT NOT NULL,   -- YYYY-MM-DD
-      price_cad REAL,             -- allow NULL => N/A
+      event_date TEXT NOT NULL,
+      price_cad REAL,
       capacity INTEGER,
       enabled INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL
@@ -215,24 +215,23 @@ get_day_prices <- function() {
   )
 }
 
+# Season passes: NO family option
 get_season_prices <- function(is_early_bird = FALSE) {
   if (is_early_bird) {
     data.frame(
-      type  = c("Adult", "Youth", "Family"),
+      type  = c("Adult", "Youth"),
       price = c(
         cfg_num("price_season_eb_adult", NA_real_),
-        cfg_num("price_season_eb_youth", NA_real_),
-        cfg_num("price_season_eb_family", NA_real_)
+        cfg_num("price_season_eb_youth", NA_real_)
       ),
       stringsAsFactors = FALSE
     )
   } else {
     data.frame(
-      type  = c("Adult", "Youth", "Family"),
+      type  = c("Adult", "Youth"),
       price = c(
         cfg_num("price_season_reg_adult", NA_real_),
-        cfg_num("price_season_reg_youth", NA_real_),
-        cfg_num("price_season_reg_family", NA_real_)
+        cfg_num("price_season_reg_youth", NA_real_)
       ),
       stringsAsFactors = FALSE
     )
@@ -403,13 +402,9 @@ server <- function(input, output, session) {
 
   receipt_tx <- reactiveVal(NULL)
 
-  # UI refresh knobs (force re-render)
   day_date_ui_nonce <- reactiveVal(0L)
-
-  # last-valid selection memory
   last_valid_day_date <- reactiveVal(Sys.Date())
 
-  # ---- helpers ----
   clear_cart <- function() rv$cart <- rv$cart[0, , drop = FALSE]
   cart_total_cents <- function(df) as.integer(round(sum(df$quantity * df$unit_price) * 100))
 
@@ -449,7 +444,6 @@ server <- function(input, output, session) {
   # -----------------------------------------------------------------------------
 
   season_win <- reactive(get_season_window(Sys.Date()))
-
   blocked_df <- reactive(get_blocked_dates())
 
   blocked_chr <- reactive({
@@ -461,8 +455,7 @@ server <- function(input, output, session) {
   })
 
   # -----------------------------------------------------------------------------
-  # CHRISTMAS PASS: constrain base dateInput to season range (only when tab visible)
-  # Valid starts: Dec 12 .. Dec 25 of season’s December year
+  # CHRISTMAS PASS: constrain dateInput to season range (only when tab visible)
   # -----------------------------------------------------------------------------
 
   observe({
@@ -482,7 +475,7 @@ server <- function(input, output, session) {
   })
 
   # -----------------------------------------------------------------------------
-  # BLOCKED DATES: revert if user picks blocked day (server-side)
+  # BLOCKED DATES: revert if user picks blocked day
   # -----------------------------------------------------------------------------
 
   observeEvent(input$day_date, {
@@ -495,7 +488,6 @@ server <- function(input, output, session) {
       bump_day_date_ui()
       return()
     }
-
     last_valid_day_date(picked)
   }, ignoreInit = TRUE)
 
@@ -565,7 +557,7 @@ server <- function(input, output, session) {
       ))
     }
 
-    # --- Season Pass ---
+    # --- Season Pass (NO family) ---
     if (tab_on("tab_season_enabled", TRUE)) {
       tabs <- c(tabs, list(
         tabPanel(
@@ -577,9 +569,8 @@ server <- function(input, output, session) {
             fluidRow(
               column(
                 4,
-                numericInput("season_adult",  "Adult",  value = 0, min = 0, step = 1),
-                numericInput("season_youth",  "Youth",  value = 0, min = 0, step = 1),
-                numericInput("season_family", "Family", value = 0, min = 0, step = 1),
+                numericInput("season_adult",  "Adult", value = 0, min = 0, step = 1),
+                numericInput("season_youth",  "Youth", value = 0, min = 0, step = 1),
                 br(),
                 actionButton("season_add_to_cart", "Add to cart")
               ),
@@ -639,7 +630,7 @@ server <- function(input, output, session) {
       ))
     }
 
-    # --- Donation ---
+    # --- Donation (NOW: add to cart) ---
     if (tab_on("tab_donation_enabled", TRUE)) {
       tabs <- c(tabs, list(
         tabPanel(
@@ -647,7 +638,7 @@ server <- function(input, output, session) {
           value = "Donation",
           fluidPage(
             h3("Donation"),
-            p("Donations are processed as a separate transaction (not added to cart)."),
+            p("Add a donation to the cart and pay later under the Cart tab."),
             tags$div(
               style = "margin-top: 8px; padding: 10px; border: 1px solid #ddd; border-radius: 6px; background: #fafafa;",
               tags$strong("Important: "),
@@ -657,11 +648,11 @@ server <- function(input, output, session) {
             fluidRow(
               column(
                 4,
-                textInput("donor_name",  "Name (for acknowledgement)", ""),
+                textInput("donor_name",  "Name (optional)", ""),
                 textInput("donor_email", "Email (optional)", ""),
                 numericInput("donation_amount", "Donation amount (CAD)", value = 0, min = 0, step = 1),
                 br(),
-                actionButton("donate_now", "Record donation")
+                actionButton("donate_add_to_cart", "Add donation to cart")
               ),
               column(8, verbatimTextOutput("donation_status"))
             )
@@ -695,7 +686,7 @@ server <- function(input, output, session) {
             column(
               6,
               h4("Notes"),
-              p("1. All passes / programs / events you added from other tabs are listed here."),
+              p("1. All items you added from other tabs are listed here."),
               p("2. When you click Pay now, you’ll be redirected to a secure Square checkout page."),
               p("3. After successful payment, you will receive a Square receipt at the email you provided."),
               tags$div(
@@ -739,7 +730,7 @@ server <- function(input, output, session) {
   })
 
   # -----------------------------------------------------------------------------
-  # DAY PASS date UI (season restricted; blocked dates enforced server-side)
+  # DAY PASS date UI
   # -----------------------------------------------------------------------------
 
   output$day_date_ui <- renderUI({
@@ -762,7 +753,6 @@ server <- function(input, output, session) {
     if (v < min_d) v <- min_d
     if (v > max_d) v <- max_d
 
-    # If last valid is now blocked, walk forward to next available date
     blk <- blocked_chr()
     if (length(blk) > 0 && as.character(v) %in% blk) {
       d <- v
@@ -918,7 +908,7 @@ server <- function(input, output, session) {
   })
 
   # -----------------------------------------------------------------------------
-  # SEASON PASS (early bird cutoff from admin)
+  # SEASON PASS (NO family)
   # -----------------------------------------------------------------------------
 
   output$season_info <- renderUI({
@@ -936,17 +926,15 @@ server <- function(input, output, session) {
     prices <- get_season_prices(is_eb)
     pr <- setNames(prices$price, prices$type)
 
-    qa <- input$season_adult  %||% 0
-    qy <- input$season_youth  %||% 0
-    qf <- input$season_family %||% 0
+    qa <- input$season_adult %||% 0
+    qy <- input$season_youth %||% 0
 
-    ok <- !(is.na(pr[["Adult"]]) || is.na(pr[["Youth"]]) || is.na(pr[["Family"]]))
-    total <- if (ok) qa*pr[["Adult"]] + qy*pr[["Youth"]] + qf*pr[["Family"]] else NA_real_
+    ok <- !(is.na(pr[["Adult"]]) || is.na(pr[["Youth"]]))
+    total <- if (ok) qa*pr[["Adult"]] + qy*pr[["Youth"]] else NA_real_
 
     paste0(
       "Adult:  ", qa, " x ", fmt_price(pr[["Adult"]]), "\n",
       "Youth:  ", qy, " x ", fmt_price(pr[["Youth"]]), "\n",
-      "Family: ", qf, " x ", fmt_price(pr[["Family"]]), "\n",
       "-------------------------\n",
       "Total: ", if (ok) paste0("$", sprintf("%.2f", total)) else "N/A (set prices in Admin)"
     )
@@ -964,9 +952,6 @@ server <- function(input, output, session) {
     }
     if ((input$season_youth %||% 0) > 0) {
       add_to_cart("season_pass", "Season pass – Youth", input$season_youth, pr[["Youth"]], list(type="Youth", early_bird=is_eb))
-    }
-    if ((input$season_family %||% 0) > 0) {
-      add_to_cart("season_pass", "Season pass – Family", input$season_family, pr[["Family"]], list(type="Family", early_bird=is_eb))
     }
   })
 
@@ -1005,7 +990,7 @@ server <- function(input, output, session) {
   })
 
   # -----------------------------------------------------------------------------
-  # SPECIAL EVENTS (from DB)
+  # SPECIAL EVENTS
   # -----------------------------------------------------------------------------
 
   output$event_picker_ui <- renderUI({
@@ -1058,30 +1043,31 @@ server <- function(input, output, session) {
   })
 
   # -----------------------------------------------------------------------------
-  # DONATION (log only)
+  # DONATION (NOW: add to cart)
   # -----------------------------------------------------------------------------
 
-  observeEvent(input$donate_now, {
-    amt   <- input$donation_amount %||% 0
-    name  <- input$donor_name
-    email <- input$donor_email
+  output$donation_status <- renderText({ "" })
 
-    if (amt <= 0) {
+  observeEvent(input$donate_add_to_cart, {
+    amt   <- input$donation_amount %||% 0
+    name  <- trimws(input$donor_name %||% "")
+    email <- trimws(input$donor_email %||% "")
+
+    if (is.na(amt) || amt <= 0) {
       output$donation_status <- renderText("Please enter a donation amount greater than zero.")
       return()
     }
 
-    con <- get_db_connection()
-    on.exit(DBI::dbDisconnect(con), add = TRUE)
-
-    DBI::dbExecute(
-      con,
-      "INSERT INTO donation_details (id, created_at, donor_name, donor_email, donation_cents, currency, square_payment_id, status)
-       VALUES (?, datetime('now'), ?, ?, ?, 'CAD', NULL, 'RECORDED_NO_SQUARE')",
-      params = list(UUIDgenerate(), name, email, as.integer(round(amt * 100)))
+    # Donation is a single line item in the cart
+    add_to_cart(
+      category    = "donation",
+      description = "Donation – Bulkley Valley Cross Country Ski Club",
+      quantity    = 1,
+      unit_price  = as.numeric(amt),
+      meta        = list(donor_name = name, donor_email = email)
     )
 
-    output$donation_status <- renderText(paste0("Donation of $", sprintf("%.2f", amt), " recorded."))
+    output$donation_status <- renderText(paste0("Donation of $", sprintf("%.2f", amt), " added to cart."))
   })
 
   # -----------------------------------------------------------------------------
@@ -1366,22 +1352,24 @@ server <- function(input, output, session) {
         column(3, textInput("adm_price_day_under9", "Under 9", value = cfg_get("price_day_under9", ""))),
         column(3, textInput("adm_price_day_family", "Family",  value = cfg_get("price_day_family", "")))
       ),
-      tags$h5("Season Pass — early bird"),
+
+      tags$h5("Season Pass — early bird (NO family)"),
       fluidRow(
-        column(4, textInput("adm_price_seb_adult",  "Adult",  value = cfg_get("price_season_eb_adult", ""))),
-        column(4, textInput("adm_price_seb_youth",  "Youth",  value = cfg_get("price_season_eb_youth", ""))),
-        column(4, textInput("adm_price_seb_family", "Family", value = cfg_get("price_season_eb_family", "")))
+        column(6, textInput("adm_price_seb_adult", "Adult", value = cfg_get("price_season_eb_adult", ""))),
+        column(6, textInput("adm_price_seb_youth", "Youth", value = cfg_get("price_season_eb_youth", "")))
       ),
-      tags$h5("Season Pass — regular"),
+
+      tags$h5("Season Pass — regular (NO family)"),
       fluidRow(
-        column(4, textInput("adm_price_sreg_adult",  "Adult",  value = cfg_get("price_season_reg_adult", ""))),
-        column(4, textInput("adm_price_sreg_youth",  "Youth",  value = cfg_get("price_season_reg_youth", ""))),
-        column(4, textInput("adm_price_sreg_family", "Family", value = cfg_get("price_season_reg_family", "")))
+        column(6, textInput("adm_price_sreg_adult", "Adult", value = cfg_get("price_season_reg_adult", ""))),
+        column(6, textInput("adm_price_sreg_youth", "Youth", value = cfg_get("price_season_reg_youth", "")))
       ),
+
       tags$h5("Christmas Pass"),
       fluidRow(
-        column(4, textInput("adm_price_christmas", "Christmas pass price", value = cfg_get("price_christmas_pass", "")))
+        column(6, textInput("adm_price_christmas", "Christmas pass price", value = cfg_get("price_christmas_pass", "")))
       ),
+
       tags$h5("Programs"),
       fluidRow(
         column(4, textInput("adm_price_prog_kids",     "Kids Ski Program", value = cfg_get("price_program_kids_ski", ""))),
@@ -1466,13 +1454,11 @@ server <- function(input, output, session) {
     cfg_set("price_day_under9",  input$adm_price_day_under9 %||% "")
     cfg_set("price_day_family",  input$adm_price_day_family %||% "")
 
-    cfg_set("price_season_eb_adult",   input$adm_price_seb_adult %||% "")
-    cfg_set("price_season_eb_youth",   input$adm_price_seb_youth %||% "")
-    cfg_set("price_season_eb_family",  input$adm_price_seb_family %||% "")
+    cfg_set("price_season_eb_adult", input$adm_price_seb_adult %||% "")
+    cfg_set("price_season_eb_youth", input$adm_price_seb_youth %||% "")
 
-    cfg_set("price_season_reg_adult",  input$adm_price_sreg_adult %||% "")
-    cfg_set("price_season_reg_youth",  input$adm_price_sreg_youth %||% "")
-    cfg_set("price_season_reg_family", input$adm_price_sreg_family %||% "")
+    cfg_set("price_season_reg_adult", input$adm_price_sreg_adult %||% "")
+    cfg_set("price_season_reg_youth", input$adm_price_sreg_youth %||% "")
 
     cfg_set("price_christmas_pass", input$adm_price_christmas %||% "")
 
