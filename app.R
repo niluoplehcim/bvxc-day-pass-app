@@ -414,42 +414,43 @@ create_square_checkout_from_cart <- function(cart_df,
   body <- list(
     idempotency_key = UUIDgenerate(),
     order = list(
-      idempotency_key = UUIDgenerate(),
-      order = list(
-        location_id = SQUARE_LOCATION_ID,
-        line_items  = line_items
-      )
+      location_id = SQUARE_LOCATION_ID,
+      line_items  = line_items
     ),
-    ask_for_shipping_address = FALSE,
-    merchant_support_email   = "info@bvnordic.ca",
-    note                     = note %||% "",
-    pre_populate_buyer_email = buyer_email %||% "",
-    redirect_url             = redirect_url
+    payment_note = note %||% "",
+    checkout_options = list(
+      ask_for_shipping_address = FALSE,
+      merchant_support_email   = "info@bvnordic.ca",
+      redirect_url             = redirect_url
+    ),
+    pre_populated_data = list(
+      buyer_email = buyer_email %||% ""
+    )
   )
 
   res <- httr::POST(
-    url = paste0(base_url, "/v2/locations/", SQUARE_LOCATION_ID, "/checkouts"),
+    url = paste0(base_url, "/v2/online-checkout/payment-links"),
     httr::add_headers(
-      "Authorization"  = paste("Bearer", SQUARE_ACCESS_TOKEN),
-      "Content-Type"   = "application/json",
-      "Square-Version" = "2025-10-16"
+      "Authorization" = paste("Bearer", SQUARE_ACCESS_TOKEN),
+      "Content-Type"  = "application/json"
+      # Intentionally omit Square-Version: Square will use the app's pinned default version.
     ),
     body   = body,
     encode = "json"
   )
 
   if (httr::status_code(res) >= 300) {
-    warning("Square checkout error: ", httr::content(res, as = "text", encoding = "UTF-8"))
+    warning("Square payment link error: ", httr::content(res, as = "text", encoding = "UTF-8"))
     return(NULL)
   }
 
   content <- httr::content(res, as = "parsed", type = "application/json")
-  checkout_url <- tryCatch(content$checkout$checkout_page_url, error = function(e) NULL)
+  pl <- content$payment_link
 
   list(
-    checkout_url = checkout_url,
-    checkout_id  = content$checkout$id %||% NA_character_,
-    square_order = content$checkout$order$id %||% NA_character_
+    checkout_url = pl$url %||% NULL,      # replacement for checkout_page_url
+    checkout_id  = pl$id %||% NA_character_,
+    square_order = pl$order_id %||% NA_character_
   )
 }
 
@@ -1191,13 +1192,99 @@ output$day_price_summary <- renderText({
   })
 
   # -----------------------------------------------------------------------------
+  # SQUARE: VERIFY ORDER ON RECEIPT RETURN (POLLING FALLBACK)
+  # -----------------------------------------------------------------------------
+
+  square_base_url <- function() {
+    if (identical(SQUARE_ENV, "sandbox")) "https://connect.squareupsandbox.com" else "https://connect.squareup.com"
+  }
+
+  square_headers <- function() {
+    httr::add_headers(
+      "Authorization" = paste("Bearer", SQUARE_ACCESS_TOKEN),
+      "Content-Type"  = "application/json",
+      "Square-Version" = "2025-10-16"
+    )
+  }
+
+  square_retrieve_order <- function(order_id) {
+    if (!nzchar(order_id %||% "")) return(NULL)
+    if (!nzchar(SQUARE_ACCESS_TOKEN) || !nzchar(SQUARE_LOCATION_ID)) return(NULL)
+
+    url <- paste0(square_base_url(), "/v2/orders/", order_id)
+
+    res <- httr::GET(url, square_headers(), httr::timeout(4))
+    if (httr::status_code(res) >= 300) {
+      warning("Square RetrieveOrder error: ", httr::content(res, as = "text", encoding = "UTF-8"))
+      return(NULL)
+    }
+    httr::content(res, as = "parsed", type = "application/json")
+  }
+
+  # Returns updated tx row (data.frame) or NULL
+  refresh_tx_status_from_square <- function(receipt_token) {
+    if (!nzchar(receipt_token %||% "")) return(NULL)
+
+    tx <- db_get1(
+      "SELECT id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
+              square_checkout_id, square_order_id, receipt_token, status
+       FROM transactions
+       WHERE receipt_token = ?token
+       LIMIT 1",
+      token = receipt_token
+    )
+    if (nrow(tx) != 1) return(NULL)
+
+    st <- toupper(trimws(tx$status[1] %||% ""))
+    if (!st %in% c("PENDING", "PENDING_SANDBOX")) return(tx)
+
+    order_id <- tx$square_order_id[1] %||% ""
+    if (!nzchar(order_id) || is.na(order_id)) return(tx)
+
+    payload <- tryCatch(square_retrieve_order(order_id), error = function(e) NULL)
+    if (is.null(payload) || is.null(payload$order)) return(tx)
+
+    order <- payload$order
+    state <- toupper(order$state %||% "")
+
+    new_status <- st
+    if (state == "COMPLETED") new_status <- "COMPLETED"
+    if (state == "CANCELED")  new_status <- "CANCELED"
+
+    # Optional but recommended: amount/currency match
+    expected_amt <- as.integer(tx$total_amount_cents[1] %||% NA_integer_)
+    expected_cur <- toupper(tx$currency[1] %||% "CAD")
+
+    got_amt <- tryCatch(as.integer(order$total_money$amount %||% NA_integer_), error = function(e) NA_integer_)
+    got_cur <- tryCatch(toupper(order$total_money$currency %||% ""), error = function(e) "")
+
+    if (new_status == "COMPLETED") {
+      if (is.na(expected_amt) || is.na(got_amt) || expected_amt != got_amt || expected_cur != got_cur) {
+        new_status <- "AMOUNT_MISMATCH"
+      }
+    }
+
+    if (!identical(new_status, st)) {
+      db_exec1(
+        "UPDATE transactions SET status = ?status WHERE receipt_token = ?token",
+        status = new_status,
+        token  = receipt_token
+      )
+      tx$status[1] <- new_status
+    }
+
+    tx
+  }
+
+  # -----------------------------------------------------------------------------
   # RECEIPT RETURN (show receipt panel + QR)
   # -----------------------------------------------------------------------------
 
   load_receipt_token <- function(token) {
     if (is.null(token) || !nzchar(token)) return(NULL)
     x <- db_get1(
-      "SELECT created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json, receipt_token, status
+      "SELECT id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
+              square_checkout_id, square_order_id, receipt_token, status
        FROM transactions
        WHERE receipt_token = ?token",
       token = token
@@ -1209,7 +1296,10 @@ output$day_price_summary <- renderText({
     isolate({
       qs <- session$clientData$url_search %||% ""
       token <- parseQueryString(qs)[["receipt"]]
-      tx <- load_receipt_token(token)
+
+      tx <- refresh_tx_status_from_square(token)
+      if (is.null(tx)) tx <- load_receipt_token(token)
+
       if (!is.null(tx)) {
         receipt_tx(tx)
         updateTabsetPanel(session, "main_nav", selected = "Cart")
@@ -1220,7 +1310,10 @@ output$day_price_summary <- renderText({
   observeEvent(session$clientData$url_search, {
     qs <- session$clientData$url_search %||% ""
     token <- parseQueryString(qs)[["receipt"]]
-    tx <- load_receipt_token(token)
+
+    tx <- refresh_tx_status_from_square(token)
+    if (is.null(tx)) tx <- load_receipt_token(token)
+
     if (!is.null(tx)) {
       receipt_tx(tx)
       updateTabsetPanel(session, "main_nav", selected = "Cart")
