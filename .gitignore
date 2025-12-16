@@ -34,3 +34,12 @@ app copy.R
 
 # local runtime data (don’t commit)
 tab_flags.csv
+
+# local secrets (never commit)
+.Renviron
+
+# Local secrets (do not commit)
+.Renviron
+
+# Local secrets (do not commit)
+.Renviron
