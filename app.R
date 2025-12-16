@@ -1,6 +1,6 @@
 # app.R
 # BVXC – Passes, Programs, Events + Cart + Admin Controls (Square)
-# v5.4 – Season/Christmas: NO family option (season removed); Donation adds to cart – 2025-12-13
+# v5.5 – Connect Cloud + Supabase-ready (SQLite fallback) – 2025-12-16
 
 library(shiny)
 library(httr)
@@ -10,36 +10,48 @@ library(uuid)
 library(jsonlite)
 library(qrcode)
 
+# ---- renv (Step 3) -----------------------------------------------------------
+# If you use renv locally (recommended), this makes local + Connect Cloud behave consistently.
+# Connect Cloud can also use renv.lock directly even without this, but sourcing is harmless.
+if (file.exists("renv/activate.R")) {
+  try(source("renv/activate.R"), silent = TRUE)
+}
+
 # -----------------------------------------------------------------------------
-# GLOBAL SETTINGS / ENV
+# GLOBAL SETTINGS / ENV (Step 4)
 # -----------------------------------------------------------------------------
 
 Sys.setenv(TZ = "America/Vancouver")
-APP_VERSION <- "BVXC v5.4 – admin-controlled – 2025-12-13 (no shinyWidgets)"
+APP_VERSION <- "BVXC v5.5 – Connect Cloud + Supabase-ready – 2025-12-16"
 
+# Local only. On Connect Cloud: set env vars / Secrets in the UI.
 if (file.exists(".Renviron")) readRenviron(".Renviron")
-
-SQUARE_ENV          <- Sys.getenv("SQUARE_ENV",            unset = NA_character_)
-SQUARE_ACCESS_TOKEN <- Sys.getenv("SQUARE_ACCESS_TOKEN",   unset = NA_character_)
-SQUARE_LOCATION_ID  <- Sys.getenv("SQUARE_LOCATION_ID",    unset = NA_character_)
-ADMIN_PASSWORD      <- Sys.getenv("BVXC_ADMIN_PASSWORD",   unset = NA_character_)
-RETURN_BASE_URL     <- Sys.getenv("BVXC_RETURN_BASE_URL",  unset = NA_character_)
-SANDBOX_MODE        <- Sys.getenv("BVXC_SANDBOX_MODE",     unset = "fake") # "fake" or "square"
 
 ALLOWED_SQUARE_ENVS   <- c("sandbox", "production")
 ALLOWED_SANDBOX_MODES <- c("fake", "square")
 
-if (is.na(SQUARE_ENV) || !(SQUARE_ENV %in% ALLOWED_SQUARE_ENVS)) {
-  stop("SQUARE_ENV must be one of: ", paste(ALLOWED_SQUARE_ENVS, collapse = ", "))
+SQUARE_ENV          <- tolower(Sys.getenv("SQUARE_ENV", unset = "sandbox"))
+SANDBOX_MODE        <- tolower(Sys.getenv("BVXC_SANDBOX_MODE", unset = "fake"))
+SQUARE_ACCESS_TOKEN <- Sys.getenv("SQUARE_ACCESS_TOKEN", unset = "")
+SQUARE_LOCATION_ID  <- Sys.getenv("SQUARE_LOCATION_ID",  unset = "")
+
+ADMIN_PASSWORD  <- Sys.getenv("BVXC_ADMIN_PASSWORD",  unset = NA_character_)
+RETURN_BASE_URL <- Sys.getenv("BVXC_RETURN_BASE_URL", unset = NA_character_)
+
+if (!SQUARE_ENV %in% ALLOWED_SQUARE_ENVS) SQUARE_ENV <- "sandbox"
+if (!SANDBOX_MODE %in% ALLOWED_SANDBOX_MODES) SANDBOX_MODE <- "fake"
+
+HAVE_SQUARE_CREDS <- nzchar(SQUARE_ACCESS_TOKEN) && nzchar(SQUARE_LOCATION_ID)
+
+# If "real Square" was requested but creds are missing, fall back safely
+if ((SQUARE_ENV == "production" || (SQUARE_ENV == "sandbox" && SANDBOX_MODE == "square")) && !HAVE_SQUARE_CREDS) {
+  SQUARE_ENV   <- "sandbox"
+  SANDBOX_MODE <- "fake"
 }
-if (!(SANDBOX_MODE %in% ALLOWED_SANDBOX_MODES)) {
-  stop("BVXC_SANDBOX_MODE must be one of: ", paste(ALLOWED_SANDBOX_MODES, collapse = ", "))
-}
-if (is.na(SQUARE_ACCESS_TOKEN) || SQUARE_ACCESS_TOKEN == "") stop("SQUARE_ACCESS_TOKEN is not set")
-if (is.na(SQUARE_LOCATION_ID)  || SQUARE_LOCATION_ID  == "") stop("SQUARE_LOCATION_ID is not set")
 
 `%||%` <- function(x, y) if (is.null(x) || (length(x) == 1 && is.na(x))) y else x
 trim_trailing_slash <- function(x) sub("/+$", "", x)
+
 if (!is.na(RETURN_BASE_URL) && nzchar(RETURN_BASE_URL)) RETURN_BASE_URL <- trim_trailing_slash(RETURN_BASE_URL)
 
 ENV_LABEL <- if (SQUARE_ENV == "sandbox") {
@@ -71,24 +83,87 @@ get_season_window <- function(today = Sys.Date()) {
 season_label <- function(w) paste0("Season: ", format(w$start), " to ", format(w$end))
 
 # -----------------------------------------------------------------------------
-# DATABASE
+# DATABASE (Step 1 + Step 2)
+# SQLite local dev; Postgres/Supabase in production via BVXC_DB_URL
 # -----------------------------------------------------------------------------
+# BVXC_DB_URL can be:
+# - libpq string: "host=... port=5432 dbname=postgres user=... password=... sslmode=require"
+# - URI: "postgresql://USER:PASSWORD@HOST:5432/postgres?sslmode=require"
+#
+# If BVXC_DB_URL is empty, app uses SQLite at BVXC_DB_PATH.
 
-db_path <- "bvxc.sqlite"
-get_db_connection <- function() DBI::dbConnect(RSQLite::SQLite(), db_path)
+DB_URL  <- Sys.getenv("BVXC_DB_URL",  unset = "")
+DB_PATH <- Sys.getenv("BVXC_DB_PATH", unset = "bvxc.sqlite")
+
+db_is_postgres <- function() nzchar(DB_URL)
+
+parse_kv_conn <- function(s) {
+  # expects: "host=... port=... dbname=... user=... password=... sslmode=require"
+  parts <- strsplit(trimws(s), "\\s+")[[1]]
+  kv <- lapply(parts, function(p) {
+    if (!grepl("=", p, fixed = TRUE)) return(NULL)
+    k <- sub("=.*$", "", p)
+    v <- sub("^[^=]*=", "", p)
+    list(k = k, v = v)
+  })
+  kv <- Filter(Negate(is.null), kv)
+
+  out <- list()
+  for (item in kv) out[[item$k]] <- item$v
+
+  if (!is.null(out$db)) out$dbname <- out$db
+  out
+}
+
+get_db_connection <- function() {
+  if (db_is_postgres()) {
+    args <- parse_kv_conn(DB_URL)
+
+    need <- c("host", "port", "dbname", "user", "password")
+    missing <- setdiff(need, names(args))
+    if (length(missing) > 0) {
+      stop(
+        "BVXC_DB_URL is missing: ", paste(missing, collapse = ", "),
+        "\nExpected format: host=... port=... dbname=... user=... password=... sslmode=require"
+      )
+    }
+
+    do.call(DBI::dbConnect, c(list(RPostgres::Postgres()), args))
+  } else {
+    DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+  }
+}
+
+now_ts <- function() format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+
+# Step 1: use sqlInterpolate everywhere so we never depend on ? vs $1 placeholder styles
+db_get <- function(con, sql, ...) DBI::dbGetQuery(con, DBI::sqlInterpolate(con, sql, ...))
+db_exec <- function(con, sql, ...) DBI::dbExecute(con, DBI::sqlInterpolate(con, sql, ...))
+
+db_get1 <- function(sql, ...) {
+  con <- get_db_connection()
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  db_get(con, sql, ...)
+}
+
+db_exec1 <- function(sql, ...) {
+  con <- get_db_connection()
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  db_exec(con, sql, ...)
+}
 
 init_db <- function() {
   con <- get_db_connection()
   on.exit(DBI::dbDisconnect(con), add = TRUE)
 
-  DBI::dbExecute(con, "
+  db_exec(con, "
     CREATE TABLE IF NOT EXISTS config (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     )
   ")
 
-  DBI::dbExecute(con, "
+  db_exec(con, "
     CREATE TABLE IF NOT EXISTS transactions (
       id TEXT PRIMARY KEY,
       created_at TEXT NOT NULL,
@@ -105,7 +180,7 @@ init_db <- function() {
   ")
 
   # Kept for backward compatibility; not used by Donation tab anymore (donations now go in cart)
-  DBI::dbExecute(con, "
+  db_exec(con, "
     CREATE TABLE IF NOT EXISTS donation_details (
       id TEXT PRIMARY KEY,
       created_at TEXT NOT NULL,
@@ -118,15 +193,26 @@ init_db <- function() {
     )
   ")
 
-  DBI::dbExecute(con, "
-    CREATE TABLE IF NOT EXISTS blocked_dates (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      date TEXT NOT NULL UNIQUE,
-      reason TEXT
-    )
-  ")
+  # blocked_dates: SQLite AUTOINCREMENT vs Postgres IDENTITY
+  if (db_is_postgres()) {
+    db_exec(con, '
+      CREATE TABLE IF NOT EXISTS blocked_dates (
+        id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        "date" TEXT NOT NULL UNIQUE,
+        reason TEXT
+      )
+    ')
+  } else {
+    db_exec(con, '
+      CREATE TABLE IF NOT EXISTS blocked_dates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        "date" TEXT NOT NULL UNIQUE,
+        reason TEXT
+      )
+    ')
+  }
 
-  DBI::dbExecute(con, "
+  db_exec(con, "
     CREATE TABLE IF NOT EXISTS special_events (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -138,6 +224,7 @@ init_db <- function() {
     )
   ")
 }
+
 init_db()
 
 # -----------------------------------------------------------------------------
@@ -145,21 +232,18 @@ init_db()
 # -----------------------------------------------------------------------------
 
 cfg_get <- function(key, default = "") {
-  con <- get_db_connection()
-  on.exit(DBI::dbDisconnect(con), add = TRUE)
-  x <- DBI::dbGetQuery(con, "SELECT value FROM config WHERE key = ? LIMIT 1", params = list(key))
+  x <- db_get1("SELECT value FROM config WHERE key = ?key LIMIT 1", key = key)
   if (nrow(x) == 0) return(default)
   x$value[1]
 }
 
 cfg_set <- function(key, value) {
-  con <- get_db_connection()
-  on.exit(DBI::dbDisconnect(con), add = TRUE)
-  DBI::dbExecute(
-    con,
-    "INSERT INTO config(key,value) VALUES(?,?)
+  # Works on SQLite + Postgres
+  db_exec1(
+    "INSERT INTO config(key,value) VALUES(?key, ?value)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    params = list(key, as.character(value %||% ""))
+    key = key,
+    value = as.character(value %||% "")
   )
 }
 
@@ -208,14 +292,29 @@ get_day_prices <- function() {
     price = c(
       cfg_num("price_day_adult", NA_real_),
       cfg_num("price_day_youth", NA_real_),
-      cfg_num("price_day_under9", NA_real_),
+      cfg_num("price_day_under9", NAreal_ = NA_real_),
       cfg_num("price_day_family", NA_real_)
     ),
     stringsAsFactors = FALSE
   )
 }
 
-# Season passes: NO family option
+# FIX: typo-safe wrapper for day under9 price (keeps code clean)
+`cfg_num_under9` <- function() cfg_num("price_day_under9", NA_real_)
+
+get_day_prices <- function() {
+  data.frame(
+    type  = c("Adult", "Youth", "Under 9", "Family"),
+    price = c(
+      cfg_num("price_day_adult", NA_real_),
+      cfg_num("price_day_youth", NA_real_),
+      cfg_num_under9(),
+      cfg_num("price_day_family", NA_real_)
+    ),
+    stringsAsFactors = FALSE
+  )
+}
+
 get_season_prices <- function(is_early_bird = FALSE) {
   if (is_early_bird) {
     data.frame(
@@ -257,17 +356,14 @@ get_special_events <- function(enabled_only = TRUE) {
   con <- get_db_connection()
   on.exit(DBI::dbDisconnect(con), add = TRUE)
 
-  q <- "SELECT id, name, event_date, price_cad, capacity, enabled, created_at
-        FROM special_events"
+  q <- "SELECT id, name, event_date, price_cad, capacity, enabled, created_at FROM special_events"
   if (enabled_only) q <- paste(q, "WHERE enabled = 1")
-  q <- paste(q, "ORDER BY date(event_date) ASC")
-  DBI::dbGetQuery(con, q)
+  q <- paste(q, "ORDER BY event_date ASC")
+  db_get(con, q)
 }
 
 get_blocked_dates <- function() {
-  con <- get_db_connection()
-  on.exit(DBI::dbDisconnect(con), add = TRUE)
-  DBI::dbGetQuery(con, "SELECT date, reason FROM blocked_dates ORDER BY date(date) ASC")
+  db_get1('SELECT "date" AS date, reason FROM blocked_dates ORDER BY "date" ASC')
 }
 
 # -----------------------------------------------------------------------------
@@ -295,10 +391,10 @@ validate_cart_limits <- function(cart_df) {
 # -----------------------------------------------------------------------------
 
 create_square_checkout_from_cart <- function(cart_df,
-                                             buyer_name   = NULL,
-                                             buyer_email  = NULL,
-                                             note         = NULL,
-                                             redirect_url = NULL) {
+                                            buyer_name   = NULL,
+                                            buyer_email  = NULL,
+                                            note         = NULL,
+                                            redirect_url = NULL) {
   if (nrow(cart_df) == 0) return(NULL)
 
   base_url <- if (identical(SQUARE_ENV, "sandbox")) "https://connect.squareupsandbox.com" else "https://connect.squareup.com"
@@ -376,7 +472,11 @@ ui <- fluidPage(
   uiOutput("main_nav_ui"),
   tags$script(HTML("
     Shiny.addCustomMessageHandler('redirect', function(message) {
-      window.location.href = message.url;
+      try {
+        window.top.location.href = message.url;   // break out of iframe (Connect preview)
+      } catch(e) {
+        window.location.href = message.url;       // fallback
+      }
     });
   "))
 )
@@ -502,9 +602,23 @@ server <- function(input, output, session) {
     has_cart   <- cart_items > 0
     cart_label <- if (has_cart) paste0("Cart (", cart_items, ")") else "Cart"
 
+    # Diagnostics panel (helps Step 4 deployments)
+    env_diag <- tagList(
+      if (db_is_postgres()) {
+        tags$div(style="margin:8px 0; padding:10px; border:1px solid #ddd; border-radius:6px; background:#fafafa;",
+                 tags$strong("Database: "), "Postgres (BVXC_DB_URL set)")
+      } else {
+        tags$div(style="margin:8px 0; padding:10px; border:1px solid #ffc107; border-radius:6px; background:#fff8e1;",
+                 tags$strong("Database: "), "SQLite (BVXC_DB_URL NOT set). Settings will not persist across redeployments on Connect Cloud.")
+      },
+      if (!HAVE_SQUARE_CREDS && SANDBOX_MODE == "square") {
+        tags$div(style="margin:8px 0; padding:10px; border:1px solid #dc3545; border-radius:6px; background:#fff5f5;",
+                 tags$strong("Square: "), "SANDBOX_MODE is 'square' but Square credentials are missing. Falling back to fake mode.")
+      } else NULL
+    )
+
     tabs <- list()
 
-    # --- Day Pass ---
     if (tab_on("tab_daypass_enabled", TRUE)) {
       tabs <- c(tabs, list(
         tabPanel(
@@ -532,7 +646,6 @@ server <- function(input, output, session) {
       ))
     }
 
-    # --- Christmas Pass ---
     if (tab_on("tab_christmas_enabled", TRUE)) {
       tabs <- c(tabs, list(
         tabPanel(
@@ -557,7 +670,6 @@ server <- function(input, output, session) {
       ))
     }
 
-    # --- Season Pass (NO family) ---
     if (tab_on("tab_season_enabled", TRUE)) {
       tabs <- c(tabs, list(
         tabPanel(
@@ -581,7 +693,6 @@ server <- function(input, output, session) {
       ))
     }
 
-    # --- Programs ---
     if (tab_on("tab_programs_enabled", TRUE)) {
       tabs <- c(tabs, list(
         tabPanel(
@@ -606,7 +717,6 @@ server <- function(input, output, session) {
       ))
     }
 
-    # --- Special Events ---
     if (tab_on("tab_events_enabled", TRUE)) {
       tabs <- c(tabs, list(
         tabPanel(
@@ -630,7 +740,6 @@ server <- function(input, output, session) {
       ))
     }
 
-    # --- Donation (NOW: add to cart) ---
     if (tab_on("tab_donation_enabled", TRUE)) {
       tabs <- c(tabs, list(
         tabPanel(
@@ -661,13 +770,13 @@ server <- function(input, output, session) {
       ))
     }
 
-    # Cart + Admin always on
     tabs <- c(tabs, list(
       tabPanel(
         title = tags$span(class = if (has_cart) "cart-hot" else NULL, cart_label),
         value = "Cart",
         fluidPage(
           h3("Cart – review and pay"),
+          env_diag,
           fluidRow(
             column(
               6,
@@ -771,31 +880,43 @@ server <- function(input, output, session) {
   # DAY PASS
   # -----------------------------------------------------------------------------
 
-  output$day_price_summary <- renderText({
-    date <- suppressWarnings(as.Date(input$day_date))
-    if (is.na(date)) date <- last_valid_day_date()
+output$day_price_summary <- renderText({
+  date <- suppressWarnings(as.Date(input$day_date))
+  if (is.null(date) || length(date) == 0 || is.na(date)) date <- last_valid_day_date()
 
-    prices <- get_day_prices()
-    pr <- setNames(prices$price, prices$type)
+  prices <- get_day_prices()
+  pr <- setNames(prices$price, prices$type)
 
-    qa <- input$day_adult  %||% 0
-    qy <- input$day_youth  %||% 0
-    qu <- input$day_under9 %||% 0
-    qf <- input$day_family %||% 0
+  getp <- function(name) {
+    v <- pr[[name]]
+    if (is.null(v) || length(v) == 0) return(NA_real_)
+    v <- suppressWarnings(as.numeric(v[1]))
+    if (is.na(v) || v < 0) NA_real_ else v
+  }
 
-    ok <- !(is.na(pr[["Adult"]]) || is.na(pr[["Youth"]]) || is.na(pr[["Under 9"]]) || is.na(pr[["Family"]]))
-    total <- if (ok) qa*pr[["Adult"]] + qy*pr[["Youth"]] + qu*pr[["Under 9"]] + qf*pr[["Family"]] else NA_real_
+  pA <- getp("Adult")
+  pY <- getp("Youth")
+  pU <- getp("Under 9")
+  pF <- getp("Family")
 
-    paste0(
-      "Date: ", as.character(date), "\n",
-      "Adult:   ", qa, " x ", fmt_price(pr[["Adult"]]), "\n",
-      "Youth:   ", qy, " x ", fmt_price(pr[["Youth"]]), "\n",
-      "Under 9: ", qu, " x ", fmt_price(pr[["Under 9"]]), "\n",
-      "Family:  ", qf, " x ", fmt_price(pr[["Family"]]), "\n",
-      "-------------------------\n",
-      "Total: ", if (ok) paste0("$", sprintf("%.2f", total)) else "N/A (set prices in Admin)"
-    )
-  })
+  qa <- as.integer(input$day_adult  %||% 0)
+  qy <- as.integer(input$day_youth  %||% 0)
+  qu <- as.integer(input$day_under9 %||% 0)
+  qf <- as.integer(input$day_family %||% 0)
+
+  ok <- !any(is.na(c(pA, pY, pU, pF)))
+  total <- if (ok) qa*pA + qy*pY + qu*pU + qf*pF else NA_real_
+
+  paste0(
+    "Date: ", as.character(date), "\n",
+    "Adult:   ", qa, " x ", fmt_price(pA), "\n",
+    "Youth:   ", qy, " x ", fmt_price(pY), "\n",
+    "Under 9: ", qu, " x ", fmt_price(pU), "\n",
+    "Family:  ", qf, " x ", fmt_price(pF), "\n",
+    "-------------------------\n",
+    "Total: ", if (ok) paste0("$", sprintf("%.2f", total)) else "N/A (set prices in Admin)"
+  )
+})
 
   observeEvent(input$day_add_to_cart, {
     w <- season_win()
@@ -1043,7 +1164,7 @@ server <- function(input, output, session) {
   })
 
   # -----------------------------------------------------------------------------
-  # DONATION (NOW: add to cart)
+  # DONATION (add to cart)
   # -----------------------------------------------------------------------------
 
   output$donation_status <- renderText({ "" })
@@ -1058,7 +1179,6 @@ server <- function(input, output, session) {
       return()
     }
 
-    # Donation is a single line item in the cart
     add_to_cart(
       category    = "donation",
       description = "Donation – Bulkley Valley Cross Country Ski Club",
@@ -1076,16 +1196,13 @@ server <- function(input, output, session) {
 
   load_receipt_token <- function(token) {
     if (is.null(token) || !nzchar(token)) return(NULL)
-    con <- get_db_connection()
-    on.exit(DBI::dbDisconnect(con), add = TRUE)
-    tx <- DBI::dbGetQuery(
-      con,
+    x <- db_get1(
       "SELECT created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json, receipt_token, status
        FROM transactions
-       WHERE receipt_token = ?",
-      params = list(token)
+       WHERE receipt_token = ?token",
+      token = token
     )
-    if (nrow(tx) == 1) tx else NULL
+    if (nrow(x) == 1) x else NULL
   }
 
   session$onFlushed(function() {
@@ -1204,15 +1321,22 @@ server <- function(input, output, session) {
     # SANDBOX: FAKE
     if (SQUARE_ENV == "sandbox" && SANDBOX_MODE == "fake") {
       receipt_token <- UUIDgenerate()
-      con <- get_db_connection()
-      on.exit(DBI::dbDisconnect(con), add = TRUE)
 
-      DBI::dbExecute(
-        con,
-        "INSERT INTO transactions (id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
-                                   square_checkout_id, square_order_id, receipt_token, status)
-         VALUES (?, datetime('now'), ?, ?, ?, 'CAD', ?, NULL, NULL, ?, 'SANDBOX_TEST_OK')",
-        params = list(UUIDgenerate(), buyer_name, buyer_email, total_cents, jsonlite::toJSON(df, auto_unbox = TRUE), receipt_token)
+      db_exec1(
+        "INSERT INTO transactions (
+           id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
+           square_checkout_id, square_order_id, receipt_token, status
+         ) VALUES (
+           ?id, ?created_at, ?buyer_name, ?buyer_email, ?total_cents, 'CAD', ?cart_json,
+           NULL, NULL, ?receipt_token, 'SANDBOX_TEST_OK'
+         )",
+        id            = UUIDgenerate(),
+        created_at    = now_ts(),
+        buyer_name    = buyer_name,
+        buyer_email   = buyer_email,
+        total_cents   = total_cents,
+        cart_json     = jsonlite::toJSON(df, auto_unbox = TRUE),
+        receipt_token = receipt_token
       )
 
       receipt_tx(load_receipt_token(receipt_token))
@@ -1244,20 +1368,23 @@ server <- function(input, output, session) {
         return()
       }
 
-      con <- get_db_connection()
-      on.exit(DBI::dbDisconnect(con), add = TRUE)
-      DBI::dbExecute(
-        con,
-        "INSERT INTO transactions (id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
-                                   square_checkout_id, square_order_id, receipt_token, status)
-         VALUES (?, datetime('now'), ?, ?, ?, 'CAD', ?, ?, ?, ?, 'PENDING_SANDBOX')",
-        params = list(
-          UUIDgenerate(), buyer_name, buyer_email, total_cents,
-          jsonlite::toJSON(df, auto_unbox = TRUE),
-          res$checkout_id %||% NA_character_,
-          res$square_order %||% NA_character_,
-          receipt_token
-        )
+      db_exec1(
+        "INSERT INTO transactions (
+           id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
+           square_checkout_id, square_order_id, receipt_token, status
+         ) VALUES (
+           ?id, ?created_at, ?buyer_name, ?buyer_email, ?total_cents, 'CAD', ?cart_json,
+           ?checkout_id, ?order_id, ?receipt_token, 'PENDING_SANDBOX'
+         )",
+        id            = UUIDgenerate(),
+        created_at    = now_ts(),
+        buyer_name    = buyer_name,
+        buyer_email   = buyer_email,
+        total_cents   = total_cents,
+        cart_json     = jsonlite::toJSON(df, auto_unbox = TRUE),
+        checkout_id   = res$checkout_id %||% NA_character_,
+        order_id      = res$square_order %||% NA_character_,
+        receipt_token = receipt_token
       )
 
       session$sendCustomMessage("redirect", list(url = res$checkout_url))
@@ -1281,20 +1408,23 @@ server <- function(input, output, session) {
       return()
     }
 
-    con <- get_db_connection()
-    on.exit(DBI::dbDisconnect(con), add = TRUE)
-    DBI::dbExecute(
-      con,
-      "INSERT INTO transactions (id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
-                                 square_checkout_id, square_order_id, receipt_token, status)
-       VALUES (?, datetime('now'), ?, ?, ?, 'CAD', ?, ?, ?, ?, 'PENDING')",
-      params = list(
-        UUIDgenerate(), buyer_name, buyer_email, total_cents,
-        jsonlite::toJSON(df, auto_unbox = TRUE),
-        res$checkout_id %||% NA_character_,
-        res$square_order %||% NA_character_,
-        receipt_token
-      )
+    db_exec1(
+      "INSERT INTO transactions (
+         id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
+         square_checkout_id, square_order_id, receipt_token, status
+       ) VALUES (
+         ?id, ?created_at, ?buyer_name, ?buyer_email, ?total_cents, 'CAD', ?cart_json,
+         ?checkout_id, ?order_id, ?receipt_token, 'PENDING'
+       )",
+      id            = UUIDgenerate(),
+      created_at    = now_ts(),
+      buyer_name    = buyer_name,
+      buyer_email   = buyer_email,
+      total_cents   = total_cents,
+      cart_json     = jsonlite::toJSON(df, auto_unbox = TRUE),
+      checkout_id   = res$checkout_id %||% NA_character_,
+      order_id      = res$square_order %||% NA_character_,
+      receipt_token = receipt_token
     )
 
     session$sendCustomMessage("redirect", list(url = res$checkout_url))
@@ -1501,17 +1631,17 @@ server <- function(input, output, session) {
 
     en <- if (isTRUE(input$adm_ev_enabled)) 1L else 0L
 
-    con <- get_db_connection()
-    on.exit(DBI::dbDisconnect(con), add = TRUE)
-
     ok <- tryCatch({
-      DBI::dbExecute(con,
+      db_exec1(
         "INSERT INTO special_events (id, name, event_date, price_cad, capacity, enabled, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
-        params = list(id, name, as.character(d),
-                      ifelse(is.na(price), NA, price),
-                      ifelse(is.na(cap), NA, cap),
-                      en)
+         VALUES (?id, ?name, ?event_date, ?price_cad, ?capacity, ?enabled, ?created_at)",
+        id         = id,
+        name       = name,
+        event_date = as.character(d),
+        price_cad  = ifelse(is.na(price), NA, price),
+        capacity   = ifelse(is.na(cap), NA, cap),
+        enabled    = en,
+        created_at = now_ts()
       )
       TRUE
     }, error = function(e) FALSE)
@@ -1539,17 +1669,16 @@ server <- function(input, output, session) {
     }
     en <- if (isTRUE(input$adm_ev_enabled)) 1L else 0L
 
-    con <- get_db_connection()
-    on.exit(DBI::dbDisconnect(con), add = TRUE)
-
-    n <- DBI::dbExecute(con,
+    n <- db_exec1(
       "UPDATE special_events
-       SET name = ?, event_date = ?, price_cad = ?, capacity = ?, enabled = ?
-       WHERE id = ?",
-      params = list(name, as.character(d),
-                    ifelse(is.na(price), NA, price),
-                    ifelse(is.na(cap), NA, cap),
-                    en, id)
+       SET name = ?name, event_date = ?event_date, price_cad = ?price_cad, capacity = ?capacity, enabled = ?enabled
+       WHERE id = ?id",
+      name       = name,
+      event_date = as.character(d),
+      price_cad  = ifelse(is.na(price), NA, price),
+      capacity   = ifelse(is.na(cap), NA, cap),
+      enabled    = en,
+      id         = id
     )
 
     if (n == 0) showNotification("No event found with that ID.", type="error")
@@ -1561,9 +1690,7 @@ server <- function(input, output, session) {
     id <- trimws(input$adm_ev_id %||% "")
     if (!nzchar(id)) { showNotification("Enter the event ID to delete.", type="error"); return() }
 
-    con <- get_db_connection()
-    on.exit(DBI::dbDisconnect(con), add = TRUE)
-    n <- DBI::dbExecute(con, "DELETE FROM special_events WHERE id = ?", params = list(id))
+    n <- db_exec1("DELETE FROM special_events WHERE id = ?id", id = id)
     if (n == 0) showNotification("No event found with that ID.", type="error")
     else showNotification("Event deleted.", type="message")
   })
@@ -1579,11 +1706,12 @@ server <- function(input, output, session) {
     rs <- trimws(input$adm_block_reason %||% "")
     if (is.na(d)) { showNotification("Invalid date.", type="error"); return() }
 
-    con <- get_db_connection()
-    on.exit(DBI::dbDisconnect(con), add = TRUE)
     ok <- tryCatch({
-      DBI::dbExecute(con, "INSERT INTO blocked_dates(date, reason) VALUES(?, ?)",
-                     params = list(as.character(d), ifelse(nzchar(rs), rs, NA_character_)))
+      db_exec1(
+        'INSERT INTO blocked_dates("date", reason) VALUES (?date, ?reason)',
+        date   = as.character(d),
+        reason = ifelse(nzchar(rs), rs, NA_character_)
+      )
       TRUE
     }, error = function(e) FALSE)
 
@@ -1600,9 +1728,7 @@ server <- function(input, output, session) {
     d <- suppressWarnings(as.Date(input$adm_block_date))
     if (is.na(d)) { showNotification("Invalid date.", type="error"); return() }
 
-    con <- get_db_connection()
-    on.exit(DBI::dbDisconnect(con), add = TRUE)
-    n <- DBI::dbExecute(con, "DELETE FROM blocked_dates WHERE date = ?", params = list(as.character(d)))
+    n <- db_exec1('DELETE FROM blocked_dates WHERE "date" = ?date', date = as.character(d))
     if (n == 0) {
       showNotification("That date was not blocked.", type="warning")
     } else {
@@ -1613,13 +1739,10 @@ server <- function(input, output, session) {
 
   output$admin_recent_tx <- renderTable({
     if (!rv$admin_logged_in) return(NULL)
-    con <- get_db_connection()
-    on.exit(DBI::dbDisconnect(con), add = TRUE)
-    DBI::dbGetQuery(
-      con,
+    db_get1(
       "SELECT created_at, buyer_name, buyer_email, total_amount_cents, status
        FROM transactions
-       ORDER BY datetime(created_at) DESC
+       ORDER BY created_at DESC
        LIMIT 10"
     )
   })
