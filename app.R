@@ -1221,7 +1221,22 @@ output$day_price_summary <- renderText({
     httr::content(res, as = "parsed", type = "application/json")
   }
 
+  square_get_payment <- function(payment_id) {
+    if (!nzchar(payment_id %||% "")) return(NULL)
+    if (!nzchar(SQUARE_ACCESS_TOKEN)) return(NULL)
+
+    url <- paste0(square_base_url(), "/v2/payments/", payment_id)
+
+    res <- httr::GET(url, square_headers(), httr::timeout(4))
+    if (httr::status_code(res) >= 300) {
+      warning("Square GetPayment error: ", httr::content(res, as = "text", encoding = "UTF-8"))
+      return(NULL)
+    }
+    httr::content(res, as = "parsed", type = "application/json")
+  }
+
   # Returns updated tx row (data.frame) or NULL
+ 
   refresh_tx_status_from_square <- function(receipt_token) {
     if (!nzchar(receipt_token %||% "")) return(NULL)
 
@@ -1245,23 +1260,52 @@ output$day_price_summary <- renderText({
     if (is.null(payload) || is.null(payload$order)) return(tx)
 
     order <- payload$order
-    state <- toupper(order$state %||% "")
+    order_state <- toupper(order$state %||% "")
 
-    new_status <- st
-    if (state == "COMPLETED") new_status <- "COMPLETED"
-    if (state == "CANCELED")  new_status <- "CANCELED"
+    # If Square explicitly canceled the order, mark it
+    if (order_state == "CANCELED") {
+      db_exec1("UPDATE transactions SET status = 'CANCELED' WHERE receipt_token = ?token", token = receipt_token)
+      tx$status[1] <- "CANCELED"
+      return(tx)
+    }
 
-    # Optional but recommended: amount/currency match
+    # Payment verification path: order.tenders[*].payment_id -> GetPayment
+    tenders <- order$tenders %||% list()
+    payment_id <- NULL
+    if (length(tenders) > 0) {
+      payment_id <- tenders[[1]]$payment_id %||% tenders[[1]]$paymentId %||% NULL
+    }
+
+    if (!nzchar(payment_id %||% "")) {
+      # No payment recorded yet (still pending / abandoned)
+      return(tx)
+    }
+
+    pay <- tryCatch(square_get_payment(payment_id), error = function(e) NULL)
+    if (is.null(pay) || is.null(pay$payment)) return(tx)
+
+    p <- pay$payment
+    p_status <- toupper(p$status %||% "")
+
+    # Optional: verify amount/currency match your expected total
     expected_amt <- as.integer(tx$total_amount_cents[1] %||% NA_integer_)
     expected_cur <- toupper(tx$currency[1] %||% "CAD")
 
-    got_amt <- tryCatch(as.integer(order$total_money$amount %||% NA_integer_), error = function(e) NA_integer_)
-    got_cur <- tryCatch(toupper(order$total_money$currency %||% ""), error = function(e) "")
+    got_amt <- tryCatch(as.integer(p$amount_money$amount %||% NA_integer_), error = function(e) NA_integer_)
+    got_cur <- tryCatch(toupper(p$amount_money$currency %||% ""), error = function(e) "")
 
-    if (new_status == "COMPLETED") {
-      if (is.na(expected_amt) || is.na(got_amt) || expected_amt != got_amt || expected_cur != got_cur) {
+    new_status <- st
+    if (p_status == "COMPLETED") {
+      if (!is.na(expected_amt) && !is.na(got_amt) && expected_amt == got_amt && expected_cur == got_cur) {
+        new_status <- "COMPLETED"
+      } else {
         new_status <- "AMOUNT_MISMATCH"
       }
+    } else if (p_status %in% c("CANCELED", "FAILED")) {
+      new_status <- p_status
+    } else {
+      # APPROVED / PENDING / etc: keep pending
+      new_status <- st
     }
 
     if (!identical(new_status, st)) {
