@@ -95,7 +95,7 @@ season_label <- function(w) paste0("Season: ", format(w$start), " to ", format(w
 DB_URL  <- Sys.getenv("BVXC_DB_URL",  unset = "")
 DB_PATH <- Sys.getenv("BVXC_DB_PATH", unset = "bvxc.sqlite")
 
-db_is_postgres <- function() nzchar(DB_URL)
+db_is_postgres <- function() nzchar(trimws(DB_URL))
 
 parse_kv_conn <- function(s) {
   # expects: "host=... port=... dbname=... user=... password=... sslmode=require"
@@ -111,27 +111,39 @@ parse_kv_conn <- function(s) {
   out <- list()
   for (item in kv) out[[item$k]] <- item$v
 
-  if (!is.null(out$db)) out$dbname <- out$db
+  # Allow db= as an alias for dbname= (libpq accepts both)
+  if (!is.null(out$db) && is.null(out$dbname)) out$dbname <- out$db
+
   out
 }
 
 get_db_connection <- function() {
   if (db_is_postgres()) {
-    args <- parse_kv_conn(DB_URL)
+    s <- trimws(DB_URL)
+
+    # If user provides a URI, RPostgres can take it directly via dbname=
+    if (grepl("^postgres(ql)?://", s, ignore.case = TRUE)) {
+      return(DBI::dbConnect(RPostgres::Postgres(), dbname = s))
+    }
+
+    # Otherwise assume libpq key=value format
+    args <- parse_kv_conn(s)
 
     need <- c("host", "port", "dbname", "user", "password")
     missing <- setdiff(need, names(args))
     if (length(missing) > 0) {
       stop(
         "BVXC_DB_URL is missing: ", paste(missing, collapse = ", "),
-        "\nExpected format: host=... port=... dbname=... user=... password=... sslmode=require"
+        "\nExpected either:",
+        "\n  1) host=... port=... dbname=... user=... password=... sslmode=require",
+        "\n  2) postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require"
       )
     }
 
-    do.call(DBI::dbConnect, c(list(RPostgres::Postgres()), args))
-  } else {
-    DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+    return(do.call(DBI::dbConnect, c(list(RPostgres::Postgres()), args)))
   }
+
+  DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
 }
 
 now_ts <- function() format(Sys.time(), "%Y-%m-%d %H:%M:%S")
@@ -175,20 +187,6 @@ init_db <- function() {
       square_checkout_id TEXT,
       square_order_id TEXT,
       receipt_token TEXT,
-      status TEXT
-    )
-  ")
-
-  # Kept for backward compatibility; not used by Donation tab anymore (donations now go in cart)
-  db_exec(con, "
-    CREATE TABLE IF NOT EXISTS donation_details (
-      id TEXT PRIMARY KEY,
-      created_at TEXT NOT NULL,
-      donor_name TEXT,
-      donor_email TEXT,
-      donation_cents INTEGER NOT NULL,
-      currency TEXT NOT NULL,
-      square_payment_id TEXT,
       status TEXT
     )
   ")
@@ -286,21 +284,8 @@ fmt_price <- function(x) if (is.na(x)) "N/A" else paste0("$", sprintf("%.2f", x)
 
 get_early_bird_cutoff <- function() cfg_date("early_bird_cutoff", as.Date(NA))
 
-get_day_prices <- function() {
-  data.frame(
-    type  = c("Adult", "Youth", "Under 9", "Family"),
-    price = c(
-      cfg_num("price_day_adult", NA_real_),
-      cfg_num("price_day_youth", NA_real_),
-      cfg_num("price_day_under9", NAreal_ = NA_real_),
-      cfg_num("price_day_family", NA_real_)
-    ),
-    stringsAsFactors = FALSE
-  )
-}
-
 # FIX: typo-safe wrapper for day under9 price (keeps code clean)
-`cfg_num_under9` <- function() cfg_num("price_day_under9", NA_real_)
+cfg_num_under9 <- function() cfg_num("price_day_under9", NA_real_)
 
 get_day_prices <- function() {
   data.frame(
