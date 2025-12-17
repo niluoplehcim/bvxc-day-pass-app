@@ -1,6 +1,6 @@
 # app.R
 # BVXC – Passes, Programs, Events + Cart + Admin Controls (Square)
-# v5.9 – Per-tab mini-cart + remove item controls – 2025-12-17
+# v6.0 – Qty update controls + new program categories – 2025-12-17
 
 # ---- renv -------------------------------------------------------------------
 if (file.exists("renv/activate.R")) {
@@ -24,7 +24,7 @@ suppressPackageStartupMessages({
 # -----------------------------------------------------------------------------
 
 Sys.setenv(TZ = "America/Vancouver")
-APP_VERSION <- "BVXC v5.9 – Per-tab mini-cart remove – 2025-12-17"
+APP_VERSION <- "BVXC v6.0 – Qty update controls + new programs – 2025-12-17"
 
 if (file.exists(".Renviron")) readRenviron(".Renviron")
 
@@ -49,6 +49,7 @@ if (!SANDBOX_MODE %in% ALLOWED_SANDBOX_MODES) SANDBOX_MODE <- "fake"
 
 HAVE_SQUARE_CREDS <- nzchar(SQUARE_ACCESS_TOKEN) && nzchar(SQUARE_LOCATION_ID)
 
+# If user tries "sandbox+square" without creds, force fake mode
 if ((SQUARE_ENV == "production" || (SQUARE_ENV == "sandbox" && SANDBOX_MODE == "square")) && !HAVE_SQUARE_CREDS) {
   SQUARE_ENV   <- "sandbox"
   SANDBOX_MODE <- "fake"
@@ -359,42 +360,33 @@ get_season_prices <- function(is_early_bird = FALSE) {
 
 get_christmas_pass_price <- function() cfg_num("price_christmas_pass", NA_real_)
 
-# Programs (non-kids remain flat price)
-get_program_list <- function() {
+# Programs: hard-coded catalog (your requested categories)
+program_catalog <- function() {
   data.frame(
-    id    = c("kids_ski", "masters", "biathlon_intro"),
-    name  = c("Kids Ski Program", "Masters Training", "Biathlon Intro"),
-    price = c(
-      NA_real_, # kids ski is age-priced now
-      cfg_num("price_program_masters", NA_real_),
-      cfg_num("price_program_biathlon_intro", NA_real_)
+    id = c(
+      "bunnies","rabbits","u10","u12","u14","u16","u18","u20",
+      "biathlon_adp","biathlon_rifle_rental_adp","biathlon_youth_intro",
+      "masters_2x","masters_1x","biathlon_masters","biathlon_masters_rifle_rental"
+    ),
+    name = c(
+      "Bunnies","Rabbits","U10","U12","U14","U16","U18","U20",
+      "Biathlon ADP","Biathlon Rifle Rental ADP","Biathlon Youth Intro",
+      "Masters 2X","Masters 1X","Biathlon Masters","Biathlon Masters Rifle Rental"
+    ),
+    price_key = c(
+      "price_program_bunnies","price_program_rabbits","price_program_u10","price_program_u12",
+      "price_program_u14","price_program_u16","price_program_u18","price_program_u20",
+      "price_program_biathlon_adp","price_program_biathlon_rifle_rental_adp","price_program_biathlon_youth_intro",
+      "price_program_masters_2x","price_program_masters_1x","price_program_biathlon_masters","price_program_biathlon_masters_rifle_rental"
     ),
     stringsAsFactors = FALSE
   )
 }
 
-# Kids Ski age categories (hard-coded labels)
-kids_age_categories <- function() {
-  c("4-10 yrs","11-12 yrs","13-14 yrs","15-16 yrs","17-18 yrs","18+ yrs")
-}
-
-kids_age_key <- function(label) {
-  # maps UI label to config key suffix
-  switch(label,
-    "4-10 yrs"   = "4_10",
-    "11-12 yrs"  = "11_12",
-    "13-14 yrs"  = "13_14",
-    "15-16 yrs"  = "15_16",
-    "17-18 yrs"  = "17_18",
-    "18+ yrs"    = "18_plus",
-    NA_character_
-  )
-}
-
-kids_ski_price_for_age <- function(label) {
-  suf <- kids_age_key(label)
-  if (!nzchar(suf %||% "")) return(NA_real_)
-  cfg_num(paste0("price_program_kids_ski_", suf), NA_real_)
+get_program_list <- function() {
+  cat <- program_catalog()
+  cat$price <- vapply(cat$price_key, function(k) cfg_num(k, NA_real_), numeric(1))
+  cat[, c("id","name","price","price_key")]
 }
 
 get_special_events <- function(enabled_only = TRUE) {
@@ -516,6 +508,29 @@ css_tabs <- "
 }
 .cart-hot { color: #0d6efd !important; font-weight: 800 !important; font-size: 1.07em !important; }
 .mini-cart-box { margin-top: 14px; padding: 10px; border: 1px solid #ddd; border-radius: 8px; background: #fafafa; }
+
+.cart-line {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid #eee;
+}
+
+.cart-desc { flex: 1; font-weight: 600; }
+.cart-meta { color: #666; font-weight: 400; margin-left: 10px; }
+.cart-qty { width: 120px; }
+.cart-money { width: 120px; text-align: right; font-variant-numeric: tabular-nums; }
+
+.cart-controls { display: flex; align-items: center; gap: 12px; }
+
+.cart-qty-input {
+  font-size: 20px;
+  height: 44px;
+  padding: 6px 12px;
+  min-width: 120px;
+}
+
 .receipt-card {
   padding: 16px;
   border: 1px solid #d1e7dd;
@@ -647,53 +662,132 @@ server <- function(input, output, session) {
   }
 
   # -----------------------------------------------------------------------------
-  # MINI-CART HELPERS (per tab remove)
+  # CART QTY UPDATE (0 = remove) + MINI-CART PER TAB
   # -----------------------------------------------------------------------------
 
-  remove_cart_id <- function(id) {
-    id <- as.character(id %||% "")
-    if (!nzchar(id)) return()
-    rv$cart <- rv$cart[rv$cart$id != id, , drop = FALSE]
-    showNotification("Removed from cart.", type = "message")
+  set_cart_qty <- function(item_id, new_qty) {
+    item_id <- as.character(item_id %||% "")
+    if (!nzchar(item_id)) return(invisible(NULL))
+
+    q <- suppressWarnings(as.integer(new_qty))
+    if (is.na(q)) return(invisible(NULL))
+
+    df <- rv$cart
+    if (nrow(df) == 0) return(invisible(NULL))
+
+    idx <- which(df$id == item_id)
+    if (length(idx) != 1) return(invisible(NULL))
+
+    if (q <= 0L) {
+      rv$cart <- df[df$id != item_id, , drop = FALSE]
+      return(invisible(NULL))
+    }
+
+    df$quantity[idx] <- q
+    rv$cart <- df
+    invisible(NULL)
   }
 
-  register_mini_cart <- function(prefix, category) {
-    table_id     <- paste0(prefix, "_table")
-    remove_ui_id <- paste0(prefix, "_remove_ui")
-    remove_btn   <- paste0(prefix, "_remove_btn")
-    remove_sel   <- paste0(prefix, "_remove_id")
+  render_cart_list_ui <- function(df, change_input_id, max_qty = 20L, show_category = FALSE) {
+    if (is.null(df) || nrow(df) == 0) {
+      return(tags$div(style = "color:#666;", "No items."))
+    }
 
-    output[[table_id]] <- renderTable({
-      df <- rv$cart
-      sub <- df[df$category == category, , drop = FALSE]
-      if (nrow(sub) == 0) return(NULL)
-      sub$line_total <- sub$quantity * sub$unit_price
-      sub[, c("description","quantity","unit_price","line_total")]
-    }, digits = 2)
+box_id <- paste0(change_input_id, "_box")
 
-    output[[remove_ui_id]] <- renderUI({
-      df <- rv$cart
-      sub <- df[df$category == category, , drop = FALSE]
-      if (nrow(sub) == 0) {
-        return(tags$div(style="color:#666;", "No items from this tab in the cart."))
-      }
-      choices <- setNames(sub$id, paste0(sub$description, " (x", sub$quantity, ")"))
-      selectInput(remove_sel, "Remove item", choices = choices)
-    })
+row_ui <- lapply(seq_len(nrow(df)), function(i) {
+  r <- df[i, , drop = FALSE]
+  desc <- as.character(r$description[1] %||% "")
+  cat  <- as.character(r$category[1] %||% "")
+  qty  <- suppressWarnings(as.integer(r$quantity[1] %||% 0L))
+  price <- suppressWarnings(as.numeric(r$unit_price[1] %||% NA_real_))
+  line_total <- if (!is.na(price)) qty * price else NA_real_
 
-    observeEvent(input[[remove_btn]], {
-      id <- input[[remove_sel]] %||% ""
-      remove_cart_id(id)
-    }, ignoreInit = TRUE)
+  if (is.na(qty) || qty < 0L) qty <- 0L
+  if (qty > max_qty) qty <- max_qty
+
+  left_text <- if (isTRUE(show_category) && nzchar(cat)) {
+    tags$div(
+      tags$div(desc),
+      tags$div(style = "color:#777; font-size: 0.9em;", cat)
+    )
+  } else {
+    tags$div(desc)
   }
 
-  # one mini-cart per category
-  register_mini_cart("mini_day",    "day_pass")
-  register_mini_cart("mini_xmas",   "christmas_pass")
-  register_mini_cart("mini_season", "season_pass")
-  register_mini_cart("mini_prog",   "program")
-  register_mini_cart("mini_event",  "event")
-  register_mini_cart("mini_don",    "donation")
+  tags$div(
+    class = "cart-line",
+    tags$div(class = "cart-desc", left_text),
+    tags$div(
+      class = "cart-controls",
+      tags$input(
+        type         = "number",
+        class        = "cart-qty-input",
+        `data-itemid` = as.character(r$id[1]),
+        value        = qty,
+        min          = 0,
+        max          = max_qty,
+        step         = 1
+      ),
+      tags$span(
+        class = "cart-line-total",
+        if (!is.na(line_total)) sprintf("$%.2f", line_total) else ""
+      )
+    )
+  )
+})
+
+tagList(
+  tags$div(id = box_id, class = "cart-list", row_ui),
+  tags$script(HTML(sprintf(
+    "
+    $(document).off('input change', '#%s .cart-qty-input');
+    $(document).on('input change', '#%s .cart-qty-input', function() {
+      var id = $(this).data('itemid');
+      var qty = parseInt($(this).val(), 10);
+      if (isNaN(qty)) qty = 0;
+      Shiny.setInputValue('%s', {id: id, qty: qty, nonce: Math.random()}, {priority: 'event'});
+    });
+    ",
+    box_id, box_id, change_input_id
+  )))
+)
+  }
+
+  # Per-tab mini cart lists
+  output$mini_day_list <- renderUI({
+    sub <- rv$cart[rv$cart$category == "day_pass", , drop = FALSE]
+    render_cart_list_ui(sub, change_input_id = "mini_day_qty_change", max_qty = 20L, show_category = FALSE)
+  })
+  output$mini_xmas_list <- renderUI({
+    sub <- rv$cart[rv$cart$category == "christmas_pass", , drop = FALSE]
+    render_cart_list_ui(sub, change_input_id = "mini_xmas_qty_change", max_qty = 20L, show_category = FALSE)
+  })
+  output$mini_season_list <- renderUI({
+    sub <- rv$cart[rv$cart$category == "season_pass", , drop = FALSE]
+    render_cart_list_ui(sub, change_input_id = "mini_season_qty_change", max_qty = 20L, show_category = FALSE)
+  })
+  output$mini_prog_list <- renderUI({
+    sub <- rv$cart[rv$cart$category == "program", , drop = FALSE]
+    render_cart_list_ui(sub, change_input_id = "mini_prog_qty_change", max_qty = 20L, show_category = FALSE)
+  })
+  output$mini_event_list <- renderUI({
+    sub <- rv$cart[rv$cart$category == "event", , drop = FALSE]
+    render_cart_list_ui(sub, change_input_id = "mini_event_qty_change", max_qty = 20L, show_category = FALSE)
+  })
+  output$mini_don_list <- renderUI({
+    sub <- rv$cart[rv$cart$category == "donation", , drop = FALSE]
+    render_cart_list_ui(sub, change_input_id = "mini_don_qty_change", max_qty = 1L, show_category = FALSE)
+  })
+
+  # One observer per list
+  observeEvent(input$mini_day_qty_change,    { set_cart_qty(input$mini_day_qty_change$id,    input$mini_day_qty_change$qty)    }, ignoreInit = TRUE)
+  observeEvent(input$mini_xmas_qty_change,   { set_cart_qty(input$mini_xmas_qty_change$id,   input$mini_xmas_qty_change$qty)   }, ignoreInit = TRUE)
+  observeEvent(input$mini_season_qty_change, { set_cart_qty(input$mini_season_qty_change$id, input$mini_season_qty_change$qty) }, ignoreInit = TRUE)
+  observeEvent(input$mini_prog_qty_change,   { set_cart_qty(input$mini_prog_qty_change$id,   input$mini_prog_qty_change$qty)   }, ignoreInit = TRUE)
+  observeEvent(input$mini_event_qty_change,  { set_cart_qty(input$mini_event_qty_change$id,  input$mini_event_qty_change$qty)  }, ignoreInit = TRUE)
+  observeEvent(input$mini_don_qty_change,    { set_cart_qty(input$mini_don_qty_change$id,    input$mini_don_qty_change$qty)    }, ignoreInit = TRUE)
+  observeEvent(input$cart_qty_change,        { set_cart_qty(input$cart_qty_change$id,        input$cart_qty_change$qty)        }, ignoreInit = TRUE)
 
   # -----------------------------------------------------------------------------
   # REACTIVE DATA SOURCES
@@ -752,7 +846,7 @@ server <- function(input, output, session) {
   }, ignoreInit = TRUE)
 
   # -----------------------------------------------------------------------------
-  # DYNAMIC NAVBAR
+  # DYNAMIC NAVBAR (Receipt tab is ALWAYS present to avoid “tab missing” issues)
   # -----------------------------------------------------------------------------
 
   output$main_nav_ui <- renderUI({
@@ -761,7 +855,6 @@ server <- function(input, output, session) {
     cart_items <- if (nrow(rv$cart) == 0) 0 else sum(rv$cart$quantity %||% 0)
     has_cart   <- cart_items > 0
     cart_label <- if (has_cart) paste0("Cart (", cart_items, ")") else "Cart"
-    has_receipt <- !is.null(receipt_tx())
 
     env_diag <- tagList(
       if (db_is_postgres()) {
@@ -786,299 +879,268 @@ server <- function(input, output, session) {
 
     tabs <- list()
 
-    if (tab_on("tab_daypass_enabled", TRUE)) {
-      tabs <- c(tabs, list(
-        tabPanel(
-          title = "Day Pass",
-          value = "Day Pass",
-          fluidPage(
-            h3("Day Passes"),
-            tags$p(season_label(season_win())),
-            p("Choose your ski day and passes, then add to cart. Payment happens on the Cart tab."),
-            fluidRow(
-              column(
-                4,
-                uiOutput("day_date_ui"),
-                numericInput("day_adult",  "Adult",   value = 0, min = 0, step = 1),
-                numericInput("day_youth",  "Youth",   value = 0, min = 0, step = 1),
-                numericInput("day_under9", "Under 9", value = 0, min = 0, step = 1),
-                numericInput("day_family", "Family",  value = 0, min = 0, step = 1),
-                br(),
-                actionButton("day_add_to_cart", "Add to cart")
-              ),
-              column(
-                8,
-                h4("Price summary"),
-                verbatimTextOutput("day_price_summary"),
-                tags$div(class="mini-cart-box",
-                  h4("Items in cart from Day Pass"),
-                  tableOutput("mini_day_table"),
-                  uiOutput("mini_day_remove_ui"),
-                  actionButton("mini_day_remove_btn", "Remove selected item")
-                )
-              )
-            )
-          )
-        )
-      ))
-    }
-
-    if (tab_on("tab_christmas_enabled", TRUE)) {
-      tabs <- c(tabs, list(
-        tabPanel(
-          title = "Christmas Pass",
-          value = "Christmas Pass",
-          fluidPage(
-            h3("Christmas Pass"),
-            tags$p(season_label(season_win())),
-            p("Choose a 14-day window that must include Dec 25. Add to cart, then pay on the Cart tab."),
-            fluidRow(
-              column(
-                4,
-                dateInput("xmas_start", "Start date (14-day window)", value = Sys.Date()),
-                numericInput("xmas_qty", "Number of passes", value = 0, min = 0, step = 1),
-                br(),
-                actionButton("xmas_add_to_cart", "Add to cart")
-              ),
-              column(
-                8,
-                h4("Summary"),
-                verbatimTextOutput("xmas_summary"),
-                tags$div(class="mini-cart-box",
-                  h4("Items in cart from Christmas Pass"),
-                  tableOutput("mini_xmas_table"),
-                  uiOutput("mini_xmas_remove_ui"),
-                  actionButton("mini_xmas_remove_btn", "Remove selected item")
-                )
-              )
-            )
-          )
-        )
-      ))
-    }
-
-    if (tab_on("tab_season_enabled", TRUE)) {
-      tabs <- c(tabs, list(
-        tabPanel(
-          title = "Season Pass",
-          value = "Season Pass",
-          fluidPage(
-            h3("Season Passes"),
-            uiOutput("season_info"),
-            fluidRow(
-              column(
-                4,
-                numericInput("season_adult",  "Adult", value = 0, min = 0, step = 1),
-                numericInput("season_youth",  "Youth", value = 0, min = 0, step = 1),
-                br(),
-                actionButton("season_add_to_cart", "Add to cart")
-              ),
-              column(
-                8,
-                h4("Price summary"),
-                verbatimTextOutput("season_price_summary"),
-                tags$div(class="mini-cart-box",
-                  h4("Items in cart from Season Pass"),
-                  tableOutput("mini_season_table"),
-                  uiOutput("mini_season_remove_ui"),
-                  actionButton("mini_season_remove_btn", "Remove selected item")
-                )
-              )
-            )
-          )
-        )
-      ))
-    }
-
-    if (tab_on("tab_programs_enabled", TRUE)) {
-      tabs <- c(tabs, list(
-        tabPanel(
-          title = "Programs",
-          value = "Programs",
-          fluidPage(
-            h3("Programs"),
-            p("Select a program and number of participants, then add to cart."),
-            fluidRow(
-              column(
-                4,
-                selectInput(
-                  "program_choice", "Program",
-                  choices = setNames(get_program_list()$id, get_program_list()$name)
-                ),
-                uiOutput("kids_age_ui"),
-                numericInput("program_qty", "Number of participants", value = 0, min = 0, step = 1),
-                br(),
-                actionButton("program_add_to_cart", "Add to cart")
-              ),
-              column(
-                8,
-                h4("Program details"),
-                verbatimTextOutput("program_summary"),
-                tags$div(class="mini-cart-box",
-                  h4("Items in cart from Programs"),
-                  tableOutput("mini_prog_table"),
-                  uiOutput("mini_prog_remove_ui"),
-                  actionButton("mini_prog_remove_btn", "Remove selected item")
-                )
-              )
-            )
-          )
-        )
-      ))
-    }
-
-    if (tab_on("tab_events_enabled", TRUE)) {
-      tabs <- c(tabs, list(
-        tabPanel(
-          title = "Special Events",
-          value = "Special Events",
-          fluidPage(
-            h3("Special Events"),
-            p("Add one or more special event registrations to the cart."),
-            fluidRow(
-              column(
-                4,
-                uiOutput("event_picker_ui"),
-                numericInput("event_qty", "Number of participants", value = 0, min = 0, step = 1),
-                br(),
-                actionButton("event_add_to_cart", "Add to cart")
-              ),
-              column(
-                8,
-                h4("Event details"),
-                verbatimTextOutput("event_summary"),
-                tags$div(class="mini-cart-box",
-                  h4("Items in cart from Special Events"),
-                  tableOutput("mini_event_table"),
-                  uiOutput("mini_event_remove_ui"),
-                  actionButton("mini_event_remove_btn", "Remove selected item")
-                )
-              )
-            )
-          )
-        )
-      ))
-    }
-
-    if (tab_on("tab_donation_enabled", TRUE)) {
-      tabs <- c(tabs, list(
-        tabPanel(
-          title = "Donation",
-          value = "Donation",
-          fluidPage(
-            h3("Donation"),
-            p("Add a donation to the cart and pay later under the Cart tab."),
-            tags$div(
-              style = "margin-top: 8px; padding: 10px; border: 1px solid #ddd; border-radius: 6px; background: #fafafa;",
-              tags$strong("Important: "),
-              "The club is not a registered charity at this time. Donations are not tax-deductible."
-            ),
+if (tab_on("tab_daypass_enabled", TRUE)) {
+  tabs <- c(tabs, list(
+    tabPanel(
+      title = "Day Pass",
+      value = "Day Pass",
+      fluidPage(
+        h3("Day Passes"),
+        tags$p(season_label(season_win())),
+        p("Choose your ski day and passes, then add to cart. Payment happens on the Cart tab."),
+        fluidRow(
+          column(
+            4,
+            uiOutput("day_date_ui"),
+            numericInput("day_adult",  "Adult",   value = 0, min = 0, step = 1),
+            numericInput("day_youth",  "Youth",   value = 0, min = 0, step = 1),
+            numericInput("day_under9", "Under 9", value = 0, min = 0, step = 1),
+            numericInput("day_family", "Family",  value = 0, min = 0, step = 1),
             br(),
-            fluidRow(
-              column(
-                4,
-                textInput("donor_name",  "Name (optional)", ""),
-                textInput("donor_email", "Email (optional)", ""),
-                numericInput("donation_amount", "Donation amount (CAD)", value = 0, min = 0, step = 1),
-                br(),
-                actionButton("donate_add_to_cart", "Add donation to cart")
-              ),
-              column(
-                8,
-                verbatimTextOutput("donation_status"),
-                tags$div(class="mini-cart-box",
-                  h4("Items in cart from Donation"),
-                  tableOutput("mini_don_table"),
-                  uiOutput("mini_don_remove_ui"),
-                  actionButton("mini_don_remove_btn", "Remove selected item")
-                )
-              )
+            actionButton("day_add_to_cart", "Add to cart")
+          ),
+          column(
+            8,
+            tags$div(
+              class = "mini-cart-box",
+              h4("Items in cart from Day Pass"),
+              uiOutput("mini_day_list")
             )
           )
         )
-      ))
-    }
+      )
+    )
+  ))
+}
 
-    if (has_receipt) {
-      tabs <- c(tabs, list(
-        tabPanel(
-          title = "Receipt",
-          value = "Receipt",
-          fluidPage(
-            h3("Payment receipt"),
-            uiOutput("receipt_panel")
+if (tab_on("tab_christmas_enabled", TRUE)) {
+  tabs <- c(tabs, list(
+    tabPanel(
+      title = "Christmas Pass",
+      value = "Christmas Pass",
+      fluidPage(
+        h3("Christmas Pass"),
+        tags$p(season_label(season_win())),
+        p("Choose a 14-day window that must include Dec 25. Add to cart, then pay on the Cart tab."),
+        fluidRow(
+          column(
+            4,
+            dateInput("xmas_start", "Start date (14-day window)", value = Sys.Date()),
+            numericInput("xmas_qty", "Number of passes", value = 0, min = 0, step = 1),
+            br(),
+            actionButton("xmas_add_to_cart", "Add to cart")
+          ),
+          column(
+            8,
+            tags$div(
+              class = "mini-cart-box",
+              h4("Items in cart from Christmas Pass"),
+              uiOutput("mini_xmas_list")
+            )
           )
         )
-      ))
-    }
+      )
+    )
+  ))
+}
 
+if (tab_on("tab_season_enabled", TRUE)) {
+  tabs <- c(tabs, list(
+    tabPanel(
+      title = "Season Pass",
+      value = "Season Pass",
+      fluidPage(
+        h3("Season Passes"),
+        uiOutput("season_info"),
+        fluidRow(
+          column(
+            4,
+            numericInput("season_adult", "Adult", value = 0, min = 0, step = 1),
+            numericInput("season_youth", "Youth", value = 0, min = 0, step = 1),
+            br(),
+            actionButton("season_add_to_cart", "Add to cart")
+          ),
+          column(
+            8,
+            tags$div(
+              class = "mini-cart-box",
+              h4("Items in cart from Season Pass"),
+              uiOutput("mini_season_list")
+            )
+          )
+        )
+      )
+    )
+  ))
+}
+
+if (tab_on("tab_programs_enabled", TRUE)) {
+  tabs <- c(tabs, list(
+    tabPanel(
+      title = "Programs",
+      value = "Programs",
+      fluidPage(
+        h3("Programs"),
+        p("Select a program and number of participants, then add to cart."),
+        fluidRow(
+          column(
+            4,
+            selectInput(
+              "program_choice", "Program",
+              choices = setNames(get_program_list()$id, get_program_list()$name)
+            ),
+            uiOutput("kids_age_ui"),
+            numericInput("program_qty", "Number of participants", value = 0, min = 0, step = 1),
+            br(),
+            actionButton("program_add_to_cart", "Add to cart")
+          ),
+          column(
+            8,
+            tags$div(
+              class = "mini-cart-box",
+              h4("Items in cart from Programs"),
+              uiOutput("mini_prog_list")
+            )
+          )
+        )
+      )
+    )
+  ))
+}
+
+if (tab_on("tab_events_enabled", TRUE)) {
+  tabs <- c(tabs, list(
+    tabPanel(
+      title = "Special Events",
+      value = "Special Events",
+      fluidPage(
+        h3("Special Events"),
+        p("Add one or more special event registrations to the cart."),
+        fluidRow(
+          column(
+            4,
+            uiOutput("event_picker_ui"),
+            numericInput("event_qty", "Number of participants", value = 0, min = 0, step = 1),
+            br(),
+            actionButton("event_add_to_cart", "Add to cart")
+          ),
+          column(
+            8,
+            tags$div(
+              class = "mini-cart-box",
+              h4("Items in cart from Special Events"),
+              uiOutput("mini_event_list")
+            )
+          )
+        )
+      )
+    )
+  ))
+}
+
+if (tab_on("tab_donation_enabled", TRUE)) {
+  tabs <- c(tabs, list(
+    tabPanel(
+      title = "Donation",
+      value = "Donation",
+      fluidPage(
+        h3("Donation"),
+        p("Add a donation to the cart and pay later under the Cart tab."),
+        tags$div(
+          style = "margin-top: 8px; padding: 10px; border: 1px solid #ddd; border-radius: 6px; background: #fafafa;",
+          tags$strong("Important: "),
+          "The club is not a registered charity at this time. Donations are not tax-deductible."
+        ),
+        br(),
+        fluidRow(
+          column(
+            4,
+            textInput("donor_name",  "Name (optional)", ""),
+            textInput("donor_email", "Email (optional)", ""),
+            numericInput("donation_amount", "Donation amount (CAD)", value = 0, min = 0, step = 1),
+            br(),
+            actionButton("donate_add_to_cart", "Add donation to cart")
+          ),
+          column(
+            8,
+            tags$div(
+              class = "mini-cart-box",
+              h4("Items in cart from Donation"),
+              uiOutput("mini_don_list")
+            )
+          )
+        )
+      )
+    )
+  ))
+}
+
+    # Receipt always present (prevents blank tab / tab missing on redirect)
     tabs <- c(tabs, list(
       tabPanel(
-        title = tags$span(class = if (has_cart) "cart-hot" else NULL, cart_label),
-        value = "Cart",
+        title = "Receipt",
+        value = "Receipt",
         fluidPage(
-          h3("Cart – review and pay"),
-          env_diag,
-          fluidRow(
-            column(
-              6,
-              textInput("buyer_name",  "Name for receipt", ""),
-              textInput("buyer_email", "Email for receipt", ""),
-              br(),
-              tableOutput("cart_table"),
-              uiOutput("cart_remove_ui"),
-              actionButton("cart_remove_btn", "Remove selected item"),
-              br(),
-              strong(textOutput("cart_total")),
-              br(), br(),
-              actionButton("cart_clear",    "Clear cart"),
-              actionButton("cart_checkout", "Pay now"),
-              br(), br(),
-              uiOutput("receipt_panel")
-            ),
-            column(
-              6,
-              h4("Notes"),
-              p("1. All items you added from other tabs are listed here."),
-              p("2. When you click Pay now, you’ll be redirected to a secure Square checkout page."),
-              p("3. After successful payment, you will receive a Square receipt at the email you provided."),
-              if (SQUARE_ENV == "sandbox") {
-                tags$div(
-                  style = "margin-top: 10px; padding: 10px; border: 1px solid #0d6efd; border-radius: 6px; background: #f3f8ff;",
-                  tags$strong("Test card (sandbox): "),
-                  tags$div("Card number: 4111 1111 1111 1111"),
-                  tags$div("Expiry: 12/26"),
-                  tags$div("CVV: 111"),
-                  tags$div("Name / email / ZIP: any values")
-                )
-              } else NULL,
-              br(),
-              tags$p(
-                style = "padding: 5px 10px; border-radius: 6px; font-weight: 700;",
-                if (SQUARE_ENV == "sandbox") "background: #ffc107;" else "background: #28a745; color: white;",
-                if (SQUARE_ENV == "sandbox") "SANDBOX – TEST MODE – NO REAL CHARGES" else "LIVE – PRODUCTION PAYMENTS ENABLED"
-              ),
-              tags$p(APP_VERSION),
-              tags$p(ENV_LABEL)
-            )
-          )
-        )
-      ),
-      tabPanel(
-        title = "Admin",
-        value = "Admin",
-        fluidPage(
-          h3("Admin"),
-          passwordInput("admin_password", "Admin password"),
-          actionButton("admin_login", "Log in"),
-          br(), br(),
-          uiOutput("admin_content")
+          h3("Payment receipt"),
+          uiOutput("receipt_panel")
         )
       )
     ))
 
-    do.call(navbarPage, c(list(title = "BVXC", id = "main_nav"), tabs))
-  })
+tabs <- c(tabs, list(
+  tabPanel(
+    title = tags$span(class = if (has_cart) "cart-hot" else NULL, cart_label),
+    value = "Cart",
+    fluidPage(
+      h3("Cart – review and pay"),
+      env_diag,
+      fluidRow(
+        column(
+          6,
+          textInput("buyer_name",  "Name for receipt", ""),
+          textInput("buyer_email", "Email for receipt", ""),
+          br(),
+uiOutput("cart_qty_controls"),         
+ br(),
+          strong(textOutput("cart_total")),
+          br(), br(),
+
+          actionButton("cart_clear", "Clear cart"),
+          actionButton("cart_checkout", "Pay now")
+        ),
+        column(
+          6,
+          h4("Notes"),
+          p("1. Review your items and adjust quantities before paying."),
+          p("2. Pay now opens a secure Square checkout page (unless sandbox fake mode)."),
+          p("3. After payment, you’ll be redirected back to the Receipt tab."),
+          br(),
+          tags$p(
+            style = "padding: 5px 10px; border-radius: 6px; font-weight: 700;",
+            if (SQUARE_ENV == "sandbox") "background: #ffc107;" else "background: #28a745; color: white;",
+            if (SQUARE_ENV == "sandbox") "SANDBOX – TEST MODE – NO REAL CHARGES" else "LIVE – PRODUCTION PAYMENTS ENABLED"
+          ),
+          tags$p(APP_VERSION),
+          tags$p(ENV_LABEL)
+        )
+      )
+    )
+  ),
+  tabPanel(
+    title = "Admin",
+    value = "Admin",
+    fluidPage(
+      h3("Admin"),
+      passwordInput("admin_password", "Admin password"),
+      actionButton("admin_login", "Log in"),
+      br(), br(),
+      uiOutput("admin_content")
+    )
+  )
+))
+
+do.call(navbarPage, c(list(title = "BVXC", id = "main_nav"), tabs))
+})
 
   # -----------------------------------------------------------------------------
   # DAY PASS date UI
@@ -1368,44 +1430,24 @@ server <- function(input, output, session) {
   })
 
   # -----------------------------------------------------------------------------
-  # PROGRAMS – Kids Ski age categories priced via Admin
+  # PROGRAMS (new categories)
   # -----------------------------------------------------------------------------
-
-  output$kids_age_ui <- renderUI({
-    id <- input$program_choice %||% ""
-    if (!identical(id, "kids_ski")) return(NULL)
-    selectInput("kids_age_cat", "Age category", choices = kids_age_categories())
-  })
 
   output$program_summary <- renderText({
     programs <- get_program_list()
-    id  <- input$program_choice
+    id  <- input$program_choice %||% ""
     qty <- qty_int(input$program_qty, "Participants")
+
     row <- programs[programs$id == id, , drop = FALSE]
     if (nrow(row) == 0) return("No program selected.")
 
-    if (identical(id, "kids_ski")) {
-      age_cat <- input$kids_age_cat %||% ""
-      price <- kids_ski_price_for_age(age_cat)
-      ok <- !is.na(price)
-      total <- if (ok) qty * price else NA_real_
-
-      return(paste0(
-        "Program: ", row$name[1], "\n",
-        "Age category: ", ifelse(nzchar(age_cat), age_cat, "(select an age category)"), "\n",
-        "Price: ", fmt_price(price), " per participant\n",
-        "Quantity: ", qty, "\n",
-        "-------------------------\n",
-        "Total: ", if (ok) paste0("$", sprintf("%.2f", total)) else "N/A (set age-category prices in Admin)"
-      ))
-    }
-
-    ok <- !is.na(row$price[1])
-    total <- if (ok) qty * row$price[1] else NA_real_
+    price <- row$price[1]
+    ok <- !is.na(price)
+    total <- if (ok) qty * price else NA_real_
 
     paste0(
       "Program: ", row$name[1], "\n",
-      "Price: ", fmt_price(row$price[1]), " per participant\n",
+      "Price: ", fmt_price(price), " per participant\n",
       "Quantity: ", qty, "\n",
       "-------------------------\n",
       "Total: ", if (ok) paste0("$", sprintf("%.2f", total)) else "N/A (set price in Admin)"
@@ -1414,27 +1456,10 @@ server <- function(input, output, session) {
 
   observeEvent(input$program_add_to_cart, {
     programs <- get_program_list()
-    id  <- input$program_choice
+    id  <- input$program_choice %||% ""
     qty <- qty_int(input$program_qty, "Participants")
     row <- programs[programs$id == id, , drop = FALSE]
     if (nrow(row) == 0 || qty <= 0) return()
-
-    if (identical(id, "kids_ski")) {
-      age_cat <- input$kids_age_cat %||% ""
-      if (!nzchar(age_cat)) {
-        showNotification("Select an age category.", type = "error")
-        return()
-      }
-      price <- kids_ski_price_for_age(age_cat)
-      add_to_cart(
-        "program",
-        paste0("Program – ", row$name[1], " (", age_cat, ")"),
-        qty,
-        price,
-        list(program_id=row$id[1], program_name=row$name[1], age_category=age_cat)
-      )
-      return()
-    }
 
     add_to_cart(
       "program",
@@ -1461,9 +1486,9 @@ server <- function(input, output, session) {
     events_nonce()
     ev <- get_special_events(enabled_only = TRUE)
 
-    id  <- input$event_choice
+    id  <- input$event_choice %||% ""
     qty <- qty_int(input$event_qty, "Participants")
-    if (is.null(id) || !nzchar(id) || nrow(ev) == 0) return("No event selected.")
+    if (!nzchar(id) || nrow(ev) == 0) return("No event selected.")
 
     row <- ev[ev$id == id, , drop = FALSE]
     if (nrow(row) == 0) return("No event selected.")
@@ -1487,9 +1512,9 @@ server <- function(input, output, session) {
     events_nonce()
     ev <- get_special_events(enabled_only = TRUE)
 
-    id  <- input$event_choice
+    id  <- input$event_choice %||% ""
     qty <- qty_int(input$event_qty, "Participants")
-    if (is.null(id) || !nzchar(id) || qty <= 0 || nrow(ev) == 0) return()
+    if (!nzchar(id) || qty <= 0 || nrow(ev) == 0) return()
 
     row <- ev[ev$id == id, , drop = FALSE]
     if (nrow(row) == 0) return()
@@ -1533,7 +1558,6 @@ server <- function(input, output, session) {
   # -----------------------------------------------------------------------------
   # RECEIPT RETURN / STATUS POLL
   # -----------------------------------------------------------------------------
-  # (unchanged from your v5.8)
 
   square_retrieve_order <- function(order_id) {
     if (!nzchar(order_id %||% "")) return(NULL)
@@ -1658,6 +1682,7 @@ server <- function(input, output, session) {
     tx
   }
 
+  # Load receipt from querystring on start and on change; then go to Receipt tab
   session$onFlushed(function() {
     isolate({
       qs <- session$clientData$url_search %||% ""
@@ -1669,8 +1694,8 @@ server <- function(input, output, session) {
       if (!is.null(tx)) {
         receipt_tx(tx)
         poll_count(0L)
-updateTabsetPanel(session, "main_nav", selected = "Receipt")
- }
+        updateTabsetPanel(session, "main_nav", selected = "Receipt")
+      }
     })
   }, once = TRUE)
 
@@ -1684,7 +1709,7 @@ updateTabsetPanel(session, "main_nav", selected = "Receipt")
     if (!is.null(tx)) {
       receipt_tx(tx)
       poll_count(0L)
-updateTabsetPanel(session, "main_nav", selected = "Receipt")
+      updateTabsetPanel(session, "main_nav", selected = "Receipt")
     }
   }, ignoreInit = TRUE)
 
@@ -1706,74 +1731,79 @@ updateTabsetPanel(session, "main_nav", selected = "Receipt")
     if (!is.null(updated)) receipt_tx(updated)
   })
 
-cart_from_tx <- function(tx) {
-  cj <- tx$cart_json[1] %||% ""
-  df <- tryCatch(jsonlite::fromJSON(cj), error = function(e) NULL)
-  if (is.null(df) || nrow(df) == 0) return(NULL)
-  if (!all(c("description","quantity","unit_price") %in% names(df))) return(NULL)
-  df$line_total <- df$quantity * df$unit_price
-  df[, c("description","quantity","unit_price","line_total")]
-}
+  cart_from_tx <- function(tx) {
+    cj <- tx$cart_json[1] %||% ""
+    df <- tryCatch(jsonlite::fromJSON(cj), error = function(e) NULL)
+    if (is.null(df) || nrow(df) == 0) return(NULL)
+    if (!all(c("description","quantity","unit_price") %in% names(df))) return(NULL)
+    df$line_total <- df$quantity * df$unit_price
+    df[, c("description","quantity","unit_price","line_total")]
+  }
 
-output$receipt_panel <- renderUI({
-  tx <- receipt_tx()
-  if (is.null(tx)) return(NULL)
+  output$receipt_panel <- renderUI({
+    tx <- receipt_tx()
+    if (is.null(tx)) {
+      return(tags$div(
+        style="padding:10px; border:1px solid #ddd; border-radius:8px; background:#fafafa; color:#555;",
+        "No receipt loaded yet. After payment, you will be redirected here automatically."
+      ))
+    }
 
-  total   <- tx$total_amount_cents[1] / 100
-  name    <- tx$buyer_name[1]
-  email   <- tx$buyer_email[1]
-  status  <- toupper(tx$status[1] %||% "")
-  created <- tx$created_at[1]
+    total   <- tx$total_amount_cents[1] / 100
+    name    <- tx$buyer_name[1]
+    email   <- tx$buyer_email[1]
+    status  <- toupper(tx$status[1] %||% "")
+    created <- tx$created_at[1]
 
-  title <- switch(status,
-    "COMPLETED"        = "\u2705 Payment complete",
-    "SANDBOX_TEST_OK"  = "\u2705 Test payment recorded",
-    "PENDING"          = "Payment pending",
-    "PENDING_SANDBOX"  = "Payment pending (sandbox)",
-    "FAILED"           = "Payment failed",
-    "CANCELED"         = "Payment canceled",
-    "AMOUNT_MISMATCH"  = "Payment amount mismatch",
-    paste0("Payment status: ", status)
-  )
+    title <- switch(status,
+      "COMPLETED"        = "\u2705 Payment complete",
+      "SANDBOX_TEST_OK"  = "\u2705 Test payment recorded",
+      "PENDING"          = "Payment pending",
+      "PENDING_SANDBOX"  = "Payment pending (sandbox)",
+      "FAILED"           = "Payment failed",
+      "CANCELED"         = "Payment canceled",
+      "AMOUNT_MISMATCH"  = "Payment amount mismatch",
+      paste0("Payment status: ", status)
+    )
 
-  sub <- switch(status,
-    "COMPLETED"        = "Thank you for supporting Bulkley Valley Cross Country Ski Club.",
-    "SANDBOX_TEST_OK"  = "Sandbox fake-mode transaction. No real payment was processed.",
-    "PENDING"          = "We are checking Square for confirmation. This page updates automatically.",
-    "PENDING_SANDBOX"  = "We are checking Square for confirmation (sandbox). This page updates automatically.",
-    "FAILED"           = "Square reported FAILED. Please try again.",
-    "CANCELED"         = "Square reported CANCELED. No payment was taken.",
-    "AMOUNT_MISMATCH"  = "Completed, but amount/currency mismatch. Contact the club.",
-    "Status recorded."
-  )
+    sub <- switch(status,
+      "COMPLETED"        = "Thank you for supporting Bulkley Valley Cross Country Ski Club.",
+      "SANDBOX_TEST_OK"  = "Sandbox fake-mode transaction. No real payment was processed.",
+      "PENDING"          = "We are checking Square for confirmation. This page updates automatically.",
+      "PENDING_SANDBOX"  = "We are checking Square for confirmation (sandbox). This page updates automatically.",
+      "FAILED"           = "Square reported FAILED. Please try again.",
+      "CANCELED"         = "Square reported CANCELED. No payment was taken.",
+      "AMOUNT_MISMATCH"  = "Completed, but amount/currency mismatch. Contact the club.",
+      "Status recorded."
+    )
 
-  items <- cart_from_tx(tx)
+    items <- cart_from_tx(tx)
 
-  tagList(
-    tags$div(
-      class = "receipt-card",
-      tags$div(class = "receipt-title", title),
-      tags$div(class = "receipt-sub", sub)
-    ),
-    br(),
-    h4("Details"),
-    tags$div(style="padding:10px; border:1px solid #ddd; border-radius:8px; background:#fafafa;",
-      tags$div(tags$strong("Date/time: "), created),
-      tags$div(tags$strong("Name: "), ifelse(nzchar(name %||% ""), name, "N/A")),
-      tags$div(tags$strong("Email: "), ifelse(nzchar(email %||% ""), email, "N/A")),
-      tags$div(tags$strong("Amount: "), sprintf("$%.2f %s", total, tx$currency[1])),
-      tags$div(tags$strong("Status: "), status)
-    ),
-    if (!is.null(items)) tagList(
+    tagList(
+      tags$div(
+        class = "receipt-card",
+        tags$div(class = "receipt-title", title),
+        tags$div(class = "receipt-sub", sub)
+      ),
       br(),
-      h4("Items purchased"),
-      tableOutput("receipt_items")
-    ) else NULL,
-    br(),
-    h4("Receipt QR code"),
-    plotOutput("receipt_qr", height = "260px", width = "260px")
-  )
-})
+      h4("Details"),
+      tags$div(style="padding:10px; border:1px solid #ddd; border-radius:8px; background:#fafafa;",
+        tags$div(tags$strong("Date/time: "), created),
+        tags$div(tags$strong("Name: "), ifelse(nzchar(name %||% ""), name, "N/A")),
+        tags$div(tags$strong("Email: "), ifelse(nzchar(email %||% ""), email, "N/A")),
+        tags$div(tags$strong("Amount: "), sprintf("$%.2f %s", total, tx$currency[1])),
+        tags$div(tags$strong("Status: "), status)
+      ),
+      if (!is.null(items)) tagList(
+        br(),
+        h4("Items purchased"),
+        tableOutput("receipt_items")
+      ) else NULL,
+      br(),
+      h4("Receipt QR code"),
+      plotOutput("receipt_qr", height = "260px", width = "260px")
+    )
+  })
 
   output$receipt_items <- renderTable({
     tx <- receipt_tx()
@@ -1812,28 +1842,12 @@ output$receipt_panel <- renderUI({
   }, res = 120)
 
   # -----------------------------------------------------------------------------
-  # CART TAB
+  # CART TAB (qty update controls, no test card panel)
   # -----------------------------------------------------------------------------
 
-  output$cart_table <- renderTable({
-    df <- rv$cart
-    if (nrow(df) == 0) return(NULL)
-    df$line_total <- df$quantity * df$unit_price
-    df[, c("category", "description", "quantity", "unit_price", "line_total")]
-  }, digits = 2)
-
-  output$cart_remove_ui <- renderUI({
-    df <- rv$cart
-    if (nrow(df) == 0) return(NULL)
-    choices <- setNames(df$id, paste0(df$description, " (x", df$quantity, ")"))
-    selectInput("cart_remove_id", "Select item to remove", choices = choices)
-  })
-
-  observeEvent(input$cart_remove_btn, {
-    id <- input$cart_remove_id %||% ""
-    if (!nzchar(id)) return()
-    rv$cart <- rv$cart[rv$cart$id != id, , drop = FALSE]
-  })
+output$cart_qty_controls <- renderUI({
+  render_cart_list_ui(rv$cart, change_input_id = "cart_qty_change", max_qty = 20L, show_category = TRUE)
+})
 
   output$cart_total <- renderText({
     df <- rv$cart
@@ -1865,6 +1879,7 @@ output$receipt_panel <- renderUI({
 
     total_cents <- cart_total_cents(df)
 
+    # Sandbox fake mode: simulate a “paid” transaction and go to Receipt tab
     if (SQUARE_ENV == "sandbox" && SANDBOX_MODE == "fake") {
       receipt_token <- UUIDgenerate()
 
@@ -1888,6 +1903,7 @@ output$receipt_panel <- renderUI({
       receipt_tx(load_receipt_token(receipt_token))
       poll_count(0L)
       clear_cart()
+      updateTabsetPanel(session, "main_nav", selected = "Receipt")
 
       showModal(modalDialog(
         title = "Sandbox test payment simulated",
@@ -1940,7 +1956,6 @@ output$receipt_panel <- renderUI({
   # -----------------------------------------------------------------------------
   # ADMIN
   # -----------------------------------------------------------------------------
-  # (your v5.8 admin code unchanged below)
 
   observeEvent(input$admin_login, {
     now <- Sys.time()
@@ -1971,8 +1986,25 @@ output$receipt_panel <- renderUI({
     }
   })
 
-  # --- your existing v5.8 output$admin_content and admin handlers ---
-  # (UNCHANGED; pasted from your file)
+  output$adm_program_prices_ui <- renderUI({
+    cat <- program_catalog()
+
+    inputs <- lapply(seq_len(nrow(cat)), function(i) {
+      rid <- cat$id[i]
+      nm  <- cat$name[i]
+      key <- cat$price_key[i]
+      input_id <- paste0("adm_prog_", rid)
+
+      column(4, textInput(input_id, nm, value = cfg_get(key, "")))
+    })
+
+    # chunk into rows of 3 columns
+    rows <- list()
+    for (i in seq(1, length(inputs), by = 3)) {
+      rows[[length(rows) + 1L]] <- fluidRow(inputs[i:min(i+2, length(inputs))])
+    }
+    do.call(tagList, rows)
+  })
 
   output$admin_content <- renderUI({
     if (!rv$admin_logged_in) return(p("Please log in to see admin options."))
@@ -2034,23 +2066,8 @@ output$receipt_panel <- renderUI({
         column(6, textInput("adm_price_christmas", "Christmas pass price", value = cfg_get("price_christmas_pass", "")))
       ),
 
-      tags$h5("Programs — Kids Ski Program (by age category)"),
-      fluidRow(
-        column(4, textInput("adm_kids_4_10",   "4–10 yrs",  value = cfg_get("price_program_kids_ski_4_10", ""))),
-        column(4, textInput("adm_kids_11_12",  "11–12 yrs", value = cfg_get("price_program_kids_ski_11_12", ""))),
-        column(4, textInput("adm_kids_13_14",  "13–14 yrs", value = cfg_get("price_program_kids_ski_13_14", "")))
-      ),
-      fluidRow(
-        column(4, textInput("adm_kids_15_16",  "15–16 yrs", value = cfg_get("price_program_kids_ski_15_16", ""))),
-        column(4, textInput("adm_kids_17_18",  "17–18 yrs", value = cfg_get("price_program_kids_ski_17_18", ""))),
-        column(4, textInput("adm_kids_18_plus","18+ yrs",   value = cfg_get("price_program_kids_ski_18_plus", "")))
-      ),
-
-      tags$h5("Programs — other"),
-      fluidRow(
-        column(6, textInput("adm_price_prog_masters",  "Masters Training", value = cfg_get("price_program_masters", ""))),
-        column(6, textInput("adm_price_prog_biathlon", "Biathlon Intro",   value = cfg_get("price_program_biathlon_intro", "")))
-      ),
+      tags$h5("Programs (your categories)"),
+      uiOutput("adm_program_prices_ui"),
       br(),
       actionButton("admin_save_prices", "Save prices"),
       hr(),
@@ -2075,29 +2092,30 @@ output$receipt_panel <- renderUI({
       tableOutput("admin_report_items"),
       hr(),
 
-      h4("Special events (create / edit / enable / delete)"),
-      fluidRow(
-        column(
-          6,
-          textInput("adm_ev_id",   "Event ID (unique, no spaces)", value = ""),
-          textInput("adm_ev_name", "Event name", value = ""),
-          dateInput("adm_ev_date", "Event date", value = Sys.Date()),
-          textInput("adm_ev_price","Price CAD (blank = N/A)", value = ""),
-          textInput("adm_ev_cap",  "Capacity (blank = N/A)", value = ""),
-          checkboxInput("adm_ev_enabled", "Enabled (visible to public)", value = TRUE),
-          br(),
-          actionButton("admin_ev_create", "Create new event"),
-          actionButton("admin_ev_update", "Update selected event"),
-          actionButton("admin_ev_delete", "Delete selected event")
-        ),
-        column(
-          6,
-          h5("Existing events"),
-          tableOutput("admin_events_table"),
-          p("Tip: copy an existing Event ID into the editor to update/delete.", style="color:#666;")
-        )
-      ),
-      hr(),
+h4("Special events (create / edit / enable / delete)"),
+fluidRow(
+  column(
+    6,
+    uiOutput("admin_event_select_ui"),
+    br(),
+    textInput("adm_ev_name", "Event name", value = ""),
+    dateInput("adm_ev_date", "Event date", value = Sys.Date()),
+    textInput("adm_ev_price","Price CAD (blank = N/A)", value = ""),
+    textInput("adm_ev_cap",  "Capacity (blank = N/A)", value = ""),
+    checkboxInput("adm_ev_enabled", "Enabled (visible to public)", value = TRUE),
+    br(),
+    actionButton("admin_ev_create", "Create new event"),
+    actionButton("admin_ev_update", "Update selected event"),
+    actionButton("admin_ev_delete", "Delete selected event")
+  ),
+  column(
+    6,
+    h5("Existing events"),
+    tableOutput("admin_events_table"),
+    p("Tip: select an event above to load it, then update/delete.", style="color:#666;")
+  )
+),
+hr(),
 
       h4("Blocked dates"),
       fluidRow(
@@ -2157,15 +2175,14 @@ output$receipt_panel <- renderUI({
 
     cfg_set("price_christmas_pass", input$adm_price_christmas %||% "")
 
-    cfg_set("price_program_kids_ski_4_10",    input$adm_kids_4_10 %||% "")
-    cfg_set("price_program_kids_ski_11_12",   input$adm_kids_11_12 %||% "")
-    cfg_set("price_program_kids_ski_13_14",   input$adm_kids_13_14 %||% "")
-    cfg_set("price_program_kids_ski_15_16",   input$adm_kids_15_16 %||% "")
-    cfg_set("price_program_kids_ski_17_18",   input$adm_kids_17_18 %||% "")
-    cfg_set("price_program_kids_ski_18_plus", input$adm_kids_18_plus %||% "")
-
-    cfg_set("price_program_masters",        input$adm_price_prog_masters %||% "")
-    cfg_set("price_program_biathlon_intro", input$adm_price_prog_biathlon %||% "")
+    # programs (new catalog)
+    cat <- program_catalog()
+    for (i in seq_len(nrow(cat))) {
+      rid <- cat$id[i]
+      key <- cat$price_key[i]
+      inp <- paste0("adm_prog_", rid)
+      cfg_set(key, input[[inp]] %||% "")
+    }
 
     showNotification("Prices saved.", type = "message")
   })
@@ -2217,13 +2234,13 @@ output$receipt_panel <- renderUI({
         if (is.null(cart_df) || nrow(cart_df) == 0) next
 
         tmp <- data.frame(
-          tx_id      = tx$id[i],
-          created_at = tx$created_at[i],
-          status     = tx$status[i],
-          category   = as.character(cart_df$category),
-          description= as.character(cart_df$description),
-          quantity   = as.integer(cart_df$quantity),
-          unit_price = as.numeric(cart_df$unit_price),
+          tx_id       = tx$id[i],
+          created_at  = tx$created_at[i],
+          status      = tx$status[i],
+          category    = as.character(cart_df$category),
+          description = as.character(cart_df$description),
+          quantity    = as.integer(cart_df$quantity),
+          unit_price  = as.numeric(cart_df$unit_price),
           stringsAsFactors = FALSE
         )
         tmp$line_total <- tmp$quantity * tmp$unit_price
@@ -2348,24 +2365,59 @@ output$receipt_panel <- renderUI({
     }
   )
 
-  output$admin_events_table <- renderTable({
+output$admin_event_select_ui <- renderUI({
+  if (!rv$admin_logged_in) return(NULL)
+
+  events_nonce()
+  ev <- get_special_events(enabled_only = FALSE)
+
+  if (nrow(ev) == 0) {
+    return(tags$div(style="color:#666;", "No events yet. Create one below."))
+  }
+
+  choices <- setNames(ev$id, paste0(ev$name, " (", ev$event_date, ")"))
+  selectInput("adm_ev_selected_id", "Select existing event (for update/delete)", choices = choices)
+})
+
+observeEvent(input$adm_ev_selected_id, {
+  req(rv$admin_logged_in)
+
+  id <- input$adm_ev_selected_id %||% ""
+  if (!nzchar(id)) return()
+
+  ev <- get_special_events(enabled_only = FALSE)
+  row <- ev[ev$id == id, , drop = FALSE]
+  if (nrow(row) != 1) return()
+
+  updateTextInput(session, "adm_ev_name",  value = row$name[1] %||% "")
+  updateDateInput(session, "adm_ev_date",  value = suppressWarnings(as.Date(row$event_date[1])))
+  updateTextInput(session, "adm_ev_price", value = ifelse(is.na(row$price_cad[1]), "", as.character(row$price_cad[1])))
+  updateTextInput(session, "adm_ev_cap",   value = ifelse(is.na(row$capacity[1]),  "", as.character(row$capacity[1])))
+  updateCheckboxInput(session, "adm_ev_enabled", value = isTRUE(as.integer(row$enabled[1] %||% 0) == 1L))
+}, ignoreInit = TRUE)
+
+output$admin_events_table <- renderTable({
     if (!rv$admin_logged_in) return(NULL)
     ev <- get_special_events(enabled_only = FALSE)
     if (nrow(ev) == 0) return(NULL)
     ev[, c("id","name","event_date","price_cad","capacity","enabled")]
   }, digits = 2)
 
+
+
+
   observeEvent(input$admin_ev_create, {
     req(rv$admin_logged_in)
 
-    id   <- trimws(input$adm_ev_id %||% "")
-    name <- trimws(input$adm_ev_name %||% "")
-    d    <- suppressWarnings(as.Date(input$adm_ev_date))
+name <- trimws(input$adm_ev_name %||% "")
+d    <- suppressWarnings(as.Date(input$adm_ev_date))
 
-    if (!nzchar(id) || !nzchar(name) || is.na(d)) {
-      showNotification("Event ID, name, and a valid date are required.", type="error")
-      return()
-    }
+if (!nzchar(name) || is.na(d)) {
+  showNotification("Event name and a valid date are required.", type="error")
+  return()
+}
+
+id <- UUIDgenerate()
 
     price <- {
       s <- trimws(input$adm_ev_price %||% "")
@@ -2407,8 +2459,9 @@ output$receipt_panel <- renderUI({
 
   observeEvent(input$admin_ev_update, {
     req(rv$admin_logged_in)
-    id <- trimws(input$adm_ev_id %||% "")
-    if (!nzchar(id)) { showNotification("Enter the event ID to update.", type="error"); return() }
+
+id <- input$adm_ev_selected_id %||% ""
+if (!nzchar(id)) { showNotification("Select an existing event to update.", type="error"); return() }
 
     name <- trimws(input$adm_ev_name %||% "")
     d    <- suppressWarnings(as.Date(input$adm_ev_date))
@@ -2447,8 +2500,8 @@ output$receipt_panel <- renderUI({
 
   observeEvent(input$admin_ev_delete, {
     req(rv$admin_logged_in)
-    id <- trimws(input$adm_ev_id %||% "")
-    if (!nzchar(id)) { showNotification("Enter the event ID to delete.", type="error"); return() }
+id <- input$adm_ev_selected_id %||% ""
+if (!nzchar(id)) { showNotification("Select an existing event to delete.", type="error"); return() }
 
     n <- db_exec1("DELETE FROM special_events WHERE id = ?id", id = id)
     if (n == 0) showNotification("No event found with that ID.", type="error")
