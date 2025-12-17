@@ -272,4 +272,269 @@ One-paragraph “mechanics summary” for developers
 
 Shiny renders the UI and keeps a reactive cart in memory. Admin configuration is persisted in a config key/value table in Postgres (Supabase) so prices, limits, and tab availability are editable without code changes. On checkout, the app writes a transaction row containing serialized cart items (cart_json), calls Square to create an Online Checkout payment link, then redirects the browser to Square. After payment, Square redirects back with a receipt token; the app reloads the transaction and attempts to confirm status by polling Square order/payment endpoints, then displays a receipt panel and QR code. Special events and blocked dates are stored as first-class DB tables. Reports rehydrate cart_json to produce summary and CSV exports.
 
-If you want, I can also generate a README.md you can paste directly into GitHub (with install/run/deploy steps and env var templates) based on this exact v5.8 behavior.
+____________________________________________________________________________________________________________________________________________
+# BVXC Payment App (Shiny + Square + Supabase)
+
+**Live app (Connect Cloud):** https://019b2621-4e77-3206-b803-421600641f45.share.connect.posit.cloud
+
+Single-file R Shiny app for Bulkley Valley Cross Country Ski Club to sell:
+- Day passes
+- Christmas passes
+- Season passes (early-bird cutoff supported)
+- Programs (including Kids Ski Program priced by age category)
+- Special events
+- Donations
+
+Users add items to a **cart**, then pay via **Square Online Checkout**. Admins manage prices, limits, events, blocked dates, and reports inside the app. Admin settings persist to **Supabase/Postgres** (deployed) or **SQLite fallback** (local dev only).
+
+---
+
+## Architecture
+
+### Components
+- **Shiny (R)**: UI, cart, validation, admin tools, reports
+- **Database**
+  - **Supabase Postgres** (recommended for deployed persistence)
+  - **SQLite fallback** (local development only)
+- **Square**: creates a hosted checkout payment link + processes card payments
+- **Posit Connect Cloud**: hosts the Shiny app; deploys from this GitHub repo
+
+### High-level flow
+1. User selects items on a tab and clicks **Add to cart**
+2. Cart lives in server memory (reactive values)
+3. On **Cart → Pay now**:
+   - App writes a `transactions` row including `cart_json`
+   - App requests a Square **payment link**
+   - User is redirected to Square checkout
+4. Square redirects back with a `receipt` token
+5. App loads the transaction by token and displays status + receipt panel (and polls Square when configured)
+
+---
+
+## Data storage
+
+### Tables
+- `config`  
+  Key/value store for admin-controlled configuration:
+  - prices
+  - global limits (max total CAD, max item count)
+  - early-bird cutoff
+  - tab enable/disable flags
+  - Kids Ski Program age-category pricing
+
+- `transactions`  
+  One record per checkout attempt:
+  - buyer name/email, totals, currency
+  - `cart_json` (line items for reporting)
+  - Square identifiers (payment link / order ids)
+  - `receipt_token` (lookup after redirect)
+  - status
+
+- `special_events`  
+  Admin-managed events: name, date, price, capacity (informational unless you enforce), enabled.
+
+- `blocked_dates`  
+  Admin-managed blocked day-pass dates.
+
+---
+
+## Kids Ski Program age categories
+
+Age categories are **hard-coded** in the app UI:
+- 4–10 yrs
+- 11–12 yrs
+- 13–14 yrs
+- 15–16 yrs
+- 17–18 yrs
+- 18+ yrs
+
+Prices are **admin-configured** (stored in `config`) per category.
+
+---
+
+## Requirements
+
+- R (recent release recommended)
+- Packages are managed via `renv.lock` and Connect Cloud deploy uses `manifest.json`
+
+---
+
+## Local run
+
+From the repo folder (where `app.R` is):
+
+### Option A: Local dev with SQLite fallback (fastest)
+```bash
+BVXC_ALLOW_SQLITE_FALLBACK=1 R -q -e "shiny::runApp('.', port=3838, launch.browser=TRUE)"
+Option B: Local dev with Supabase/Postgres (recommended)
+bash
+Copy code
+export BVXC_DB_URL='postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require'
+R -q -e "shiny::runApp('.', port=3838, launch.browser=TRUE)"
+Stop the app with Ctrl + C.
+
+Environment variables
+Database
+BVXC_DB_URL
+Supabase/Postgres connection string (required for deployed persistence)
+
+BVXC_DB_PATH
+SQLite filename (default: bvxc.sqlite) – only used if SQLite fallback enabled
+
+BVXC_ALLOW_SQLITE_FALLBACK
+Set to 1 for local dev if you are not using Postgres; should be 0 in production
+
+Square
+SQUARE_ENV
+sandbox or production
+
+BVXC_SANDBOX_MODE
+fake (no Square call) or square (real Square sandbox checkout)
+
+SQUARE_ACCESS_TOKEN
+Square access token for chosen environment
+
+SQUARE_LOCATION_ID
+Square location id
+
+SQUARE_VERSION
+Square API version header (optional; default is set in code)
+
+App
+BVXC_ADMIN_PASSWORD
+Required to access Admin controls
+
+BVXC_RETURN_BASE_URL
+Used to build the post-checkout redirect URL (appends /?receipt=<token>)
+
+Admin guide
+Log in
+Open Admin tab and enter BVXC_ADMIN_PASSWORD.
+
+Admin capabilities
+Set prices:
+
+Day passes
+
+Season passes (early bird + regular)
+
+Christmas pass
+
+Programs (including Kids Ski Program by age category)
+
+Set early-bird cutoff date
+
+Enable/disable public tabs
+
+Set global limits:
+
+maximum cart total
+
+maximum item count
+
+Create/update/delete special events
+
+Add/remove blocked dates
+
+Run reports:
+
+date-range summary
+
+aggregated line items
+
+CSV downloads (transactions + line items)
+
+User guide (public)
+Open the app URL
+
+Pick a tab (Day Pass / Season / Programs / Special Events / Donation)
+
+Enter quantities/options and click Add to cart
+
+Go to Cart
+
+Enter email (required for receipt)
+
+Click Pay now and complete Square checkout
+
+You will be redirected back and shown payment status + receipt details
+
+Deploying via GitHub → Posit Connect Cloud
+Update app.R
+
+Regenerate manifest.json (important if packages changed):
+
+bash
+Copy code
+R -q -e "rsconnect::writeManifest()"
+Commit and push:
+
+bash
+Copy code
+git add app.R manifest.json
+git commit -m "Update BVXC app"
+git push origin main
+In Connect Cloud:
+
+Ensure the content is linked to this GitHub repo
+
+Verify it redeploys from the latest commit
+
+Ensure environment variables are set for the deployed app (especially BVXC_DB_URL)
+
+Production readiness checklist
+This is what remains to be “production-grade”:
+
+Square production configuration
+
+Set SQUARE_ENV=production
+
+Set production SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID
+
+Confirm BVXC_RETURN_BASE_URL is correct
+
+Square webhook integration (recommended)
+
+Current approach relies on redirect + polling to confirm status
+
+Webhooks provide authoritative async confirmation and better reconciliation
+
+Capacity enforcement (optional but common)
+
+Events have capacity stored but may be informational unless enforced
+
+If enforcing: count confirmed registrations and reject over-capacity checkouts
+
+Reporting filters
+
+Decide if reports should include only COMPLETED transactions (recommended)
+
+Optionally add UI filters by status
+
+Operational basics
+
+DB backup strategy (Supabase)
+
+Monitoring/log review process
+
+Data retention/privacy statement (names/emails are stored)
+
+License / Ownership
+This repository is intended for BVXC operational use. Add an explicit license if you plan to publish broadly.
+
+makefile
+Copy code
+::contentReference[oaicite:0]{index=0}
+
+
+
+
+
+
+
+
+Thinking
+
+
+
+ChatGPT can make mistakes. Check important info.
