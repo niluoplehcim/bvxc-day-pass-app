@@ -2229,16 +2229,16 @@
       "checksum": "157a327a724eb9c908d03b6b6db7dabe"
     },
     ".Rprofile": {
-      "checksum": "44b083471ca3a18b35ba23d52cb5e9f0"
+      "checksum": "517d407e88287221c92b5087fe0d2f2c"
     },
     "README.md": {
-      "checksum": "16bd4d51bef6defa100c0ffcf88c169b"
+      "checksum": "2015de8e3440ff255ac23d49814f263a"
     },
     "app.R": {
-      "checksum": "ea6a38c0b54e0a43f4107104b157b258"
+      "checksum": "e6f33684de34923cea502d3e209def7b"
     },
     "bvxc.sqlite": {
-      "checksum": "fd5d455eb9c56521aff1349dd7ec0d0c"
+      "checksum": "042fbf220223335ad88c51fa22bca2df"
     },
     "check_env.R": {
       "checksum": "ec441a7d3b51296025f6d8861bf28f9f"

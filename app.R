@@ -516,6 +516,23 @@ css_tabs <- "
 }
 .cart-hot { color: #0d6efd !important; font-weight: 800 !important; font-size: 1.07em !important; }
 .mini-cart-box { margin-top: 14px; padding: 10px; border: 1px solid #ddd; border-radius: 8px; background: #fafafa; }
+.receipt-card {
+  padding: 16px;
+  border: 1px solid #d1e7dd;
+  background: #d1e7dd;
+  border-radius: 10px;
+  margin-top: 10px;
+}
+.receipt-title {
+  font-size: 34px;
+  font-weight: 800;
+  color: #0f5132;
+}
+.receipt-sub {
+  margin-top: 6px;
+  color: #0f5132;
+  font-weight: 600;
+}
 "
 
 ui <- fluidPage(
@@ -744,6 +761,7 @@ server <- function(input, output, session) {
     cart_items <- if (nrow(rv$cart) == 0) 0 else sum(rv$cart$quantity %||% 0)
     has_cart   <- cart_items > 0
     cart_label <- if (has_cart) paste0("Cart (", cart_items, ")") else "Cart"
+    has_receipt <- !is.null(receipt_tx())
 
     env_diag <- tagList(
       if (db_is_postgres()) {
@@ -976,6 +994,19 @@ server <- function(input, output, session) {
                 )
               )
             )
+          )
+        )
+      ))
+    }
+
+    if (has_receipt) {
+      tabs <- c(tabs, list(
+        tabPanel(
+          title = "Receipt",
+          value = "Receipt",
+          fluidPage(
+            h3("Payment receipt"),
+            uiOutput("receipt_panel")
           )
         )
       ))
@@ -1638,8 +1669,8 @@ server <- function(input, output, session) {
       if (!is.null(tx)) {
         receipt_tx(tx)
         poll_count(0L)
-        updateTabsetPanel(session, "main_nav", selected = "Cart")
-      }
+updateTabsetPanel(session, "main_nav", selected = "Receipt")
+ }
     })
   }, once = TRUE)
 
@@ -1653,7 +1684,7 @@ server <- function(input, output, session) {
     if (!is.null(tx)) {
       receipt_tx(tx)
       poll_count(0L)
-      updateTabsetPanel(session, "main_nav", selected = "Cart")
+updateTabsetPanel(session, "main_nav", selected = "Receipt")
     }
   }, ignoreInit = TRUE)
 
@@ -1675,53 +1706,80 @@ server <- function(input, output, session) {
     if (!is.null(updated)) receipt_tx(updated)
   })
 
-  output$receipt_panel <- renderUI({
+cart_from_tx <- function(tx) {
+  cj <- tx$cart_json[1] %||% ""
+  df <- tryCatch(jsonlite::fromJSON(cj), error = function(e) NULL)
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  if (!all(c("description","quantity","unit_price") %in% names(df))) return(NULL)
+  df$line_total <- df$quantity * df$unit_price
+  df[, c("description","quantity","unit_price","line_total")]
+}
+
+output$receipt_panel <- renderUI({
+  tx <- receipt_tx()
+  if (is.null(tx)) return(NULL)
+
+  total   <- tx$total_amount_cents[1] / 100
+  name    <- tx$buyer_name[1]
+  email   <- tx$buyer_email[1]
+  status  <- toupper(tx$status[1] %||% "")
+  created <- tx$created_at[1]
+
+  title <- switch(status,
+    "COMPLETED"        = "\u2705 Payment complete",
+    "SANDBOX_TEST_OK"  = "\u2705 Test payment recorded",
+    "PENDING"          = "Payment pending",
+    "PENDING_SANDBOX"  = "Payment pending (sandbox)",
+    "FAILED"           = "Payment failed",
+    "CANCELED"         = "Payment canceled",
+    "AMOUNT_MISMATCH"  = "Payment amount mismatch",
+    paste0("Payment status: ", status)
+  )
+
+  sub <- switch(status,
+    "COMPLETED"        = "Thank you for supporting Bulkley Valley Cross Country Ski Club.",
+    "SANDBOX_TEST_OK"  = "Sandbox fake-mode transaction. No real payment was processed.",
+    "PENDING"          = "We are checking Square for confirmation. This page updates automatically.",
+    "PENDING_SANDBOX"  = "We are checking Square for confirmation (sandbox). This page updates automatically.",
+    "FAILED"           = "Square reported FAILED. Please try again.",
+    "CANCELED"         = "Square reported CANCELED. No payment was taken.",
+    "AMOUNT_MISMATCH"  = "Completed, but amount/currency mismatch. Contact the club.",
+    "Status recorded."
+  )
+
+  items <- cart_from_tx(tx)
+
+  tagList(
+    tags$div(
+      class = "receipt-card",
+      tags$div(class = "receipt-title", title),
+      tags$div(class = "receipt-sub", sub)
+    ),
+    br(),
+    h4("Details"),
+    tags$div(style="padding:10px; border:1px solid #ddd; border-radius:8px; background:#fafafa;",
+      tags$div(tags$strong("Date/time: "), created),
+      tags$div(tags$strong("Name: "), ifelse(nzchar(name %||% ""), name, "N/A")),
+      tags$div(tags$strong("Email: "), ifelse(nzchar(email %||% ""), email, "N/A")),
+      tags$div(tags$strong("Amount: "), sprintf("$%.2f %s", total, tx$currency[1])),
+      tags$div(tags$strong("Status: "), status)
+    ),
+    if (!is.null(items)) tagList(
+      br(),
+      h4("Items purchased"),
+      tableOutput("receipt_items")
+    ) else NULL,
+    br(),
+    h4("Receipt QR code"),
+    plotOutput("receipt_qr", height = "260px", width = "260px")
+  )
+})
+
+  output$receipt_items <- renderTable({
     tx <- receipt_tx()
     if (is.null(tx)) return(NULL)
-
-    total   <- tx$total_amount_cents[1] / 100
-    name    <- tx$buyer_name[1]
-    status  <- toupper(tx$status[1] %||% "")
-    created <- tx$created_at[1]
-
-    title <- switch(status,
-      "COMPLETED"        = "Payment complete",
-      "SANDBOX_TEST_OK"  = "Test payment recorded",
-      "PENDING"          = "Payment pending",
-      "PENDING_SANDBOX"  = "Payment pending (sandbox)",
-      "FAILED"           = "Payment failed",
-      "CANCELED"         = "Payment canceled",
-      "AMOUNT_MISMATCH"  = "Payment amount mismatch",
-      paste0("Payment status: ", status)
-    )
-
-    msg <- switch(status,
-      "COMPLETED"        = "Your payment has been confirmed.",
-      "SANDBOX_TEST_OK"  = "This is a sandbox fake-mode transaction. No real payment was processed.",
-      "PENDING"          = "We are checking Square for confirmation. This page updates automatically.",
-      "PENDING_SANDBOX"  = "We are checking Square for confirmation (sandbox). This page updates automatically.",
-      "FAILED"           = "Square reported the payment as FAILED. Please try again.",
-      "CANCELED"         = "Square reported the order as CANCELED. No payment was taken.",
-      "AMOUNT_MISMATCH"  = "Square reported a completed payment, but the amount/currency did not match what we expected. Contact the club.",
-      "Status recorded. If unsure, contact the club."
-    )
-
-    tagList(
-      tags$hr(),
-      h4(title),
-      p(sprintf(
-        "Thank you, %s, for supporting Bulkley Valley Cross Country Ski Club.",
-        ifelse(is.na(name) || name == "", "skier", name)
-      )),
-      p(sprintf("Payment date/time: %s", created)),
-      p(sprintf("Amount: $%.2f %s", total, tx$currency[1])),
-      p(sprintf("Status: %s", status)),
-      tags$div(style="margin-top:8px; padding:10px; border:1px solid #ddd; border-radius:6px; background:#fafafa;", msg),
-      br(),
-      h5("Receipt QR code"),
-      plotOutput("receipt_qr", height = "260px", width = "260px")
-    )
-  })
+    cart_from_tx(tx)
+  }, digits = 2)
 
   output$receipt_qr <- renderPlot({
     tx <- receipt_tx()
