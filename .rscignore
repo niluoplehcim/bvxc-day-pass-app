@@ -1,0 +1,16 @@
+# never deploy secrets (anywhere)
+**/.Renviron
+
+# never deploy archives/backups/history (anywhere)
+archive/**
+**/.Rapp.history
+**/.Rhistory
+**/.RData
+**/.Rproj.user/**
+
+# never deploy databases/backups (anywhere)
+**/*.sqlite
+**/*.sqlite.bak
+**/*.bak
+**/*.backup_*
+
