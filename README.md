@@ -1,150 +1,275 @@
-# BVXC Payment App (Shiny + Square + Supabase)
+BVXC Payment App Overview
 
-This is a Shiny web app used by the Bulkley Valley Cross Country Ski Club (BVXC) to sell passes/program registrations, accept donations, and process payments through Square.
+Live (current) URL: https://019b2621-4e77-3206-b803-421600641f45.share.connect.posit.cloud
 
-The key design goal: **club admins can change settings (prices, dates, events, tabs) without editing code**, and those settings **persist online** when the app is hosted on Posit Connect Cloud by using **Supabase Postgres**.
+This is a single-file R Shiny web app that sells day passes, season passes, Christmas passes, programs, special events, and donations. Users add items to a cart and pay using Square Online Checkout. The admin team manages prices, availability, blocked dates, events, and global limits inside the app; those settings persist in the database (Supabase/Postgres on the deployed app; optional SQLite for local dev).
 
----
+Architecture and Data Flow
+Components
 
-## What users can do
+Shiny (R): UI + server logic, validation, cart, admin controls, reporting.
 
-Public tabs:
-- **Day Pass**: pick a ski date, add passes to cart.
-- **Christmas Pass**: pick a 14‑day window that must include Dec 25, add to cart.
-- **Season Pass**: adult / youth passes (early‑bird vs regular pricing supported).
-- **Programs**: fixed program list with admin-set prices.
-- **Special Events**: choose an event created by Admin, add registrations to cart.
-- **Donation**: add a donation to cart (not tax‑deductible unless the club becomes a registered charity).
+Database
 
-Cart:
-- Review cart items
-- Enter name/email for receipt
-- **Pay now** redirects to Square hosted checkout
-- After successful payment, the app can display a “thank you” panel and a receipt QR code (when redirect is configured)
+Supabase (Postgres) for deployed persistence (recommended).
 
-Admin:
-- Password‑protected
-- Enable/disable tabs
-- Set all prices
-- Set early-bird cutoff date
-- Set transaction limits
-- Block dates (prevent payment on specific dates)
-- Create/update/delete special events
+SQLite fallback for local development only.
 
----
+Square: creates a payment link (Square-hosted checkout page) and processes card payments.
 
-## Database modes (important)
+Posit Connect Cloud: hosts and runs the Shiny app; pulls code from GitHub and deploys via manifest.json / renv.lock.
 
-This app supports two database modes:
+High-level flow
 
-### A) Production persistence (recommended)
-If `BVXC_DB_URL` is set, the app uses **Postgres (Supabase)**.
-- Admin settings persist across redeployments
-- Events/blocked dates persist
-- Transaction records persist
+User selects items (Day Pass / Season / Programs / Events / Donation) and clicks Add to cart.
 
-### B) Local development fallback
-If `BVXC_DB_URL` is **not** set, the app uses **SQLite** (`bvxc.sqlite` by default).
-- Good for local testing
-- Not recommended for production persistence on Connect Cloud
+App stores items in an in-memory Shiny reactive cart (rv$cart).
 
----
+On Cart → Pay now:
 
-## Environment variables (Secrets)
+App writes a transaction row to the database with status = PENDING (or sandbox variants).
 
-Do **not** hardcode secrets into `app.R`.
+App calls Square to create a payment link using cart line items.
 
-### Required (Connect Cloud Secrets)
-- `SQUARE_ENV`  
-  Must be exactly: `sandbox` or `production`
+App redirects the browser to Square checkout.
 
-- `BVXC_SANDBOX_MODE`  
-  Must be exactly: `fake` or `square`  
-  - `fake` = simulate payment (no Square redirect)  
-  - `square` = real Square sandbox hosted checkout
+After payment, Square redirects back to the app using a receipt token in the URL.
 
-- `SQUARE_ACCESS_TOKEN`  
-  Square access token (sandbox or production).
+App looks up the transaction by receipt token and (when possible) confirms status by polling Square (order/payment lookup), then shows a receipt panel and QR code.
 
-- `SQUARE_LOCATION_ID`  
-  Your Square location id.
+Database Schema and What Gets Stored
+config table
 
-- `BVXC_ADMIN_PASSWORD`  
-  Admin tab password.
+Key/value store for all admin-controlled variables, including:
 
-- `BVXC_RETURN_BASE_URL`  
-  Your deployed Connect Cloud app URL **without** a trailing slash.  
-  Example: `https://your-app-name.connect.posit.cloud`
+Prices (day passes, season passes, Christmas pass, programs)
 
-- `BVXC_DB_URL`  
-  Supabase Postgres connection string. Use the **pooler** connection method (session pooler / Supavisor) from Supabase.
+Kids Ski Program age-category pricing (hard-coded categories; prices are admin-set)
 
-Recommended libpq keyword/value format:
-```
-host=aws-1-ca-central-1.pooler.supabase.com port=5432 dbname=postgres user=postgres.<your-project-ref> password=<db-password> sslmode=require
-```
+Global limits (max total CAD, max total items)
 
-Optional:
-- `BVXC_DB_PATH` (SQLite filename for local mode; default `bvxc.sqlite`)
+Tab enable/disable flags
 
----
+Early-bird cutoff date
 
-## Local development (quick start)
+transactions table
 
-1) Go to the repo folder:
-```bash
-cd ~/Documents/bvxc-day-pass-app
-```
+One row per checkout attempt:
 
-2) Create a local `.Renviron` for development (do not commit it):
-```bash
-SQUARE_ENV=sandbox
-BVXC_SANDBOX_MODE=fake
-SQUARE_ACCESS_TOKEN=...
-SQUARE_LOCATION_ID=...
-BVXC_ADMIN_PASSWORD=...
-# Leave BVXC_DB_URL empty to use SQLite locally
-# BVXC_DB_URL=
-```
+created_at, buyer info, total_amount_cents, currency
 
-3) Run the app:
-```bash
-R -q -e "shiny::runApp('.', launch.browser=TRUE)"
-```
+cart_json containing the cart line items (used for reports)
 
----
+Square IDs when applicable (square_checkout_id, square_order_id)
 
-## Deploy to Posit Connect Cloud (overview)
+receipt_token used to find the transaction after redirect
 
-1) Ensure Connect Cloud can access the GitHub repo.
-   - Some plans require the repo to be public.
+status (PENDING, COMPLETED, FAILED, etc.)
 
-2) Create content from the repo in Connect Cloud.
+special_events table
 
-3) Add the Secrets listed above.
+Admin-managed events:
 
-4) Publish.
+name, date, price, capacity (currently informational unless you enforce it), enabled flag
 
----
+blocked_dates table
 
-## Security notes
+Dates where Day Pass payments are disallowed (UI blocks and server enforces).
 
-- **Never** commit `.Renviron` or any file containing real tokens/passwords.
-- Use Connect Cloud **Secrets** for production values.
-- If a secret was ever pushed to GitHub, rotate it immediately (Square token / Supabase DB password).
+How Pricing Works
+Hard-coded category lists (stable)
 
----
+Kids Ski Program age categories are fixed:
 
-## Common problems
+4–10 yrs, 11–12 yrs, 13–14 yrs, 15–16 yrs, 17–18 yrs, 18+ yrs
 
-### “SQUARE_ENV must be one of: sandbox, production”
-Your `SQUARE_ENV` secret is missing or not exactly `sandbox` / `production`.
+These are stable labels in the UI and in cart descriptions.
 
-### “SQUARE_ACCESS_TOKEN is not set”
-You did not set `SQUARE_ACCESS_TOKEN` in Connect Cloud Secrets (or it’s blank).
+Admin-controlled prices (dynamic)
 
-### Supabase hostname doesn’t resolve
-Use the Supabase **pooler** host (session pooler / Supavisor) instead of the direct `db.<project>.supabase.co` host.
+All prices are pulled at runtime from config.
+If a price is missing/blank, it becomes N/A and the app blocks adding that item to cart.
 
-### Square checkout refuses to connect
-This can happen if the app is embedded in an iframe. The app includes an iframe-escape redirect handler; confirm you’re testing the published Connect Cloud URL in a normal browser tab.
+Limits and Validation
+
+Global cart validation is applied at add-to-cart time and again at checkout:
+
+Max transaction total CAD (limit_max_total_cad)
+
+Max total number of items (limit_max_items_total)
+
+Blocked dates are enforced when choosing day-pass dates.
+
+User Guide
+Public user (non-admin)
+
+Open the app URL.
+
+Go to a tab (Day Pass / Season Pass / Programs / Special Events / Donation).
+
+Enter quantities, choose dates/options, click Add to cart.
+
+Go to Cart:
+
+Enter name (optional but recommended)
+
+Enter email (required for receipt)
+
+Click Pay now
+
+Complete payment on Square’s checkout page.
+
+You’ll be redirected back and see a payment status + QR code.
+
+Admin
+
+Open Admin tab.
+
+Enter admin password and log in.
+
+Admin capabilities:
+
+Set prices (including Kids Ski age-category pricing)
+
+Set early-bird cutoff
+
+Enable/disable tabs
+
+Set global limits
+
+Create/update/delete special events
+
+Add/remove blocked dates
+
+Run reports:
+
+Date range summary
+
+Line-item aggregation
+
+Download CSVs (transactions + expanded line-items)
+
+Coder Guide
+Repo contents and dependency management
+
+app.R is the app (single-file architecture).
+
+Dependencies are captured via renv.lock and deployed using manifest.json (generated by rsconnect::writeManifest()).
+
+Environment variables (critical)
+
+Square
+
+SQUARE_ENV = sandbox or production
+
+BVXC_SANDBOX_MODE = fake (no Square call) or square (real sandbox checkout)
+
+SQUARE_ACCESS_TOKEN
+
+SQUARE_LOCATION_ID
+
+SQUARE_VERSION (API version header)
+
+Database
+
+BVXC_DB_URL = Postgres/Supabase connection string (deployed)
+
+BVXC_ALLOW_SQLITE_FALLBACK = 1 only for local dev (should be 0 in production)
+
+App
+
+BVXC_ADMIN_PASSWORD
+
+BVXC_RETURN_BASE_URL (used to build the post-checkout redirect URL containing ?receipt=)
+
+Key internal concepts
+
+rv$cart holds the live cart in memory (reactiveValues).
+
+Checkout creates a transaction row with a receipt_token.
+
+Redirect back uses receipt_token to reload and display payment state.
+
+Reports parse cart_json back into line items for aggregation.
+
+Known implementation choice
+
+Payment confirmation uses redirect + polling (Square order/payment lookup).
+For higher integrity, production should add Square webhooks (see below).
+
+What’s Left to Enter Production
+
+Here’s the real checklist—this is what matters.
+
+1) Square production readiness
+
+Switch SQUARE_ENV=production
+
+Use production SQUARE_ACCESS_TOKEN + SQUARE_LOCATION_ID
+
+Confirm checkout works end-to-end with real cards
+
+Confirm your return URL (BVXC_RETURN_BASE_URL) is correct for production
+
+2) Add Square webhooks (recommended)
+
+Right now, status is confirmed via redirect/polling. That works, but it’s not ideal.
+Production-grade approach:
+
+Configure Square webhooks (payment/order events)
+
+Verify webhook signatures
+
+Update transactions.status based on webhook events
+This removes reliance on the user returning to the app and makes reconciliation cleaner.
+
+3) Capacity enforcement (if you want it real)
+
+Events have capacity, but unless you explicitly implemented reservation counting and blocking, capacity is currently informational.
+Production needs:
+
+Count confirmed registrations per event
+
+Reject adds/checkout if capacity would be exceeded
+
+Decide whether “pending carts” reserve spots or not (and if yes, add expiry)
+
+4) Admin hardening
+
+Add logout
+
+Consider rate limiting / lockouts (you already have a basic lockout pattern)
+
+Consider multiple admin users and audit logs (optional but worth it)
+
+5) Reporting / accounting consistency
+
+Decide what “revenue” means:
+
+Include only COMPLETED? (recommended)
+
+Exclude sandbox and failed/canceled
+
+Add a report filter UI to select statuses
+
+6) Operational basics
+
+Backups of Supabase DB
+
+Monitoring (error logs, uptime)
+
+Privacy policy and data retention statement (you’re storing names/emails)
+
+Confirm TLS is handled (Connect Cloud handles HTTPS)
+
+7) Domain and branding (optional)
+
+If you want a nicer URL than the Connect Cloud share link:
+
+Put it behind your own domain (reverse proxy or Connect configuration, depending on your plan/capabilities)
+
+One-paragraph “mechanics summary” for developers
+
+Shiny renders the UI and keeps a reactive cart in memory. Admin configuration is persisted in a config key/value table in Postgres (Supabase) so prices, limits, and tab availability are editable without code changes. On checkout, the app writes a transaction row containing serialized cart items (cart_json), calls Square to create an Online Checkout payment link, then redirects the browser to Square. After payment, Square redirects back with a receipt token; the app reloads the transaction and attempts to confirm status by polling Square order/payment endpoints, then displays a receipt panel and QR code. Special events and blocked dates are stored as first-class DB tables. Reports rehydrate cart_json to produce summary and CSV exports.
+
+If you want, I can also generate a README.md you can paste directly into GitHub (with install/run/deploy steps and env var templates) based on this exact v5.8 behavior.
