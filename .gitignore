@@ -43,3 +43,7 @@ tab_flags.csv
 
 # Local secrets (do not commit)
 .Renviron
+
+# local helper scripts
+check_env.R
+run_local.R
