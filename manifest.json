@@ -2225,17 +2225,29 @@
     }
   },
   "files": {
+    ".Renviron": {
+      "checksum": "157a327a724eb9c908d03b6b6db7dabe"
+    },
     ".Rprofile": {
-      "checksum": "6aaf969986aa82331236c89b2b9d30c1"
+      "checksum": "90a649079037b167aa60702937f7f636"
     },
     "README.md": {
       "checksum": "16bd4d51bef6defa100c0ffcf88c169b"
     },
     "app.R": {
-      "checksum": "fe6a2f58a27df81fd10c988fbd6d7730"
+      "checksum": "5165f445ee0e57e8c4121f6006752250"
+    },
+    "bvxc.sqlite": {
+      "checksum": "fd5d455eb9c56521aff1349dd7ec0d0c"
+    },
+    "check_env.R": {
+      "checksum": "ec441a7d3b51296025f6d8861bf28f9f"
     },
     "renv.lock": {
       "checksum": "4f882f81c9a601f4c68af630a7ace2da"
+    },
+    "run_local.R": {
+      "checksum": "5641f7c337905e6c54a7ff81842c14d6"
     }
   },
   "users": null
