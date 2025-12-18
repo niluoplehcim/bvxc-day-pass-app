@@ -483,11 +483,14 @@ create_square_checkout_from_cart <- function(cart_df,
     checkout_options = list(
       ask_for_shipping_address = FALSE,
       redirect_url             = redirect_url
-    ),
-    pre_populated_data = list(
-      buyer_email = buyer_email %||% ""
     )
   )
+
+  # Only include buyer_email if it is non-empty (prevents Square rejecting "")
+  buyer_email <- trimws(as.character(buyer_email %||% ""))
+  if (nzchar(buyer_email)) {
+    body$pre_populated_data <- list(buyer_email = buyer_email)
+  }
 
   r <- square_http_post("/v2/online-checkout/payment-links", body = body)
   if (r$status >= 300 || is.null(r$body$payment_link$url)) {
@@ -733,6 +736,34 @@ server <- function(input, output, session) {
       )
     }
     as.integer(round(v))
+  }
+
+  # -----------------------------------------------------------------------------
+  # BUYER VALIDATION (centralized)
+  # -----------------------------------------------------------------------------
+
+  is_valid_email <- function(x) {
+    x <- trimws(as.character(x %||% ""))
+    nzchar(x) && grepl("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", x)
+  }
+
+  validate_buyer_or_notify <- function(name, email) {
+    name  <- trimws(as.character(name %||% ""))
+    email <- trimws(as.character(email %||% ""))
+
+    if (!nzchar(name) && !nzchar(email)) {
+      showNotification("Please enter your name and email address.", type = "warning")
+      return(FALSE)
+    }
+    if (!nzchar(name)) {
+      showNotification("Please enter your name.", type = "warning")
+      return(FALSE)
+    }
+    if (!is_valid_email(email)) {
+      showNotification("Please enter a valid email address for the receipt.", type = "warning")
+      return(FALSE)
+    }
+    TRUE
   }
 
   build_redirect_url <- function(receipt_token) {
@@ -1709,10 +1740,11 @@ server <- function(input, output, session) {
       note         = paste("BVXC", if (SQUARE_ENV == "sandbox") "sandbox" else "production", source, "checkout"),
       redirect_url = redirect_url
     )
-    if (is.null(res) || is.null(res$checkout_url)) {
-      showNotification("Error creating Square checkout.", type = "error")
-      return()
-    }
+
+if (is.null(res) || !nzchar(res$checkout_url %||% "")) {
+  showNotification("Unable to start checkout. Please verify your name and email address and try again.", type = "error")
+  return()
+}
 
     ok <- tryCatch({
       db_exec1(
@@ -2070,18 +2102,37 @@ server <- function(input, output, session) {
     }
   }
 
-  output$receipt_qr <- renderImage({
-    tx <- receipt_tx()
-    if (is.null(tx) || nrow(tx) != 1) return(NULL)
-    token <- as.character(tx$receipt_token[1] %||% "")
-    if (!nzchar(token)) return(NULL)
+output$receipt_qr <- renderImage({
+  tx <- receipt_tx()
+  if (is.null(tx) || nrow(tx) != 1) return(NULL)
 
-    url <- receipt_url_for_token(token)
-    tf <- tempfile(fileext = ".png")
-    qrcode::qrcode_gen(url, plotQRcode = FALSE) # ensures package loaded
-    qrcode::qrcode_gen(url, plotQRcode = TRUE, file = tf)
-    list(src = tf, contentType = "image/png", width = 220, height = 220, alt = "Receipt QR")
-  }, deleteFile = TRUE)
+  token <- as.character(tx$receipt_token[1] %||% "")
+  if (!nzchar(token)) return(NULL)
+
+  url <- receipt_url_for_token(token)
+  if (!nzchar(url)) return(NULL)
+
+  tf <- tempfile(fileext = ".png")
+
+  ok <- tryCatch({
+    grDevices::png(tf, width = 260, height = 260)
+    op <- par(mar = c(0, 0, 0, 0))
+    on.exit({
+      par(op)
+      grDevices::dev.off()
+    }, add = TRUE)
+
+    qrcode::qrcode_gen(url, plotQRcode = TRUE)
+    TRUE
+  }, error = function(e) {
+    try(grDevices::dev.off(), silent = TRUE)
+    FALSE
+  })
+
+  if (!ok || !file.exists(tf)) return(NULL)
+
+  list(src = tf, contentType = "image/png", width = 220, height = 220, alt = "Receipt QR")
+}, deleteFile = TRUE)
 
   output$receipt_items <- renderUI({
     tx <- receipt_tx()
