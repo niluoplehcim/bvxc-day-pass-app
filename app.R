@@ -126,10 +126,12 @@ make_pool <- function() {
   if (db_is_postgres()) {
     s <- trimws(DB_URL)
 
+    # URI form (recommended): postgresql://USER:PASSWORD@HOST:5432/DB?sslmode=require
     if (grepl("^postgres(ql)?://", s, ignore.case = TRUE)) {
       return(pool::dbPool(RPostgres::Postgres(), dbname = s))
     }
 
+    # KV form: host=... port=... dbname=... user=... password=...
     args <- parse_kv_conn(s)
     need <- c("host", "port", "dbname", "user", "password")
     missing <- setdiff(need, names(args))
@@ -139,7 +141,6 @@ make_pool <- function() {
         "\nUse URI form (recommended): postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require"
       )
     }
-
     return(do.call(pool::dbPool, c(list(RPostgres::Postgres()), args)))
   }
 
@@ -270,7 +271,6 @@ cfg_set <- function(key, value) {
         "UPDATE config SET value = ?value WHERE key = ?key",
         key = key, value = value
       )
-
       if (isTRUE(n == 0)) {
         tryCatch({
           db_exec(con,
@@ -319,8 +319,6 @@ cfg_date <- function(key, default = as.Date(NA)) {
   if (is.na(d)) default else d
 }
 
-fmt_price <- function(x) if (is.na(x)) "N/A" else paste0("$", sprintf("%.2f", x))
-
 # -----------------------------------------------------------------------------
 # BUSINESS DATA
 # -----------------------------------------------------------------------------
@@ -364,7 +362,6 @@ get_season_prices <- function(is_early_bird = FALSE) {
 
 get_christmas_pass_price <- function() cfg_num("price_christmas_pass", NA_real_)
 
-# Programs: hard-coded catalog
 program_catalog <- function() {
   data.frame(
     id = c(
@@ -405,7 +402,7 @@ get_blocked_dates <- function() {
 }
 
 # -----------------------------------------------------------------------------
-# LIMITS / VALIDATION (global cart limits)
+# LIMITS / VALIDATION
 # -----------------------------------------------------------------------------
 
 validate_cart_limits <- function(cart_df) {
@@ -427,7 +424,7 @@ validate_cart_limits <- function(cart_df) {
 }
 
 # -----------------------------------------------------------------------------
-# SQUARE CHECKOUT (CART)
+# SQUARE CHECKOUT (Payment Links)
 # -----------------------------------------------------------------------------
 
 square_base_url <- function() {
@@ -448,7 +445,7 @@ create_square_checkout_from_cart <- function(cart_df,
                                             buyer_email  = NULL,
                                             note         = NULL,
                                             redirect_url = NULL) {
-  if (nrow(cart_df) == 0) return(NULL)
+  if (is.null(cart_df) || nrow(cart_df) == 0) return(NULL)
 
   line_items <- lapply(seq_len(nrow(cart_df)), function(i) {
     row <- cart_df[i, ]
@@ -516,10 +513,10 @@ checkout_panel_ui <- function(prefix, title = "Checkout") {
       textInput(paste0(prefix, "_buyer_email"), "Email for receipt", value = ""),
       br(),
       strong(textOutput(paste0(prefix, "_cart_total"))),
-           br(), br(),
-     actionButton(paste0(prefix, "_cart_clear"), "Clear cart"),
-uiOutput(paste0(prefix, "_cart_pay_ui"))
- )
+      br(), br(),
+      actionButton(paste0(prefix, "_cart_clear"), "Clear cart"),
+      uiOutput(paste0(prefix, "_cart_pay_ui"))
+    )
   )
 }
 
@@ -551,23 +548,66 @@ css_tabs <- "
   padding: 6px 12px;
   min-width: 120px;
 }
-.receipt-card {
+/* ---- Receipt status banners ---- */
+.receipt-card{
   padding: 16px;
-  border: 1px solid #d1e7dd;
-  background: #d1e7dd;
   border-radius: 10px;
   margin-top: 10px;
+  border: 1px solid #ddd;
+  background: #fafafa;
 }
-.receipt-title {
+
+.receipt-title{
   font-size: 34px;
   font-weight: 800;
-  color: #0f5132;
 }
-.receipt-sub {
+
+.receipt-sub{
   margin-top: 6px;
-  color: #0f5132;
   font-weight: 600;
 }
+
+/* Status variants */
+.receipt-ok{
+  border-color: #badbcc;
+  background: #d1e7dd;
+  color: #0f5132;
+}
+.receipt-ok .receipt-title,
+.receipt-ok .receipt-sub{ color:#0f5132; }
+
+.receipt-pending{
+  border-color: #ffecb5;
+  background: #fff3cd;
+  color: #664d03;
+}
+.receipt-pending .receipt-title,
+.receipt-pending .receipt-sub{ color:#664d03; }
+
+.receipt-bad{
+  border-color: #f5c2c7;
+  background: #f8d7da;
+  color: #842029;
+}
+.receipt-bad .receipt-title,
+.receipt-bad .receipt-sub{ color:#842029; }
+
+.receipt-neutral{
+  border-color: #dee2e6;
+  background: #f8f9fa;
+  color: #495057;
+}
+
+.receipt-spinner{
+  display:inline-block;
+  width:14px; height:14px;
+  border:2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: receiptSpin .8s linear infinite;
+  vertical-align: -2px;
+}
+@keyframes receiptSpin { to { transform: rotate(360deg); } }
 
 /* ---- Pay button emphasis (ONLY when cart has items) ---- */
 .pay-now-hot {
@@ -634,8 +674,6 @@ server <- function(input, output, session) {
   events_nonce        <- reactiveVal(0L)
 
   poll_count <- reactiveVal(0L)
-
-  # Reports
   report_state <- reactiveVal(NULL)
 
   clear_cart <- function() rv$cart <- empty_cart_df()
@@ -668,7 +706,7 @@ server <- function(input, output, session) {
   bump_day_date_ui <- function() day_date_ui_nonce(isolate(day_date_ui_nonce()) + 1L)
 
   # -----------------------------------------------------------------------------
-  # CART MERGE / NORMALIZE (single line per item identity)
+  # CART MERGE / NORMALIZE
   # -----------------------------------------------------------------------------
 
   sort_list_recursive <- function(x) {
@@ -690,7 +728,7 @@ server <- function(input, output, session) {
     obj <- tryCatch(jsonlite::fromJSON(s, simplifyVector = FALSE), error = function(e) NULL)
     if (is.null(obj)) return(s)
     obj <- sort_list_recursive(obj)
-    jsonlite::toJSON(obj, auto_unbox = TRUE, null = "null")
+    as.character(jsonlite::toJSON(obj, auto_unbox = TRUE, null = "null"))
   }
 
   cart_merge_key <- function(category, description, unit_price, meta_json) {
@@ -730,7 +768,7 @@ server <- function(input, output, session) {
   }
 
   # -----------------------------------------------------------------------------
-  # CART QTY UPDATE (server-side enforcement + limit validation + normalize)
+  # CART QTY UPDATE (and Donation Amount Edit)
   # -----------------------------------------------------------------------------
 
   set_cart_qty <- function(item_id, new_qty) {
@@ -746,9 +784,13 @@ server <- function(input, output, session) {
     idx <- which(df$id == item_id)
     if (length(idx) != 1) return(invisible(NULL))
 
-    # category-specific max qty
     cat <- as.character(df$category[idx] %||% "")
-    max_q <- if (identical(cat, "donation")) 1L else 20L
+    if (identical(cat, "donation")) {
+      # Donation is amount-editable, not quantity-editable
+      return(invisible(NULL))
+    }
+
+    max_q <- 20L
 
     if (q <= 0L) {
       cand <- df[df$id != item_id, , drop = FALSE]
@@ -758,7 +800,45 @@ server <- function(input, output, session) {
       cand$quantity[idx] <- q
     }
 
-    # normalize merges any legacy duplicates
+    cand <- normalize_cart(cand)
+
+    msg <- validate_cart_limits(cand)
+    if (!is.null(msg)) {
+      showNotification(msg, type = "error")
+      return(invisible(NULL))
+    }
+
+    rv$cart <- cand
+    invisible(NULL)
+  }
+
+  set_cart_amount <- function(item_id, new_amt) {
+    item_id <- as.character(item_id %||% "")
+    if (!nzchar(item_id)) return(invisible(NULL))
+
+    amt <- suppressWarnings(as.numeric(new_amt))
+    if (is.na(amt)) return(invisible(NULL))
+
+    df <- rv$cart
+    if (is.null(df) || nrow(df) == 0) return(invisible(NULL))
+
+    idx <- which(df$id == item_id)
+    if (length(idx) != 1) return(invisible(NULL))
+
+    cat <- as.character(df$category[idx] %||% "")
+    if (!identical(cat, "donation")) {
+      # Only donation is amount-editable
+      return(invisible(NULL))
+    }
+
+    if (amt <= 0) {
+      cand <- df[df$id != item_id, , drop = FALSE]  # set to 0 => remove line
+    } else {
+      cand <- df
+      cand$quantity[idx]   <- 1L
+      cand$unit_price[idx] <- amt
+    }
+
     cand <- normalize_cart(cand)
 
     msg <- validate_cart_limits(cand)
@@ -780,14 +860,18 @@ server <- function(input, output, session) {
 
     row_ui <- lapply(seq_len(nrow(df)), function(i) {
       r <- df[i, , drop = FALSE]
-      desc <- as.character(r$description[1] %||% "")
-      cat  <- as.character(r$category[1] %||% "")
-      qty  <- suppressWarnings(as.integer(r$quantity[1] %||% 0L))
+      desc  <- as.character(r$description[1] %||% "")
+      cat   <- as.character(r$category[1] %||% "")
+      qty   <- suppressWarnings(as.integer(r$quantity[1] %||% 0L))
       price <- suppressWarnings(as.numeric(r$unit_price[1] %||% NA_real_))
-      line_total <- if (!is.na(price)) qty * price else NA_real_
 
       if (is.na(qty) || qty < 0L) qty <- 0L
-      if (qty > max_qty) qty <- max_qty
+
+      # Donation: force qty=1, edit amount instead
+      if (identical(cat, "donation")) qty <- 1L
+      if (!identical(cat, "donation") && qty > max_qty) qty <- max_qty
+
+      line_total <- if (!is.na(price)) qty * price else NA_real_
 
       left_text <- if (isTRUE(show_category) && nzchar(cat)) {
         tags$div(
@@ -798,25 +882,43 @@ server <- function(input, output, session) {
         tags$div(desc)
       }
 
-      tags$div(
-        class = "cart-line",
-        tags$div(class = "cart-desc", left_text),
-        tags$div(
-          class = "cart-controls",
+      controls <- if (identical(cat, "donation")) {
+        tagList(
+          tags$span(style = "font-weight:600;", "Amount:"),
           tags$input(
-            type         = "number",
-            class        = "cart-qty-input",
+            type          = "text",
+            class         = "cart-amt-input",
             `data-itemid` = as.character(r$id[1]),
-            value        = qty,
-            min          = 0,
-            max          = max_qty,
-            step         = 1
+            value         = if (!is.na(price)) sprintf("%.2f", price) else "",
+            placeholder   = "0.00"
           ),
           tags$span(
             class = "cart-line-total",
             if (!is.na(line_total)) sprintf("$%.2f", line_total) else ""
           )
         )
+      } else {
+        tagList(
+          tags$input(
+            type          = "number",
+            class         = "cart-qty-input",
+            `data-itemid` = as.character(r$id[1]),
+            value         = qty,
+            min           = 0,
+            max           = max_qty,
+            step          = 1
+          ),
+          tags$span(
+            class = "cart-line-total",
+            if (!is.na(line_total)) sprintf("$%.2f", line_total) else ""
+          )
+        )
+      }
+
+      tags$div(
+        class = "cart-line",
+        tags$div(class = "cart-desc", left_text),
+        tags$div(class = "cart-controls", controls)
       )
     })
 
@@ -824,6 +926,7 @@ server <- function(input, output, session) {
       tags$div(id = box_id, class = "cart-list", row_ui),
       tags$script(HTML(sprintf(
         "
+        // Quantity edits (non-donation)
         $(document).off('input change', '#%s .cart-qty-input');
         $(document).on('input change', '#%s .cart-qty-input', function() {
           var id = $(this).data('itemid');
@@ -831,7 +934,16 @@ server <- function(input, output, session) {
           if (isNaN(qty)) qty = 0;
           Shiny.setInputValue('%s', {id: id, qty: qty, nonce: Math.random()}, {priority: 'event'});
         });
+
+        // Amount edits (donation)
+        $(document).off('input change', '#%s .cart-amt-input');
+        $(document).on('input change', '#%s .cart-amt-input', function() {
+          var id = $(this).data('itemid');
+          var amt = $(this).val();
+          Shiny.setInputValue('%s', {id: id, amt: amt, nonce: Math.random()}, {priority: 'event'});
+        });
         ",
+        box_id, box_id, change_input_id,
         box_id, box_id, change_input_id
       )))
     )
@@ -842,14 +954,12 @@ server <- function(input, output, session) {
 
     df <- rv$cart
 
-    # compute merge_key for incoming rows
     rows_df$merge_key <- mapply(
       cart_merge_key,
       rows_df$category, rows_df$description, rows_df$unit_price, rows_df$meta_json,
       USE.NAMES = FALSE
     )
 
-    # ensure df merge_key exists
     if (!is.null(df) && nrow(df) > 0) {
       df$merge_key <- mapply(
         cart_merge_key,
@@ -863,13 +973,25 @@ server <- function(input, output, session) {
       q <- suppressWarnings(as.integer(r$quantity[1] %||% 0L))
       if (is.na(q) || q <= 0L) next
 
+      # Donation: always quantity 1
+      if (identical(as.character(r$category[1] %||% ""), "donation")) q <- 1L
+
       k <- r$merge_key[1] %||% ""
       hit <- which(df$merge_key == k)
 
       if (length(hit) >= 1) {
         j <- hit[1]
-        df$quantity[j] <- as.integer(df$quantity[j] %||% 0L) + q
+
+        if (identical(as.character(df$category[j] %||% ""), "donation")) {
+          # If same donation merges, sum the amounts
+          df$quantity[j]   <- 1L
+          df$unit_price[j] <- as.numeric(df$unit_price[j] %||% 0) + as.numeric(r$unit_price[1] %||% 0)
+        } else {
+          df$quantity[j] <- as.integer(df$quantity[j] %||% 0L) + q
+        }
+
       } else {
+        if (identical(as.character(r$category[1] %||% ""), "donation")) r$quantity[1] <- 1L
         df <- rbind(df, r)
       }
     }
@@ -888,9 +1010,11 @@ server <- function(input, output, session) {
   }
 
   add_to_cart <- function(category, description, quantity, unit_price, meta = list()) {
+    cat <- as.character(category %||% "")
     q <- as.integer(quantity %||% 0)
     p <- as.numeric(unit_price %||% NA_real_)
-    if (q <= 0) return(invisible(FALSE))
+
+    if (cat != "donation" && q <= 0) return(invisible(FALSE))
 
     if (is.na(p)) {
       showNotification("Price is N/A. Admin must set prices first.", type = "error")
@@ -898,22 +1022,123 @@ server <- function(input, output, session) {
     }
     if (p < 0) return(invisible(FALSE))
 
-    # server-side cap (donation must be 1; others max 20)
-    if (identical(category, "donation")) q <- 1L
+    # Donation behaves as a single editable amount line
+    if (identical(cat, "donation")) q <- 1L
     q <- min(q, 20L)
 
     rows_df <- data.frame(
       id          = UUIDgenerate(),
-      category    = category,
+      category    = cat,
       description = description,
       quantity    = q,
       unit_price  = p,
-      meta_json   = jsonlite::toJSON(meta, auto_unbox = TRUE),
-      merge_key   = "", # filled in add_rows_to_cart
+      meta_json   = as.character(jsonlite::toJSON(meta, auto_unbox = TRUE, null = "null")),
+      merge_key   = "",
       stringsAsFactors = FALSE
     )
 
     add_rows_to_cart(rows_df)
+  }
+
+  # -----------------------------------------------------------------------------
+  # SPECIAL EVENT CAPACITY ENFORCEMENT
+  # -----------------------------------------------------------------------------
+
+  parse_event_id_from_meta <- function(meta_json) {
+    s <- as.character(meta_json %||% "")
+    if (!nzchar(s)) return("")
+    obj <- tryCatch(jsonlite::fromJSON(s, simplifyVector = FALSE), error = function(e) NULL)
+    if (is.null(obj)) return("")
+    as.character(obj$event_id %||% "")
+  }
+
+  cart_event_qty_in_session <- function(event_id) {
+    if (!nzchar(event_id %||% "")) return(0L)
+    df <- rv$cart
+    if (is.null(df) || nrow(df) == 0) return(0L)
+
+    ix <- which(df$category == "event")
+    if (length(ix) == 0) return(0L)
+
+    q <- 0L
+    for (i in ix) {
+      eid <- parse_event_id_from_meta(df$meta_json[i] %||% "")
+      if (identical(eid, event_id)) {
+        q <- q + as.integer(df$quantity[i] %||% 0L)
+      }
+    }
+    as.integer(q)
+  }
+
+  event_sold_qty_completed <- function(event_id) {
+    if (!nzchar(event_id %||% "")) return(0L)
+
+    tx <- db_get1(
+      "SELECT cart_json
+       FROM transactions
+       WHERE status IN ('COMPLETED','SANDBOX_TEST_OK')"
+    )
+    if (nrow(tx) == 0) return(0L)
+
+    sold <- 0L
+    for (i in seq_len(nrow(tx))) {
+      cart_df <- tryCatch(jsonlite::fromJSON(tx$cart_json[i] %||% ""), error = function(e) NULL)
+      if (is.null(cart_df) || nrow(cart_df) == 0) next
+      if (!all(c("category","quantity","meta_json") %in% names(cart_df))) next
+
+      ix <- which(cart_df$category == "event")
+      if (length(ix) == 0) next
+
+      for (j in ix) {
+        eid <- parse_event_id_from_meta(cart_df$meta_json[j] %||% "")
+        if (identical(eid, event_id)) {
+          sold <- sold + as.integer(cart_df$quantity[j] %||% 0L)
+        }
+      }
+    }
+    as.integer(sold)
+  }
+
+  validate_event_capacities_for_cart <- function(cart_df) {
+    if (is.null(cart_df) || nrow(cart_df) == 0) return(NULL)
+
+    ix <- which(cart_df$category == "event")
+    if (length(ix) == 0) return(NULL)
+
+    # aggregate requested qty by event_id
+    req_by_event <- list()
+    for (i in ix) {
+      eid <- parse_event_id_from_meta(cart_df$meta_json[i] %||% "")
+      if (!nzchar(eid)) next
+      req_by_event[[eid]] <- (req_by_event[[eid]] %||% 0L) + as.integer(cart_df$quantity[i] %||% 0L)
+    }
+    if (length(req_by_event) == 0) return(NULL)
+
+    for (eid in names(req_by_event)) {
+      cap_row <- db_get1("SELECT capacity, name, event_date FROM special_events WHERE id = ?id LIMIT 1", id = eid)
+      if (nrow(cap_row) != 1) next
+
+      cap <- suppressWarnings(as.integer(cap_row$capacity[1]))
+      if (is.na(cap)) next  # no capacity = unlimited
+
+      sold <- event_sold_qty_completed(eid)
+      remaining <- cap - sold
+
+      requested <- as.integer(req_by_event[[eid]] %||% 0L)
+
+      if (remaining <= 0L) {
+        return(paste0("Event is sold out: ", cap_row$name[1], " (", cap_row$event_date[1], ")."))
+      }
+      if (requested > remaining) {
+        return(paste0(
+          "Not enough remaining capacity for event: ",
+          cap_row$name[1], " (", cap_row$event_date[1], "). ",
+          "Remaining: ", remaining, ", requested: ", requested, "."
+        ))
+      }
+    }
+
+    NULL
   }
 
   # -----------------------------------------------------------------------------
@@ -973,7 +1198,7 @@ server <- function(input, output, session) {
   }, ignoreInit = TRUE)
 
   # -----------------------------------------------------------------------------
-  # DYNAMIC NAVBAR (Receipt tab always exists, but nav item is hidden until receipt exists)
+  # DYNAMIC NAVBAR
   # -----------------------------------------------------------------------------
 
   output$main_nav_ui <- renderUI({
@@ -1120,11 +1345,15 @@ server <- function(input, output, session) {
             ),
             br(),
             fluidRow(
-              column(
+                           column(
                 4,
-                textInput("donor_name",  "Name (optional)", ""),
-                textInput("donor_email", "Email (optional)", ""),
-                numericInput("donation_amount", "Donation amount (CAD)", value = 0, min = 0, step = 1),
+                numericInput(
+                  "donation_amount",
+                  "Donation amount (CAD)",
+                  value = 0,
+                  min   = 0,
+                  step  = 10
+                ),
                 br(),
                 actionButton("donate_add_to_cart", "Add donation to cart")
               ),
@@ -1236,65 +1465,81 @@ server <- function(input, output, session) {
   # PER-TAB CHECKOUT WIRING (cart shown on every tab)
   # -----------------------------------------------------------------------------
 
-checkout_prefixes <- c("day","xmas","season","prog","event","don")
+  checkout_prefixes <- c("day","xmas","season","prog","event","don")
 
-for (p in checkout_prefixes) {
-  local({
-    prefix    <- p
-    change_id <- paste0(prefix, "_cart_qty_change")
+  for (p in checkout_prefixes) {
+    local({
+      prefix    <- p
+      change_id <- paste0(prefix, "_cart_qty_change")
 
-    output[[paste0(prefix, "_cart_list")]] <- renderUI({
-      df <- rv$cart
-      render_cart_list_ui(
-        df,
-        change_input_id = change_id,
-        max_qty = 20L,
-        show_category = TRUE
-      )
+      output[[paste0(prefix, "_cart_list")]] <- renderUI({
+        df <- rv$cart
+        render_cart_list_ui(
+          df,
+          change_input_id = change_id,
+          max_qty         = 20L,
+          show_category   = TRUE
+        )
+      })
+
+      output[[paste0(prefix, "_cart_total")]] <- renderText({
+        df <- rv$cart
+        if (is.null(df) || nrow(df) == 0) return("Cart is empty.")
+        tot <- sum(df$quantity * df$unit_price, na.rm = TRUE)
+        paste0("Total: $", sprintf("%.2f", tot))
+      })
+
+      output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
+        has_items <- !is.null(rv$cart) && nrow(rv$cart) > 0
+        actionButton(
+          inputId = paste0(prefix, "_cart_pay"),
+          label   = "Pay now",
+          class   = paste("btn", if (has_items) "pay-now-hot" else ""),
+          disabled = if (!has_items) "disabled" else NULL
+        )
+      })
+
+      observeEvent(input[[change_id]], {
+        x <- input[[change_id]]
+
+        if (!is.null(x$qty)) {
+          set_cart_qty(x$id, x$qty)
+        } else if (!is.null(x$amt)) {
+          set_cart_amount(x$id, x$amt)
+        }
+      }, ignoreInit = TRUE)
+
+      observeEvent(input[[paste0(prefix, "_buyer_name")]], {
+        rv$buyer_name <- trimws(input[[paste0(prefix, "_buyer_name")]] %||% "")
+        for (other in setdiff(checkout_prefixes, prefix)) {
+          try(updateTextInput(session, paste0(other, "_buyer_name"), value = rv$buyer_name), silent = TRUE)
+        }
+      }, ignoreInit = TRUE)
+
+      observeEvent(input[[paste0(prefix, "_buyer_email")]], {
+        rv$buyer_email <- trimws(input[[paste0(prefix, "_buyer_email")]] %||% "")
+        for (other in setdiff(checkout_prefixes, prefix)) {
+          try(updateTextInput(session, paste0(other, "_buyer_email"), value = rv$buyer_email), silent = TRUE)
+        }
+      }, ignoreInit = TRUE)
     })
+  }
 
-    output[[paste0(prefix, "_cart_total")]] <- renderText({
-      df <- rv$cart
-      if (is.null(df) || nrow(df) == 0) return("Cart is empty.")
-      tot <- sum(df$quantity * df$unit_price, na.rm = TRUE)
-      paste0("Total: $", sprintf("%.2f", tot))
-    })
-
-output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
-  has_items <- !is.null(rv$cart) && nrow(rv$cart) > 0
-
-  actionButton(
-    inputId = paste0(prefix, "_cart_pay"),
-    label   = "Pay now",
-    class   = paste("btn", if (has_items) "pay-now-hot" else ""),
-    disabled = if (!has_items) "disabled" else NULL
-  )
-})
-
-    observeEvent(input[[change_id]], {
-      x <- input[[change_id]]
-      set_cart_qty(x$id, x$qty)
-    }, ignoreInit = TRUE)
-
-    observeEvent(input[[paste0(prefix, "_buyer_name")]], {
-      rv$buyer_name <- trimws(input[[paste0(prefix, "_buyer_name")]] %||% "")
-      for (other in setdiff(checkout_prefixes, prefix)) {
-        try(updateTextInput(session, paste0(other, "_buyer_name"), value = rv$buyer_name), silent = TRUE)
-      }
-    }, ignoreInit = TRUE)
-
-    observeEvent(input[[paste0(prefix, "_buyer_email")]], {
-      rv$buyer_email <- trimws(input[[paste0(prefix, "_buyer_email")]] %||% "")
-      for (other in setdiff(checkout_prefixes, prefix)) {
-        try(updateTextInput(session, paste0(other, "_buyer_email"), value = rv$buyer_email), silent = TRUE)
-      }
-    }, ignoreInit = TRUE)
-  })
-}
- 
   # -----------------------------------------------------------------------------
   # CHECKOUT (single path used by all Pay buttons)
   # -----------------------------------------------------------------------------
+
+  load_receipt_token <- function(token) {
+    if (is.null(token) || !nzchar(token)) return(NULL)
+    x <- db_get1(
+      "SELECT id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
+              square_checkout_id, square_order_id, receipt_token, status
+       FROM transactions
+       WHERE receipt_token = ?token",
+      token = token
+    )
+    if (nrow(x) == 1) x else NULL
+  }
 
   do_checkout <- function(source = "tab") {
     df <- rv$cart
@@ -1319,9 +1564,15 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
       return()
     }
 
+    cap_msg <- validate_event_capacities_for_cart(df)
+    if (!is.null(cap_msg)) {
+      showNotification(cap_msg, type = "error")
+      return()
+    }
+
     total_cents <- cart_total_cents(df)
 
-    # Sandbox fake mode: simulate paid transaction and go to Receipt tab
+    # Sandbox fake mode
     if (SQUARE_ENV == "sandbox" && SANDBOX_MODE == "fake") {
       receipt_token <- UUIDgenerate()
 
@@ -1339,7 +1590,7 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
           buyer_name    = buyer_name,
           buyer_email   = buyer_email,
           total_cents   = total_cents,
-          cart_json     = jsonlite::toJSON(df, auto_unbox = TRUE),
+          cart_json     = as.character(jsonlite::toJSON(df, auto_unbox = TRUE, null = "null")),
           receipt_token = receipt_token
         )
         TRUE
@@ -1393,7 +1644,7 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
         buyer_name    = buyer_name,
         buyer_email   = buyer_email,
         total_cents   = total_cents,
-        cart_json     = jsonlite::toJSON(df, auto_unbox = TRUE),
+        cart_json     = as.character(jsonlite::toJSON(df, auto_unbox = TRUE, null = "null")),
         checkout_id   = res$checkout_id %||% NA_character_,
         order_id      = res$square_order %||% NA_character_,
         receipt_token = receipt_token,
@@ -1414,6 +1665,7 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
   for (p in checkout_prefixes) {
     local({
       prefix <- p
+
       observeEvent(input[[paste0(prefix, "_cart_clear")]], {
         clear_cart()
       }, ignoreInit = TRUE)
@@ -1470,7 +1722,7 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
         description = paste("Day pass –", type, "–", as.character(d)),
         quantity    = as.integer(min(qty, 20L)),
         unit_price  = p,
-        meta_json   = jsonlite::toJSON(list(type = type, date = as.character(d)), auto_unbox = TRUE),
+        meta_json   = as.character(jsonlite::toJSON(list(type = type, date = as.character(d)), auto_unbox = TRUE, null = "null")),
         merge_key   = "",
         stringsAsFactors = FALSE
       )
@@ -1486,8 +1738,7 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
       return()
     }
 
-    rows_df <- do.call(rbind, rows)
-    add_rows_to_cart(rows_df)
+    add_rows_to_cart(do.call(rbind, rows))
   })
 
   # -----------------------------------------------------------------------------
@@ -1570,7 +1821,7 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
         description = paste("Season pass –", type),
         quantity    = as.integer(min(qty, 20L)),
         unit_price  = p,
-        meta_json   = jsonlite::toJSON(list(type = type, early_bird = is_eb), auto_unbox = TRUE),
+        meta_json   = as.character(jsonlite::toJSON(list(type = type, early_bird = is_eb), auto_unbox = TRUE, null = "null")),
         merge_key   = "",
         stringsAsFactors = FALSE
       )
@@ -1585,8 +1836,7 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
       return()
     }
 
-    rows_df <- do.call(rbind, rows)
-    add_rows_to_cart(rows_df)
+    add_rows_to_cart(do.call(rbind, rows))
   })
 
   # -----------------------------------------------------------------------------
@@ -1605,7 +1855,7 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
       paste("Program –", row$name[1]),
       qty,
       row$price[1],
-      list(program_id=row$id[1], program_name=row$name[1])
+      list(program_id = row$id[1], program_name = row$name[1])
     )
   })
 
@@ -1632,12 +1882,28 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
     row <- ev[ev$id == id, , drop = FALSE]
     if (nrow(row) == 0) return()
 
+    cap <- suppressWarnings(as.integer(row$capacity[1]))
+    if (!is.na(cap)) {
+      sold    <- event_sold_qty_completed(id)
+      in_cart <- cart_event_qty_in_session(id)
+      remaining <- cap - sold - in_cart
+
+      if (remaining <= 0L) {
+        showNotification("This event is sold out.", type = "error")
+        return()
+      }
+      if (qty > remaining) {
+        showNotification(paste0("Only ", remaining, " spots remaining. Adjusting quantity."), type = "warning")
+        qty <- remaining
+      }
+    }
+
     add_to_cart(
       category    = "event",
       description = paste0("Event – ", row$name[1], " (", row$event_date[1], ")"),
       quantity    = qty,
       unit_price  = row$price_cad[1],
-      meta        = list(event_id=row$id[1], event_name=row$name[1], event_date=row$event_date[1])
+      meta        = list(event_id = row$id[1], event_name = row$name[1], event_date = row$event_date[1])
     )
   })
 
@@ -1646,9 +1912,7 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
   # -----------------------------------------------------------------------------
 
   observeEvent(input$donate_add_to_cart, {
-    amt   <- suppressWarnings(as.numeric(input$donation_amount %||% 0))
-    name  <- trimws(input$donor_name %||% "")
-    email <- trimws(input$donor_email %||% "")
+    amt <- suppressWarnings(as.numeric(input$donation_amount %||% 0))
 
     if (is.na(amt) || amt <= 0) {
       showNotification("Please enter a donation amount greater than zero.", type = "error")
@@ -1660,7 +1924,7 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
       description = "Donation – Bulkley Valley Cross Country Ski Club",
       quantity    = 1,
       unit_price  = amt,
-      meta        = list(donor_name = name, donor_email = email)
+      meta        = list()  # buyer name/email captured at checkout
     )
 
     showNotification(paste0("Donation of $", sprintf("%.2f", amt), " added to cart."), type = "message")
@@ -1675,8 +1939,8 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
     if (!nzchar(SQUARE_ACCESS_TOKEN) || !nzchar(SQUARE_LOCATION_ID)) return(NULL)
 
     url <- paste0(square_base_url(), "/v2/orders/", order_id)
-
     res <- httr::GET(url, square_headers(include_version = TRUE), httr::timeout(4))
+
     if (httr::status_code(res) >= 300) {
       warning("Square RetrieveOrder error: ", httr::content(res, as = "text", encoding = "UTF-8"))
       return(NULL)
@@ -1689,25 +1953,13 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
     if (!nzchar(SQUARE_ACCESS_TOKEN)) return(NULL)
 
     url <- paste0(square_base_url(), "/v2/payments/", payment_id)
-
     res <- httr::GET(url, square_headers(include_version = TRUE), httr::timeout(4))
+
     if (httr::status_code(res) >= 300) {
       warning("Square GetPayment error: ", httr::content(res, as = "text", encoding = "UTF-8"))
       return(NULL)
     }
     httr::content(res, as = "parsed", type = "application/json")
-  }
-
-  load_receipt_token <- function(token) {
-    if (is.null(token) || !nzchar(token)) return(NULL)
-    x <- db_get1(
-      "SELECT id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
-              square_checkout_id, square_order_id, receipt_token, status
-       FROM transactions
-       WHERE receipt_token = ?token",
-      token = token
-    )
-    if (nrow(x) == 1) x else NULL
   }
 
   refresh_tx_status_from_square <- function(receipt_token) {
@@ -1852,6 +2104,7 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
 
   output$receipt_panel <- renderUI({
     tx <- receipt_tx()
+
     if (is.null(tx)) {
       return(tags$div(
         style="padding:10px; border:1px solid #ddd; border-radius:8px; background:#fafafa; color:#555;",
@@ -1859,49 +2112,71 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
       ))
     }
 
-    total   <- tx$total_amount_cents[1] / 100
-    name    <- tx$buyer_name[1]
-    email   <- tx$buyer_email[1]
+    total   <- (tx$total_amount_cents[1] %||% 0) / 100
+    name    <- tx$buyer_name[1] %||% ""
+    email   <- tx$buyer_email[1] %||% ""
     status  <- toupper(tx$status[1] %||% "")
-    created <- tx$created_at[1]
+    created <- tx$created_at[1] %||% ""
+    cur     <- toupper(tx$currency[1] %||% "CAD")
+
+    status_class <- if (status %in% c("COMPLETED", "SANDBOX_TEST_OK")) {
+      "receipt-ok"
+    } else if (status %in% c("PENDING", "PENDING_SANDBOX")) {
+      "receipt-pending"
+    } else if (status %in% c("FAILED", "CANCELED", "AMOUNT_MISMATCH")) {
+      "receipt-bad"
+    } else {
+      "receipt-neutral"
+    }
 
     title <- switch(status,
       "COMPLETED"        = "\u2705 Payment complete",
       "SANDBOX_TEST_OK"  = "\u2705 Test payment recorded",
-      "PENDING"          = "Payment pending",
-      "PENDING_SANDBOX"  = "Payment pending (sandbox)",
-      "FAILED"           = "Payment failed",
-      "CANCELED"         = "Payment canceled",
-      "AMOUNT_MISMATCH"  = "Payment amount mismatch",
+      "PENDING"          = "\u23F3 Payment pending",
+      "PENDING_SANDBOX"  = "\u23F3 Payment pending (sandbox)",
+      "FAILED"           = "\u274C Payment failed",
+      "CANCELED"         = "\u274C Payment canceled",
+      "AMOUNT_MISMATCH"  = "\u26A0\uFE0F Payment amount mismatch",
       paste0("Payment status: ", status)
     )
 
     sub <- switch(status,
       "COMPLETED"        = "Thank you for supporting Bulkley Valley Cross Country Ski Club.",
       "SANDBOX_TEST_OK"  = "Sandbox fake-mode transaction. No real payment was processed.",
-      "PENDING"          = "We are checking Square for confirmation. This page updates automatically.",
-      "PENDING_SANDBOX"  = "We are checking Square for confirmation (sandbox). This page updates automatically.",
+      "PENDING"          = "Please wait while we confirm payment with Square. This page updates automatically.",
+      "PENDING_SANDBOX"  = "Please wait while we confirm payment with Square (sandbox). This page updates automatically.",
       "FAILED"           = "Square reported FAILED. Please try again.",
       "CANCELED"         = "Square reported CANCELED. No payment was taken.",
       "AMOUNT_MISMATCH"  = "Completed, but amount/currency mismatch. Contact the club.",
       "Status recorded."
     )
 
+    pending_ui <- NULL
+    if (status %in% c("PENDING", "PENDING_SANDBOX")) {
+      pending_ui <- tags$div(
+        style="margin-top:10px;",
+        tags$span(class="receipt-spinner"),
+        tags$span(style="margin-left:10px; font-weight:600;", "Checking Square… this page updates automatically.")
+      )
+    }
+
     items <- cart_from_tx(tx)
 
     tagList(
       tags$div(
-        class = "receipt-card",
+        class = paste("receipt-card", status_class),
         tags$div(class = "receipt-title", title),
-        tags$div(class = "receipt-sub", sub)
+        tags$div(class = "receipt-sub", sub),
+        pending_ui
       ),
       br(),
       h4("Details"),
-      tags$div(style="padding:10px; border:1px solid #ddd; border-radius:8px; background:#fafafa;",
+      tags$div(
+        style="padding:10px; border:1px solid #ddd; border-radius:8px; background:#fafafa;",
         tags$div(tags$strong("Date/time: "), created),
-        tags$div(tags$strong("Name: "), ifelse(nzchar(name %||% ""), name, "N/A")),
-        tags$div(tags$strong("Email: "), ifelse(nzchar(email %||% ""), email, "N/A")),
-        tags$div(tags$strong("Amount: "), sprintf("$%.2f %s", total, tx$currency[1])),
+        tags$div(tags$strong("Name: "),  if (nzchar(name)) name else "N/A"),
+        tags$div(tags$strong("Email: "), if (nzchar(email)) email else "N/A"),
+        tags$div(tags$strong("Amount: "), sprintf("$%.2f %s", total, cur)),
         tags$div(tags$strong("Status: "), status),
         tags$div(tags$strong("Receipt token: "), tx$receipt_token[1] %||% "")
       ),
@@ -2066,7 +2341,7 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
             column(6, textInput("adm_price_christmas", "Christmas pass price", value = cfg_get("price_christmas_pass", "")))
           ),
 
-          tags$h5("Programs (your categories)"),
+          tags$h5("Programs"),
           uiOutput("adm_program_prices_ui"),
           br(),
           actionButton("admin_save_prices", "Save prices"),
@@ -2123,11 +2398,11 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
           fluidRow(
             column(6, dateRangeInput("adm_report_range", "Date range", start = def_start, end = def_end)),
             column(6,
-                   br(),
-                   actionButton("admin_run_report", "Run report"),
-                   br(), br(),
-                   downloadButton("admin_dl_tx_csv", "Download transactions CSV"),
-                   downloadButton("admin_dl_items_csv", "Download line-items CSV")
+              br(),
+              actionButton("admin_run_report", "Run report"),
+              br(), br(),
+              downloadButton("admin_dl_tx_csv", "Download transactions CSV"),
+              downloadButton("admin_dl_items_csv", "Download line-items CSV")
             )
           ),
           br(),
@@ -2191,7 +2466,7 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
   })
 
   # -----------------------------------------------------------------------------
-  # REPORTS (Admin)
+  # REPORTS
   # -----------------------------------------------------------------------------
 
   parse_cart_json_to_df <- function(cart_json) {
@@ -2251,12 +2526,22 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
       }
     }
 
-    total_cad <- if (nrow(tx) == 0) 0 else sum(tx$total_amount_cents, na.rm = TRUE) / 100
-    n_tx <- nrow(tx)
-    by_status <- if (nrow(tx) == 0) data.frame(status=character(), n=integer(), stringsAsFactors=FALSE) else {
-      as.data.frame(table(tx$status), stringsAsFactors = FALSE)
-    }
-    names(by_status) <- c("status","n")
+n_tx <- nrow(tx)
+
+# Totals
+total_all_cad <- if (n_tx == 0) 0 else sum(tx$total_amount_cents, na.rm = TRUE) / 100
+
+completed_statuses <- c("COMPLETED", "SANDBOX_TEST_OK")
+tx_completed <- if (n_tx == 0) tx[0, , drop = FALSE] else tx[tx$status %in% completed_statuses, , drop = FALSE]
+total_completed_cad <- if (nrow(tx_completed) == 0) 0 else sum(tx_completed$total_amount_cents, na.rm = TRUE) / 100
+
+# Status breakdown
+by_status <- if (n_tx == 0) {
+  data.frame(status = character(), n = integer(), stringsAsFactors = FALSE)
+} else {
+  as.data.frame(table(tx$status), stringsAsFactors = FALSE)
+}
+names(by_status) <- c("status","n")
 
     items_agg <- data.frame()
     if (nrow(items_all) > 0) {
@@ -2264,7 +2549,7 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
       agg_qty <- tapply(items_all$quantity, key, sum, na.rm = TRUE)
       agg_rev <- tapply(items_all$line_total, key, sum, na.rm = TRUE)
 
-      parts <- strsplit(names(agg_qty), "\\|\\|\\|", fixed = FALSE)
+      parts <- strsplit(names(agg_qty), "\\|\\|\\|", perl = TRUE)
       items_agg <- data.frame(
         category = vapply(parts, `[[`, character(1), 1),
         description = vapply(parts, `[[`, character(1), 2),
@@ -2276,11 +2561,17 @@ output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
       rownames(items_agg) <- NULL
     }
 
-    summary_tbl <- data.frame(
-      metric = c("Start date","End date","Transactions","Total (CAD)"),
-      value  = c(as.character(start_date), as.character(end_date), as.character(n_tx), sprintf("$%.2f", total_cad)),
-      stringsAsFactors = FALSE
-    )
+summary_tbl <- data.frame(
+  metric = c("Start date","End date","Transactions","Total completed (CAD)","Total all statuses (CAD)"),
+  value  = c(
+    as.character(start_date),
+    as.character(end_date),
+    as.character(n_tx),
+    sprintf("$%.2f", total_completed_cad),
+    sprintf("$%.2f", total_all_cad)
+  ),
+  stringsAsFactors = FALSE
+)
 
     list(
       tx = tx,
