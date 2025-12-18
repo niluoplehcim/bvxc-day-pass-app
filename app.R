@@ -1,6 +1,6 @@
 # app.R
 # BVXC – Passes, Programs, Events + Admin Controls (Square)
-# v6.2 – Per-tab checkout panel (no Cart tab) + merged cart lines + Admin subtabs + hidden Receipt tab – 2025-12-18
+# v6.2 – Per-tab checkout + merged cart lines + Admin subtabs + hidden Receipt tab – 2025-12-18
 
 # ---- renv -------------------------------------------------------------------
 if (file.exists("renv/activate.R")) {
@@ -39,6 +39,7 @@ SQUARE_LOCATION_ID  <- Sys.getenv("SQUARE_LOCATION_ID",  unset = "")
 ADMIN_PASSWORD  <- Sys.getenv("BVXC_ADMIN_PASSWORD",  unset = NA_character_)
 RETURN_BASE_URL <- Sys.getenv("BVXC_RETURN_BASE_URL", unset = NA_character_)
 
+# Pin the Square API version you want to use (Square supports an explicit header)
 SQUARE_VERSION <- Sys.getenv("SQUARE_VERSION", unset = "2025-10-16")
 
 `%||%` <- function(x, y) if (is.null(x) || (length(x) == 1 && is.na(x))) y else x
@@ -126,7 +127,7 @@ make_pool <- function() {
   if (db_is_postgres()) {
     s <- trimws(DB_URL)
 
-    # URI form (recommended): postgresql://USER:PASSWORD@HOST:5432/DB?sslmode=require
+    # URI form: postgresql://USER:PASSWORD@HOST:5432/DB?sslmode=require
     if (grepl("^postgres(ql)?://", s, ignore.case = TRUE)) {
       return(pool::dbPool(RPostgres::Postgres(), dbname = s))
     }
@@ -138,7 +139,7 @@ make_pool <- function() {
     if (length(missing) > 0) {
       stop(
         "BVXC_DB_URL is missing: ", paste(missing, collapse = ", "),
-        "\nUse URI form (recommended): postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require"
+        "\nUse URI form: postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require"
       )
     }
     return(do.call(pool::dbPool, c(list(RPostgres::Postgres()), args)))
@@ -267,21 +268,12 @@ cfg_set <- function(key, value) {
 
   with_db(function(con) {
     DBI::dbWithTransaction(con, {
-      n <- db_exec(con,
-        "UPDATE config SET value = ?value WHERE key = ?key",
-        key = key, value = value
-      )
+      n <- db_exec(con, "UPDATE config SET value = ?value WHERE key = ?key", key = key, value = value)
       if (isTRUE(n == 0)) {
         tryCatch({
-          db_exec(con,
-            "INSERT INTO config(key, value) VALUES (?key, ?value)",
-            key = key, value = value
-          )
+          db_exec(con, "INSERT INTO config(key, value) VALUES (?key, ?value)", key = key, value = value)
         }, error = function(e) {
-          db_exec(con,
-            "UPDATE config SET value = ?value WHERE key = ?key",
-            key = key, value = value
-          )
+          db_exec(con, "UPDATE config SET value = ?value WHERE key = ?key", key = key, value = value)
         })
       }
     })
@@ -424,7 +416,7 @@ validate_cart_limits <- function(cart_df) {
 }
 
 # -----------------------------------------------------------------------------
-# SQUARE CHECKOUT (Payment Links)
+# SQUARE API HELPERS
 # -----------------------------------------------------------------------------
 
 square_base_url <- function() {
@@ -440,8 +432,30 @@ square_headers <- function(include_version = TRUE) {
   h
 }
 
+square_safe_json <- function(res) {
+  tryCatch(httr::content(res, as = "parsed", type = "application/json"), error = function(e) NULL)
+}
+
+square_http_get <- function(path, query = list()) {
+  res <- httr::GET(
+    url = paste0(square_base_url(), path),
+    square_headers(include_version = TRUE),
+    query = query
+  )
+  list(status = httr::status_code(res), body = square_safe_json(res), raw = res)
+}
+
+square_http_post <- function(path, body) {
+  res <- httr::POST(
+    url    = paste0(square_base_url(), path),
+    square_headers(include_version = TRUE),
+    body   = body,
+    encode = "json"
+  )
+  list(status = httr::status_code(res), body = square_safe_json(res), raw = res)
+}
+
 create_square_checkout_from_cart <- function(cart_df,
-                                            buyer_name   = NULL,
                                             buyer_email  = NULL,
                                             note         = NULL,
                                             redirect_url = NULL) {
@@ -468,7 +482,6 @@ create_square_checkout_from_cart <- function(cart_df,
     payment_note = note %||% "",
     checkout_options = list(
       ask_for_shipping_address = FALSE,
-      merchant_support_email   = "info@bvnordic.ca",
       redirect_url             = redirect_url
     ),
     pre_populated_data = list(
@@ -476,26 +489,32 @@ create_square_checkout_from_cart <- function(cart_df,
     )
   )
 
-  res <- httr::POST(
-    url    = paste0(square_base_url(), "/v2/online-checkout/payment-links"),
-    square_headers(include_version = TRUE),
-    body   = body,
-    encode = "json"
-  )
-
-  if (httr::status_code(res) >= 300) {
-    warning("Square payment link error: ", httr::content(res, as = "text", encoding = "UTF-8"))
+  r <- square_http_post("/v2/online-checkout/payment-links", body = body)
+  if (r$status >= 300 || is.null(r$body$payment_link$url)) {
+    warning("Square payment link error: ", httr::content(r$raw, as = "text", encoding = "UTF-8"))
     return(NULL)
   }
 
-  content <- httr::content(res, as = "parsed", type = "application/json")
-  pl <- content$payment_link
-
+  pl <- r$body$payment_link
   list(
     checkout_url = pl$url %||% NULL,
     checkout_id  = pl$id %||% NA_character_,
     square_order = pl$order_id %||% NA_character_
   )
+}
+
+square_get_order <- function(order_id) {
+  if (!nzchar(order_id %||% "")) return(NULL)
+  r <- square_http_get(paste0("/v2/orders/", order_id))
+  if (r$status >= 300) return(NULL)
+  r$body$order %||% NULL
+}
+
+square_list_payments_by_order <- function(order_id) {
+  if (!nzchar(order_id %||% "")) return(NULL)
+  r <- square_http_get("/v2/payments", query = list(order_id = order_id))
+  if (r$status >= 300) return(NULL)
+  r$body$payments %||% NULL
 }
 
 # -----------------------------------------------------------------------------
@@ -548,6 +567,13 @@ css_tabs <- "
   padding: 6px 12px;
   min-width: 120px;
 }
+.cart-amt-input {
+  font-size: 20px;
+  height: 44px;
+  padding: 6px 12px;
+  min-width: 160px;
+}
+
 /* ---- Receipt status banners ---- */
 .receipt-card{
   padding: 16px;
@@ -556,18 +582,14 @@ css_tabs <- "
   border: 1px solid #ddd;
   background: #fafafa;
 }
-
 .receipt-title{
   font-size: 34px;
   font-weight: 800;
 }
-
 .receipt-sub{
   margin-top: 6px;
   font-weight: 600;
 }
-
-/* Status variants */
 .receipt-ok{
   border-color: #badbcc;
   background: #d1e7dd;
@@ -575,7 +597,6 @@ css_tabs <- "
 }
 .receipt-ok .receipt-title,
 .receipt-ok .receipt-sub{ color:#0f5132; }
-
 .receipt-pending{
   border-color: #ffecb5;
   background: #fff3cd;
@@ -583,7 +604,6 @@ css_tabs <- "
 }
 .receipt-pending .receipt-title,
 .receipt-pending .receipt-sub{ color:#664d03; }
-
 .receipt-bad{
   border-color: #f5c2c7;
   background: #f8d7da;
@@ -591,13 +611,11 @@ css_tabs <- "
 }
 .receipt-bad .receipt-title,
 .receipt-bad .receipt-sub{ color:#842029; }
-
 .receipt-neutral{
   border-color: #dee2e6;
   background: #f8f9fa;
   color: #495057;
 }
-
 .receipt-spinner{
   display:inline-block;
   width:14px; height:14px;
@@ -623,6 +641,7 @@ css_tabs <- "
 ui <- fluidPage(
   tags$head(tags$style(HTML(css_tabs))),
   uiOutput("main_nav_ui"),
+
   tags$script(HTML("
     Shiny.addCustomMessageHandler('redirect', function(message) {
       try { window.top.location.href = message.url; }
@@ -634,6 +653,21 @@ ui <- fluidPage(
       var show = !!message.show;
       var a = $('a[data-value=\"Receipt\"]');
       if (a.length) a.closest('li').toggle(show);
+    });
+
+    // Disable browser/password-manager autofill on buyer fields (reduces input cycling)
+    Shiny.addCustomMessageHandler('disableBuyerAutofill', function(message) {
+      try {
+        $('input[id$=\"_buyer_name\"], input[id$=\"_buyer_email\"]').each(function() {
+          $(this)
+            .attr('autocomplete','off')
+            .attr('autocorrect','off')
+            .attr('autocapitalize','off')
+            .attr('spellcheck','false')
+            .attr('data-lpignore','true')
+            .attr('data-1p-ignore','true');
+        });
+      } catch(e) {}
     });
   "))
 )
@@ -661,11 +695,15 @@ server <- function(input, output, session) {
     cart = empty_cart_df(),
     buyer_name   = "",
     buyer_email  = "",
-    buyer_syncing = FALSE,
     admin_logged_in  = FALSE,
     admin_fail_count = 0L,
     admin_lock_until = as.POSIXct(NA)
   )
+
+  # Run once after the UI is ready: disable autofill on buyer fields
+  session$onFlushed(function() {
+    session$sendCustomMessage("disableBuyerAutofill", list())
+  }, once = TRUE)
 
   receipt_tx <- reactiveVal(NULL)
 
@@ -673,9 +711,10 @@ server <- function(input, output, session) {
   last_valid_day_date <- reactiveVal(Sys.Date())
   blocked_nonce       <- reactiveVal(0L)
   events_nonce        <- reactiveVal(0L)
+  admin_nonce         <- reactiveVal(0L)
+  tx_nonce            <- reactiveVal(0L)
 
   poll_count <- reactiveVal(0L)
-  report_state <- reactiveVal(NULL)
 
   clear_cart <- function() rv$cart <- empty_cart_df()
 
@@ -786,10 +825,7 @@ server <- function(input, output, session) {
     if (length(idx) != 1) return(invisible(NULL))
 
     cat <- as.character(df$category[idx] %||% "")
-    if (identical(cat, "donation")) {
-      # Donation is amount-editable, not quantity-editable
-      return(invisible(NULL))
-    }
+    if (identical(cat, "donation")) return(invisible(NULL))
 
     max_q <- 20L
 
@@ -827,13 +863,10 @@ server <- function(input, output, session) {
     if (length(idx) != 1) return(invisible(NULL))
 
     cat <- as.character(df$category[idx] %||% "")
-    if (!identical(cat, "donation")) {
-      # Only donation is amount-editable
-      return(invisible(NULL))
-    }
+    if (!identical(cat, "donation")) return(invisible(NULL))
 
     if (amt <= 0) {
-      cand <- df[df$id != item_id, , drop = FALSE]  # set to 0 => remove line
+      cand <- df[df$id != item_id, , drop = FALSE]
     } else {
       cand <- df
       cand$quantity[idx]   <- 1L
@@ -867,8 +900,6 @@ server <- function(input, output, session) {
       price <- suppressWarnings(as.numeric(r$unit_price[1] %||% NA_real_))
 
       if (is.na(qty) || qty < 0L) qty <- 0L
-
-      # Donation: force qty=1, edit amount instead
       if (identical(cat, "donation")) qty <- 1L
       if (!identical(cat, "donation") && qty > max_qty) qty <- max_qty
 
@@ -927,7 +958,6 @@ server <- function(input, output, session) {
       tags$div(id = box_id, class = "cart-list", row_ui),
       tags$script(HTML(sprintf(
         "
-        // Quantity edits (non-donation)
         $(document).off('input change', '#%s .cart-qty-input');
         $(document).on('input change', '#%s .cart-qty-input', function() {
           var id = $(this).data('itemid');
@@ -936,7 +966,6 @@ server <- function(input, output, session) {
           Shiny.setInputValue('%s', {id: id, qty: qty, nonce: Math.random()}, {priority: 'event'});
         });
 
-        // Amount edits (donation)
         $(document).off('input change', '#%s .cart-amt-input');
         $(document).on('input change', '#%s .cart-amt-input', function() {
           var id = $(this).data('itemid');
@@ -973,8 +1002,6 @@ server <- function(input, output, session) {
       r <- rows_df[i, , drop = FALSE]
       q <- suppressWarnings(as.integer(r$quantity[1] %||% 0L))
       if (is.na(q) || q <= 0L) next
-
-      # Donation: always quantity 1
       if (identical(as.character(r$category[1] %||% ""), "donation")) q <- 1L
 
       k <- r$merge_key[1] %||% ""
@@ -982,15 +1009,12 @@ server <- function(input, output, session) {
 
       if (length(hit) >= 1) {
         j <- hit[1]
-
         if (identical(as.character(df$category[j] %||% ""), "donation")) {
-          # If same donation merges, sum the amounts
           df$quantity[j]   <- 1L
           df$unit_price[j] <- as.numeric(df$unit_price[j] %||% 0) + as.numeric(r$unit_price[1] %||% 0)
         } else {
           df$quantity[j] <- as.integer(df$quantity[j] %||% 0L) + q
         }
-
       } else {
         if (identical(as.character(r$category[1] %||% ""), "donation")) r$quantity[1] <- 1L
         df <- rbind(df, r)
@@ -1023,7 +1047,6 @@ server <- function(input, output, session) {
     }
     if (p < 0) return(invisible(FALSE))
 
-    # Donation behaves as a single editable amount line
     if (identical(cat, "donation")) q <- 1L
     q <- min(q, 20L)
 
@@ -1064,9 +1087,7 @@ server <- function(input, output, session) {
     q <- 0L
     for (i in ix) {
       eid <- parse_event_id_from_meta(df$meta_json[i] %||% "")
-      if (identical(eid, event_id)) {
-        q <- q + as.integer(df$quantity[i] %||% 0L)
-      }
+      if (identical(eid, event_id)) q <- q + as.integer(df$quantity[i] %||% 0L)
     }
     as.integer(q)
   }
@@ -1092,9 +1113,7 @@ server <- function(input, output, session) {
 
       for (j in ix) {
         eid <- parse_event_id_from_meta(cart_df$meta_json[j] %||% "")
-        if (identical(eid, event_id)) {
-          sold <- sold + as.integer(cart_df$quantity[j] %||% 0L)
-        }
+        if (identical(eid, event_id)) sold <- sold + as.integer(cart_df$quantity[j] %||% 0L)
       }
     }
     as.integer(sold)
@@ -1106,7 +1125,6 @@ server <- function(input, output, session) {
     ix <- which(cart_df$category == "event")
     if (length(ix) == 0) return(NULL)
 
-    # aggregate requested qty by event_id
     req_by_event <- list()
     for (i in ix) {
       eid <- parse_event_id_from_meta(cart_df$meta_json[i] %||% "")
@@ -1120,11 +1138,10 @@ server <- function(input, output, session) {
       if (nrow(cap_row) != 1) next
 
       cap <- suppressWarnings(as.integer(cap_row$capacity[1]))
-      if (is.na(cap)) next  # no capacity = unlimited
+      if (is.na(cap)) next
 
       sold <- event_sold_qty_completed(eid)
       remaining <- cap - sold
-
       requested <- as.integer(req_by_event[[eid]] %||% 0L)
 
       if (remaining <= 0L) {
@@ -1140,6 +1157,76 @@ server <- function(input, output, session) {
     }
 
     NULL
+  }
+
+  # -----------------------------------------------------------------------------
+  # RECEIPT LOAD / DB HELPERS
+  # -----------------------------------------------------------------------------
+
+  load_receipt_token <- function(token) {
+    if (is.null(token) || !nzchar(token)) return(NULL)
+    x <- db_get1(
+      "SELECT id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
+              square_checkout_id, square_order_id, receipt_token, status
+       FROM transactions
+       WHERE receipt_token = ?token
+       LIMIT 1",
+      token = token
+    )
+    if (nrow(x) == 1) x else NULL
+  }
+
+  update_tx_status <- function(tx_id, status) {
+    if (!nzchar(tx_id %||% "")) return(FALSE)
+    db_exec1("UPDATE transactions SET status = ?st WHERE id = ?id", st = as.character(status), id = tx_id)
+    TRUE
+  }
+
+  # -----------------------------------------------------------------------------
+  # RECEIPT VERIFICATION (Square)
+  # -----------------------------------------------------------------------------
+
+  infer_status_from_square <- function(order_id) {
+    # returns one of: COMPLETED, PENDING, FAILED, UNKNOWN
+    if (!HAVE_SQUARE_CREDS) return("UNKNOWN")
+    if (!nzchar(order_id %||% "")) return("UNKNOWN")
+
+    payments <- square_list_payments_by_order(order_id)
+    if (!is.null(payments) && length(payments) > 0) {
+      sts <- toupper(vapply(payments, function(p) as.character(p$status %||% ""), character(1)))
+      if (any(sts %in% c("COMPLETED"))) return("COMPLETED")
+      if (any(sts %in% c("CANCELED","FAILED"))) return("FAILED")
+      return("PENDING")
+    }
+
+    # Fallback: check order exists (does not guarantee payment)
+    ord <- square_get_order(order_id)
+    if (is.null(ord)) return("UNKNOWN")
+    "PENDING"
+  }
+
+  verify_and_refresh_receipt <- function() {
+    tx <- receipt_tx()
+    if (is.null(tx) || nrow(tx) != 1) return(FALSE)
+
+    st0 <- as.character(tx$status[1] %||% "")
+    if (st0 %in% c("COMPLETED","SANDBOX_TEST_OK","FAILED")) {
+      return(TRUE)
+    }
+
+    # Fake sandbox: we never mark it as COMPLETED; it is SANDBOX_TEST_OK already at creation time
+    if (SQUARE_ENV == "sandbox" && SANDBOX_MODE == "fake") {
+      return(TRUE)
+    }
+
+    # Square mode: do not show COMPLETED unless Square confirms a completed payment
+    new_st <- infer_status_from_square(as.character(tx$square_order_id[1] %||% ""))
+    if (new_st %in% c("COMPLETED","FAILED","PENDING","UNKNOWN")) {
+      if (new_st != "UNKNOWN") update_tx_status(as.character(tx$id[1]), new_st)
+      # Reload from DB
+      receipt_tx(load_receipt_token(as.character(tx$receipt_token[1] %||% "")))
+    }
+    TRUE
   }
 
   # -----------------------------------------------------------------------------
@@ -1204,7 +1291,6 @@ server <- function(input, output, session) {
 
   output$main_nav_ui <- renderUI({
     tab_on <- function(key, default = TRUE) cfg_bool(key, default)
-
     tabs <- list()
 
     if (tab_on("tab_daypass_enabled", TRUE)) {
@@ -1293,10 +1379,7 @@ server <- function(input, output, session) {
             fluidRow(
               column(
                 4,
-                selectInput(
-                  "program_choice", "Program",
-                  choices = setNames(prog$id, prog$name)
-                ),
+                selectInput("program_choice", "Program", choices = setNames(prog$id, prog$name)),
                 numericInput("program_qty", "Number of participants", value = 0, min = 0, step = 1),
                 br(),
                 actionButton("program_add_to_cart", "Add to cart")
@@ -1346,15 +1429,9 @@ server <- function(input, output, session) {
             ),
             br(),
             fluidRow(
-                           column(
+              column(
                 4,
-                numericInput(
-                  "donation_amount",
-                  "Donation amount (CAD)",
-                  value = 0,
-                  min   = 0,
-                  step  = 10
-                ),
+                numericInput("donation_amount", "Donation amount (CAD)", value = 0, min = 0, step = 10),
                 br(),
                 actionButton("donate_add_to_cart", "Add donation to cart")
               ),
@@ -1396,17 +1473,11 @@ server <- function(input, output, session) {
               tags$strong("Database: "), "SQLite fallback (dev only). Do not use this on Connect Cloud for persistence."
             )
           },
-          if (!HAVE_SQUARE_CREDS && SANDBOX_MODE == "square") {
-            tags$div(
-              style="margin:8px 0; padding:10px; border:1px solid #dc3545; border-radius:6px; background:#fff5f5;",
-              tags$strong("Square: "),
-              "SANDBOX_MODE is 'square' but Square credentials are missing. Falling back to fake mode."
-            )
-          } else NULL,
           hr(),
           passwordInput("admin_password", "Admin password"),
           actionButton("admin_login", "Log in"),
-          br(), br(),
+          uiOutput("admin_lock_msg"),
+          br(),
           uiOutput("admin_content")
         )
       )
@@ -1423,6 +1494,25 @@ server <- function(input, output, session) {
   observeEvent(receipt_tx(), {
     session$sendCustomMessage("toggleReceiptNav", list(show = !is.null(receipt_tx())))
   }, ignoreInit = TRUE)
+
+  # -----------------------------------------------------------------------------
+  # Auto-load receipt from URL (?receipt=TOKEN)
+  # -----------------------------------------------------------------------------
+
+  observe({
+    qs <- session$clientData$url_search %||% ""
+    if (!nzchar(qs)) return()
+    q <- tryCatch(parseQueryString(qs), error = function(e) list())
+    token <- as.character(q$receipt %||% "")
+    if (!nzchar(token)) return()
+
+    tx <- load_receipt_token(token)
+    if (!is.null(tx)) {
+      receipt_tx(tx)
+      poll_count(0L)
+      updateTabsetPanel(session, "main_nav", selected = "Receipt")
+    }
+  })
 
   # -----------------------------------------------------------------------------
   # DAY PASS date UI
@@ -1495,14 +1585,12 @@ server <- function(input, output, session) {
         actionButton(
           inputId = paste0(prefix, "_cart_pay"),
           label   = "Pay now",
-          class   = paste("btn", if (has_items) "pay-now-hot" else ""),
-          disabled = if (!has_items) "disabled" else NULL
+          class   = paste("btn", if (has_items) "pay-now-hot" else "")
         )
       })
 
       observeEvent(input[[change_id]], {
         x <- input[[change_id]]
-
         if (!is.null(x$qty)) {
           set_cart_qty(x$id, x$qty)
         } else if (!is.null(x$amt)) {
@@ -1510,18 +1598,20 @@ server <- function(input, output, session) {
         }
       }, ignoreInit = TRUE)
 
-      observeEvent(input[[paste0(prefix, "_buyer_name")]], {
-        rv$buyer_name <- trimws(input[[paste0(prefix, "_buyer_name")]] %||% "")
-        for (other in setdiff(checkout_prefixes, prefix)) {
-          try(updateTextInput(session, paste0(other, "_buyer_name"), value = rv$buyer_name), silent = TRUE)
-        }
+      observeEvent(input[[paste0(prefix, "_cart_clear")]], {
+        clear_cart()
       }, ignoreInit = TRUE)
 
-      observeEvent(input[[paste0(prefix, "_buyer_email")]], {
+      observeEvent(input[[paste0(prefix, "_cart_pay")]], {
+        rv$buyer_name  <- trimws(input[[paste0(prefix, "_buyer_name")]]  %||% "")
         rv$buyer_email <- trimws(input[[paste0(prefix, "_buyer_email")]] %||% "")
-        for (other in setdiff(checkout_prefixes, prefix)) {
-          try(updateTextInput(session, paste0(other, "_buyer_email"), value = rv$buyer_email), silent = TRUE)
+
+        if (!nzchar(rv$buyer_email)) {
+          showNotification("Please enter an email for the receipt.", type = "warning")
+          return()
         }
+
+        do_checkout(source = prefix)
       }, ignoreInit = TRUE)
     })
   }
@@ -1529,18 +1619,6 @@ server <- function(input, output, session) {
   # -----------------------------------------------------------------------------
   # CHECKOUT (single path used by all Pay buttons)
   # -----------------------------------------------------------------------------
-
-  load_receipt_token <- function(token) {
-    if (is.null(token) || !nzchar(token)) return(NULL)
-    x <- db_get1(
-      "SELECT id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
-              square_checkout_id, square_order_id, receipt_token, status
-       FROM transactions
-       WHERE receipt_token = ?token",
-      token = token
-    )
-    if (nrow(x) == 1) x else NULL
-  }
 
   do_checkout <- function(source = "tab") {
     df <- rv$cart
@@ -1616,12 +1694,17 @@ server <- function(input, output, session) {
       return()
     }
 
+    # Square mode
+    if (!HAVE_SQUARE_CREDS) {
+      showNotification("Square credentials missing. Set SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID.", type = "error")
+      return()
+    }
+
     receipt_token <- UUIDgenerate()
     redirect_url  <- build_redirect_url(receipt_token)
 
     res <- create_square_checkout_from_cart(
       cart_df      = df,
-      buyer_name   = buyer_name,
       buyer_email  = buyer_email,
       note         = paste("BVXC", if (SQUARE_ENV == "sandbox") "sandbox" else "production", source, "checkout"),
       redirect_url = redirect_url
@@ -1649,7 +1732,7 @@ server <- function(input, output, session) {
         checkout_id   = res$checkout_id %||% NA_character_,
         order_id      = res$square_order %||% NA_character_,
         receipt_token = receipt_token,
-        status        = if (SQUARE_ENV == "sandbox") "PENDING_SANDBOX" else "PENDING"
+        status        = "PENDING"
       )
       TRUE
     }, error = function(e) {
@@ -1661,68 +1744,6 @@ server <- function(input, output, session) {
 
     session$sendCustomMessage("redirect", list(url = res$checkout_url))
     clear_cart()
-  }
-
-  # -----------------------------------------------------------------------------
-  # PER-TAB PAY / CLEAR + BUYER FIELD SYNC (prevents cycling on mobile/desktop)
-  # -----------------------------------------------------------------------------
-
-  for (p in checkout_prefixes) {
-    local({
-      prefix <- p
-
-      observeEvent(input[[paste0(prefix, "_cart_clear")]], {
-        clear_cart()
-      }, ignoreInit = TRUE)
-
-      observeEvent(input[[paste0(prefix, "_buyer_name")]], {
-        if (isTRUE(rv$buyer_syncing)) return()
-
-        new_val <- trimws(input[[paste0(prefix, "_buyer_name")]] %||% "")
-        if (identical(new_val, rv$buyer_name %||% "")) return()
-
-        rv$buyer_name <- new_val
-
-        rv$buyer_syncing <- TRUE
-        on.exit({ rv$buyer_syncing <- FALSE }, add = TRUE)
-
-        for (other in setdiff(checkout_prefixes, prefix)) {
-          other_id <- paste0(other, "_buyer_name")
-          cur <- trimws(isolate(input[[other_id]] %||% ""))
-          if (!identical(cur, new_val)) {
-            freezeReactiveValue(input, other_id)
-            try(updateTextInput(session, other_id, value = new_val), silent = TRUE)
-          }
-        }
-      }, ignoreInit = TRUE)
-
-      observeEvent(input[[paste0(prefix, "_buyer_email")]], {
-        if (isTRUE(rv$buyer_syncing)) return()
-
-        new_val <- trimws(input[[paste0(prefix, "_buyer_email")]] %||% "")
-        if (identical(new_val, rv$buyer_email %||% "")) return()
-
-        rv$buyer_email <- new_val
-
-        rv$buyer_syncing <- TRUE
-        on.exit({ rv$buyer_syncing <- FALSE }, add = TRUE)
-
-        for (other in setdiff(checkout_prefixes, prefix)) {
-          other_id <- paste0(other, "_buyer_email")
-          cur <- trimws(isolate(input[[other_id]] %||% ""))
-          if (!identical(cur, new_val)) {
-            freezeReactiveValue(input, other_id)
-            try(updateTextInput(session, other_id, value = new_val), silent = TRUE)
-          }
-        }
-      }, ignoreInit = TRUE)
-
-      observeEvent(input[[paste0(prefix, "_cart_pay")]], {
-        rv$buyer_name  <- trimws(input[[paste0(prefix, "_buyer_name")]]  %||% rv$buyer_name %||% "")
-        rv$buyer_email <- trimws(input[[paste0(prefix, "_buyer_email")]] %||% rv$buyer_email %||% "")
-        do_checkout(source = prefix)
-      }, ignoreInit = TRUE)
-    })
   }
 
   # -----------------------------------------------------------------------------
@@ -1756,12 +1777,11 @@ server <- function(input, output, session) {
     rows <- list()
 
     add_row <- function(type, qty, price) {
-      if (qty <= 0) return()
+      if (qty <= 0) return(TRUE)
       p <- suppressWarnings(as.numeric(price))
       if (is.na(p)) {
         showNotification("Price is N/A. Admin must set prices first.", type = "error")
-        rows <<- NULL
-        return()
+        return(FALSE)
       }
       rows[[length(rows) + 1L]] <<- data.frame(
         id          = UUIDgenerate(),
@@ -1773,12 +1793,13 @@ server <- function(input, output, session) {
         merge_key   = "",
         stringsAsFactors = FALSE
       )
+      TRUE
     }
 
-    add_row("Adult",   qa, pr[["Adult"]]);   if (is.null(rows)) return()
-    add_row("Youth",   qy, pr[["Youth"]]);   if (is.null(rows)) return()
-    add_row("Under 9", qu, pr[["Under 9"]]); if (is.null(rows)) return()
-    add_row("Family",  qf, pr[["Family"]]);  if (is.null(rows)) return()
+    ok <- add_row("Adult",   qa, pr[["Adult"]]);   if (!ok) return()
+    ok <- add_row("Youth",   qy, pr[["Youth"]]);   if (!ok) return()
+    ok <- add_row("Under 9", qu, pr[["Under 9"]]); if (!ok) return()
+    ok <- add_row("Family",  qf, pr[["Family"]]);  if (!ok) return()
 
     if (length(rows) == 0) {
       showNotification("Nothing to add.", type = "warning")
@@ -1971,943 +1992,768 @@ server <- function(input, output, session) {
       description = "Donation – Bulkley Valley Cross Country Ski Club",
       quantity    = 1,
       unit_price  = amt,
-      meta        = list()  # buyer name/email captured at checkout
+      meta        = list()
     )
 
     showNotification(paste0("Donation of $", sprintf("%.2f", amt), " added to cart."), type = "message")
   })
 
   # -----------------------------------------------------------------------------
-  # RECEIPT RETURN / STATUS POLL
+  # RECEIPT PAGE (UI + STATUS POLL)
   # -----------------------------------------------------------------------------
 
-  square_retrieve_order <- function(order_id) {
-    if (!nzchar(order_id %||% "")) return(NULL)
-    if (!nzchar(SQUARE_ACCESS_TOKEN) || !nzchar(SQUARE_LOCATION_ID)) return(NULL)
-
-    url <- paste0(square_base_url(), "/v2/orders/", order_id)
-    res <- httr::GET(url, square_headers(include_version = TRUE), httr::timeout(4))
-
-    if (httr::status_code(res) >= 300) {
-      warning("Square RetrieveOrder error: ", httr::content(res, as = "text", encoding = "UTF-8"))
-      return(NULL)
-    }
-    httr::content(res, as = "parsed", type = "application/json")
-  }
-
-  square_get_payment <- function(payment_id) {
-    if (!nzchar(payment_id %||% "")) return(NULL)
-    if (!nzchar(SQUARE_ACCESS_TOKEN)) return(NULL)
-
-    url <- paste0(square_base_url(), "/v2/payments/", payment_id)
-    res <- httr::GET(url, square_headers(include_version = TRUE), httr::timeout(4))
-
-    if (httr::status_code(res) >= 300) {
-      warning("Square GetPayment error: ", httr::content(res, as = "text", encoding = "UTF-8"))
-      return(NULL)
-    }
-    httr::content(res, as = "parsed", type = "application/json")
-  }
-
-  refresh_tx_status_from_square <- function(receipt_token) {
-    if (!nzchar(receipt_token %||% "")) return(NULL)
-
-    tx <- db_get1(
-      "SELECT id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
-              square_checkout_id, square_order_id, receipt_token, status
-       FROM transactions
-       WHERE receipt_token = ?token
-       LIMIT 1",
-      token = receipt_token
-    )
-    if (nrow(tx) != 1) return(NULL)
-
-    st <- toupper(trimws(tx$status[1] %||% ""))
-    if (!st %in% c("PENDING", "PENDING_SANDBOX")) return(tx)
-
-    order_id <- tx$square_order_id[1] %||% ""
-    if (!nzchar(order_id) || is.na(order_id)) return(tx)
-
-    payload <- tryCatch(square_retrieve_order(order_id), error = function(e) NULL)
-    if (is.null(payload) || is.null(payload$order)) return(tx)
-
-    order <- payload$order
-    order_state <- toupper(order$state %||% "")
-
-    if (order_state == "CANCELED") {
-      db_exec1("UPDATE transactions SET status = 'CANCELED' WHERE receipt_token = ?token", token = receipt_token)
-      tx$status[1] <- "CANCELED"
-      return(tx)
-    }
-
-    tenders <- order$tenders %||% list()
-
-    payment_id <- NULL
-    if (length(tenders) > 0) {
-      for (t in tenders) {
-        pid <- t$payment_id %||% t$paymentId %||% NULL
-        if (nzchar(pid %||% "")) { payment_id <- pid; break }
-      }
-    }
-
-    if (!nzchar(payment_id %||% "")) {
-      pid2 <- order$payment_id %||% order$paymentId %||% NULL
-      if (nzchar(pid2 %||% "")) payment_id <- pid2
-    }
-
-    if (!nzchar(payment_id %||% "")) return(tx)
-
-    pay <- tryCatch(square_get_payment(payment_id), error = function(e) NULL)
-    if (is.null(pay) || is.null(pay$payment)) return(tx)
-
-    p <- pay$payment
-    p_status <- toupper(p$status %||% "")
-
-    expected_amt <- as.integer(tx$total_amount_cents[1] %||% NA_integer_)
-    expected_cur <- toupper(tx$currency[1] %||% "CAD")
-
-    got_amt <- tryCatch(as.integer(p$amount_money$amount %||% NA_integer_), error = function(e) NA_integer_)
-    got_cur <- tryCatch(toupper(p$amount_money$currency %||% ""), error = function(e) "")
-
-    new_status <- st
-    if (p_status == "COMPLETED") {
-      if (!is.na(expected_amt) && !is.na(got_amt) && expected_amt == got_amt && expected_cur == got_cur) {
-        new_status <- "COMPLETED"
-      } else {
-        new_status <- "AMOUNT_MISMATCH"
-      }
-    } else if (p_status %in% c("CANCELED", "FAILED")) {
-      new_status <- p_status
-    }
-
-    if (!identical(new_status, st)) {
-      db_exec1(
-        "UPDATE transactions SET status = ?status WHERE receipt_token = ?token",
-        status = new_status,
-        token  = receipt_token
-      )
-      tx$status[1] <- new_status
-    }
-
-    tx
-  }
-
-  session$onFlushed(function() {
-    isolate({
-      qs <- session$clientData$url_search %||% ""
-      token <- parseQueryString(qs)[["receipt"]]
-
-      tx <- refresh_tx_status_from_square(token)
-      if (is.null(tx)) tx <- load_receipt_token(token)
-
-      if (!is.null(tx)) {
-        receipt_tx(tx)
-        poll_count(0L)
-        updateTabsetPanel(session, "main_nav", selected = "Receipt")
-      }
-    })
-  }, once = TRUE)
-
-  observeEvent(session$clientData$url_search, {
-    qs <- session$clientData$url_search %||% ""
-    token <- parseQueryString(qs)[["receipt"]]
-
-    tx <- refresh_tx_status_from_square(token)
-    if (is.null(tx)) tx <- load_receipt_token(token)
-
-    if (!is.null(tx)) {
-      receipt_tx(tx)
-      poll_count(0L)
-      updateTabsetPanel(session, "main_nav", selected = "Receipt")
-    }
+  observeEvent(receipt_tx(), {
+    poll_count(0L)
   }, ignoreInit = TRUE)
 
   observe({
     tx <- receipt_tx()
-    if (is.null(tx)) return()
+    if (is.null(tx) || nrow(tx) != 1) return()
 
-    st <- toupper(tx$status[1] %||% "")
-    if (!st %in% c("PENDING", "PENDING_SANDBOX")) return()
+    st <- as.character(tx$status[1] %||% "")
+    if (st %in% c("COMPLETED","FAILED","SANDBOX_TEST_OK")) return()
 
-    token <- tx$receipt_token[1] %||% ""
-    if (!nzchar(token)) return()
-    if (poll_count() >= 60L) return()
+    # poll up to 12 times, every 5 seconds
+    n <- poll_count()
+    if (n >= 12) return()
 
-    invalidateLater(4000, session)
-    poll_count(poll_count() + 1L)
-
-    updated <- refresh_tx_status_from_square(token)
-    if (!is.null(updated)) receipt_tx(updated)
+    invalidateLater(5000, session)
+    poll_count(n + 1L)
+    verify_and_refresh_receipt()
   })
 
-  cart_from_tx <- function(tx) {
-    cj <- tx$cart_json[1] %||% ""
-    df <- tryCatch(jsonlite::fromJSON(cj), error = function(e) NULL)
-    if (is.null(df) || nrow(df) == 0) return(NULL)
-    if (!all(c("description","quantity","unit_price") %in% names(df))) return(NULL)
-    df$line_total <- df$quantity * df$unit_price
-    df[, c("description","quantity","unit_price","line_total")]
+  observeEvent(input$receipt_refresh, {
+    verify_and_refresh_receipt()
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$receipt_clear, {
+    receipt_tx(NULL)
+    session$sendCustomMessage("toggleReceiptNav", list(show = FALSE))
+    updateTabsetPanel(session, "main_nav", selected = "Day Pass")
+  }, ignoreInit = TRUE)
+
+  receipt_status_class <- function(st) {
+    st <- toupper(trimws(st %||% ""))
+    if (st %in% c("COMPLETED","SANDBOX_TEST_OK")) return("receipt-ok")
+    if (st %in% c("FAILED")) return("receipt-bad")
+    if (st %in% c("PENDING","PENDING_SANDBOX","UNKNOWN","")) return("receipt-pending")
+    "receipt-neutral"
   }
+
+  receipt_status_title <- function(st) {
+    st <- toupper(trimws(st %||% ""))
+    if (st %in% c("COMPLETED")) return("COMPLETED")
+    if (st %in% c("SANDBOX_TEST_OK")) return("SANDBOX TEST OK")
+    if (st %in% c("FAILED")) return("FAILED")
+    if (st %in% c("PENDING","PENDING_SANDBOX","UNKNOWN","")) return("PENDING")
+    st
+  }
+
+  safe_money <- function(cents, currency = "CAD") {
+    cents <- suppressWarnings(as.integer(cents))
+    if (is.na(cents)) return(paste0(currency, " ", "N/A"))
+    paste0("$", sprintf("%.2f", cents / 100))
+  }
+
+  receipt_url_for_token <- function(token) {
+    if (!nzchar(token %||% "")) return("")
+    if (!is.na(RETURN_BASE_URL) && nzchar(RETURN_BASE_URL)) {
+      paste0(RETURN_BASE_URL, "/?receipt=", token)
+    } else {
+      # fallback: same app URL (best-effort; may not work behind proxies)
+      base <- session$clientData$url_protocol %||% ""
+      host <- session$clientData$url_hostname %||% ""
+      port <- session$clientData$url_port %||% ""
+      path <- session$clientData$url_pathname %||% "/"
+      if (nzchar(port)) host <- paste0(host, ":", port)
+      paste0(base, "//", host, path, "?receipt=", token)
+    }
+  }
+
+  output$receipt_qr <- renderImage({
+    tx <- receipt_tx()
+    if (is.null(tx) || nrow(tx) != 1) return(NULL)
+    token <- as.character(tx$receipt_token[1] %||% "")
+    if (!nzchar(token)) return(NULL)
+
+    url <- receipt_url_for_token(token)
+    tf <- tempfile(fileext = ".png")
+    qrcode::qrcode_gen(url, plotQRcode = FALSE) # ensures package loaded
+    qrcode::qrcode_gen(url, plotQRcode = TRUE, file = tf)
+    list(src = tf, contentType = "image/png", width = 220, height = 220, alt = "Receipt QR")
+  }, deleteFile = TRUE)
+
+  output$receipt_items <- renderUI({
+    tx <- receipt_tx()
+    if (is.null(tx) || nrow(tx) != 1) return(NULL)
+    cart_df <- tryCatch(jsonlite::fromJSON(tx$cart_json[1] %||% ""), error = function(e) NULL)
+    if (is.null(cart_df) || nrow(cart_df) == 0) return(tags$div("No cart details."))
+
+    # Basic table view
+    cart_df$line_total <- suppressWarnings(as.numeric(cart_df$quantity) * as.numeric(cart_df$unit_price))
+    tagList(
+      tags$h4("Items"),
+      tags$table(
+        class = "table table-condensed",
+        tags$thead(
+          tags$tr(
+            tags$th("Description"),
+            tags$th("Qty"),
+            tags$th("Unit"),
+            tags$th("Line total")
+          )
+        ),
+        tags$tbody(
+          lapply(seq_len(nrow(cart_df)), function(i) {
+            tags$tr(
+              tags$td(as.character(cart_df$description[i] %||% "")),
+              tags$td(as.integer(cart_df$quantity[i] %||% 0)),
+              tags$td(paste0("$", sprintf("%.2f", as.numeric(cart_df$unit_price[i] %||% 0)))),
+              tags$td(paste0("$", sprintf("%.2f", as.numeric(cart_df$line_total[i] %||% 0))))
+            )
+          })
+        )
+      )
+    )
+  })
 
   output$receipt_panel <- renderUI({
     tx <- receipt_tx()
-
-    if (is.null(tx)) {
-      return(tags$div(
-        style="padding:10px; border:1px solid #ddd; border-radius:8px; background:#fafafa; color:#555;",
-        "No receipt loaded yet. After payment, you will be redirected here automatically."
+    if (is.null(tx) || nrow(tx) != 1) {
+      return(tagList(
+        tags$div(class="receipt-card receipt-neutral",
+                 tags$div(class="receipt-title","No receipt loaded"),
+                 tags$div(class="receipt-sub","If you have a receipt token, open: /?receipt=YOUR_TOKEN")
+        ),
+        br(),
+        textInput("receipt_lookup_token", "Lookup receipt token", value = ""),
+        actionButton("receipt_lookup_btn", "Load receipt")
       ))
     }
 
-    total   <- (tx$total_amount_cents[1] %||% 0) / 100
-    name    <- tx$buyer_name[1] %||% ""
-    email   <- tx$buyer_email[1] %||% ""
-    status  <- toupper(tx$status[1] %||% "")
-    created <- tx$created_at[1] %||% ""
-    cur     <- toupper(tx$currency[1] %||% "CAD")
+    st <- as.character(tx$status[1] %||% "")
+    cls <- receipt_status_class(st)
+    ttl <- receipt_status_title(st)
 
-    status_class <- if (status %in% c("COMPLETED", "SANDBOX_TEST_OK")) {
-      "receipt-ok"
-    } else if (status %in% c("PENDING", "PENDING_SANDBOX")) {
-      "receipt-pending"
-    } else if (status %in% c("FAILED", "CANCELED", "AMOUNT_MISMATCH")) {
-      "receipt-bad"
-    } else {
-      "receipt-neutral"
-    }
+    token <- as.character(tx$receipt_token[1] %||% "")
+    ord   <- as.character(tx$square_order_id[1] %||% "")
+    chk   <- as.character(tx$square_checkout_id[1] %||% "")
 
-    title <- switch(status,
-      "COMPLETED"        = "\u2705 Payment complete",
-      "SANDBOX_TEST_OK"  = "\u2705 Test payment recorded",
-      "PENDING"          = "\u23F3 Payment pending",
-      "PENDING_SANDBOX"  = "\u23F3 Payment pending (sandbox)",
-      "FAILED"           = "\u274C Payment failed",
-      "CANCELED"         = "\u274C Payment canceled",
-      "AMOUNT_MISMATCH"  = "\u26A0\uFE0F Payment amount mismatch",
-      paste0("Payment status: ", status)
-    )
-
-    sub <- switch(status,
-      "COMPLETED"        = "Thank you for supporting Bulkley Valley Cross Country Ski Club.",
-      "SANDBOX_TEST_OK"  = "Sandbox fake-mode transaction. No real payment was processed.",
-      "PENDING"          = "Please wait while we confirm payment with Square. This page updates automatically.",
-      "PENDING_SANDBOX"  = "Please wait while we confirm payment with Square (sandbox). This page updates automatically.",
-      "FAILED"           = "Square reported FAILED. Please try again.",
-      "CANCELED"         = "Square reported CANCELED. No payment was taken.",
-      "AMOUNT_MISMATCH"  = "Completed, but amount/currency mismatch. Contact the club.",
-      "Status recorded."
-    )
-
-    pending_ui <- NULL
-    if (status %in% c("PENDING", "PENDING_SANDBOX")) {
-      pending_ui <- tags$div(
-        style="margin-top:10px;",
-        tags$span(class="receipt-spinner"),
-        tags$span(style="margin-left:10px; font-weight:600;", "Checking Square… this page updates automatically.")
-      )
-    }
-
-    items <- cart_from_tx(tx)
+    polling_note <- if (ttl == "PENDING") {
+      tags$span(tags$span(class="receipt-spinner"), " Verifying with payment provider…")
+    } else NULL
 
     tagList(
       tags$div(
-        class = paste("receipt-card", status_class),
-        tags$div(class = "receipt-title", title),
-        tags$div(class = "receipt-sub", sub),
-        pending_ui
+        class = paste("receipt-card", cls),
+        tags$div(class="receipt-title", ttl),
+        tags$div(class="receipt-sub", polling_note),
+        tags$div(style="margin-top:10px;",
+                 tags$div(tags$strong("Date: "), as.character(tx$created_at[1] %||% "")),
+                 tags$div(tags$strong("Name: "), as.character(tx$buyer_name[1] %||% "")),
+                 tags$div(tags$strong("Email: "), as.character(tx$buyer_email[1] %||% "")),
+                 tags$div(tags$strong("Total: "), safe_money(tx$total_amount_cents[1] %||% NA_integer_, tx$currency[1] %||% "CAD")),
+                 tags$div(tags$strong("Receipt token: "), token),
+                 if (nzchar(ord)) tags$div(tags$strong("Square order id: "), ord) else NULL,
+                 if (nzchar(chk)) tags$div(tags$strong("Square checkout id: "), chk) else NULL
+        )
       ),
       br(),
-      h4("Details"),
-      tags$div(
-        style="padding:10px; border:1px solid #ddd; border-radius:8px; background:#fafafa;",
-        tags$div(tags$strong("Date/time: "), created),
-        tags$div(tags$strong("Name: "),  if (nzchar(name)) name else "N/A"),
-        tags$div(tags$strong("Email: "), if (nzchar(email)) email else "N/A"),
-        tags$div(tags$strong("Amount: "), sprintf("$%.2f %s", total, cur)),
-        tags$div(tags$strong("Status: "), status),
-        tags$div(tags$strong("Receipt token: "), tx$receipt_token[1] %||% "")
+      fluidRow(
+        column(4,
+               tags$h4("Receipt QR"),
+               imageOutput("receipt_qr"),
+               tags$div(style="margin-top:8px; color:#666; font-size:0.95em;",
+                        "Scan to reload this receipt status."
+               )
+        ),
+        column(8,
+               uiOutput("receipt_items")
+        )
       ),
-      if (!is.null(items)) tagList(
-        br(),
-        h4("Items purchased"),
-        tableOutput("receipt_items")
-      ) else NULL,
       br(),
-      h4("Receipt QR code"),
-      plotOutput("receipt_qr", height = "260px", width = "260px")
+      actionButton("receipt_refresh", "Refresh status"),
+      actionButton("receipt_clear", "Clear receipt")
     )
   })
 
-  output$receipt_items <- renderTable({
-    tx <- receipt_tx()
-    if (is.null(tx)) return(NULL)
-    cart_from_tx(tx)
-  }, digits = 2)
-
-  output$receipt_qr <- renderPlot({
-    tx <- receipt_tx()
-    if (is.null(tx)) return(invisible(NULL))
-
-    token <- tx$receipt_token[1]
-    if (is.null(token) || is.na(token) || !nzchar(token)) return(invisible(NULL))
-
-    qr_payload <- if (!is.na(RETURN_BASE_URL) && nzchar(RETURN_BASE_URL)) {
-      paste0(RETURN_BASE_URL, "/?receipt=", token)
-    } else {
-      token
+  observeEvent(input$receipt_lookup_btn, {
+    token <- trimws(input$receipt_lookup_token %||% "")
+    if (!nzchar(token)) return()
+    tx <- load_receipt_token(token)
+    if (is.null(tx)) {
+      showNotification("Receipt token not found.", type = "error")
+      return()
     }
-
-    m <- qrcode::qr_code(qr_payload)
-    if (is.null(m) || length(m) == 0) return(invisible(NULL))
-    m <- m[nrow(m):1, , drop = FALSE]
-
-    op <- par(mar = c(0, 0, 0, 0))
-    on.exit(par(op), add = TRUE)
-
-    plot.new()
-    plot.window(xlim = c(0, ncol(m)), ylim = c(0, nrow(m)), asp = 1)
-
-    for (r in seq_len(nrow(m))) {
-      for (c in seq_len(ncol(m))) {
-        rect(c - 1, r - 1, c, r, col = if (m[r, c] == 1) "black" else "white", border = NA)
-      }
-    }
-  }, res = 120)
+    receipt_tx(tx)
+    poll_count(0L)
+    updateTabsetPanel(session, "main_nav", selected = "Receipt")
+  }, ignoreInit = TRUE)
 
   # -----------------------------------------------------------------------------
-  # ADMIN
+  # ADMIN: Lockout / Login
   # -----------------------------------------------------------------------------
+
+  admin_locked <- reactive({
+    lu <- rv$admin_lock_until
+    if (is.na(lu)) return(FALSE)
+    Sys.time() < lu
+  })
+
+  output$admin_lock_msg <- renderUI({
+    if (!admin_locked()) return(NULL)
+    left <- as.numeric(difftime(rv$admin_lock_until, Sys.time(), units = "secs"))
+    left <- max(0, round(left))
+    tags$div(style="margin-top:10px; padding:10px; border:1px solid #dc3545; border-radius:6px; background:#fff5f5;",
+             tags$strong("Locked out: "),
+             paste0("Too many failed attempts. Try again in ~", left, " seconds.")
+    )
+  })
 
   observeEvent(input$admin_login, {
-    now <- Sys.time()
-
-    if (!is.na(rv$admin_lock_until) && now < rv$admin_lock_until) {
-      secs <- ceiling(as.numeric(difftime(rv$admin_lock_until, now, units = "secs")))
-      showNotification(paste0("Admin login locked. Try again in ", secs, " seconds."), type = "error")
+    if (admin_locked()) {
+      showNotification("Admin is temporarily locked out. Wait and try again.", type = "error")
       return()
     }
 
-    ok <- (!is.na(ADMIN_PASSWORD) && nzchar(ADMIN_PASSWORD) && identical(input$admin_password, ADMIN_PASSWORD))
+    pw <- as.character(input$admin_password %||% "")
+    if (is.na(ADMIN_PASSWORD) || !nzchar(ADMIN_PASSWORD)) {
+      showNotification("Server admin password is not set (BVXC_ADMIN_PASSWORD).", type = "error")
+      return()
+    }
 
-    if (ok) {
+    if (identical(pw, ADMIN_PASSWORD)) {
       rv$admin_logged_in  <- TRUE
       rv$admin_fail_count <- 0L
       rv$admin_lock_until <- as.POSIXct(NA)
-      updateTextInput(session, "admin_password", value = "")
+      admin_nonce(admin_nonce() + 1L)
+      showNotification("Admin login successful.", type = "message")
     } else {
-      rv$admin_logged_in  <- FALSE
       rv$admin_fail_count <- rv$admin_fail_count + 1L
-      showNotification("Invalid admin password.", type = "error")
+      showNotification("Incorrect password.", type = "error")
 
+      # lockout after 5 failures for 5 minutes
       if (rv$admin_fail_count >= 5L) {
-        rv$admin_lock_until <- now + 60
+        rv$admin_lock_until <- Sys.time() + 300
         rv$admin_fail_count <- 0L
-        showNotification("Too many failed attempts. Locked for 60 seconds.", type = "error")
       }
     }
-  })
-
-  output$adm_program_prices_ui <- renderUI({
-    cat <- program_catalog()
-    inputs <- lapply(seq_len(nrow(cat)), function(i) {
-      rid <- cat$id[i]
-      nm  <- cat$name[i]
-      key <- cat$price_key[i]
-      input_id <- paste0("adm_prog_", rid)
-      column(4, textInput(input_id, nm, value = cfg_get(key, "")))
-    })
-
-    rows <- list()
-    for (i in seq(1, length(inputs), by = 3)) {
-      rows[[length(rows) + 1L]] <- fluidRow(inputs[i:min(i+2, length(inputs))])
-    }
-    do.call(tagList, rows)
-  })
-
-  output$admin_content <- renderUI({
-    if (!rv$admin_logged_in) return(p("Please log in to see admin options."))
-
-    eb_val <- cfg_date("early_bird_cutoff", as.Date(NA))
-    eb_val <- if (is.na(eb_val)) NULL else eb_val
-
-    today <- Sys.Date()
-    def_start <- today - 30
-    def_end   <- today
-
-    tabsetPanel(
-      id = "admin_subtabs",
-      tabPanel(
-        "Settings",
-        tagList(
-          h4("Global settings"),
-          fluidRow(
-            column(4, dateInput("adm_early_bird_cutoff", "Early-bird cutoff", value = eb_val)),
-            column(4, textInput("adm_limit_max_total", "Max transaction total CAD (blank = no limit)", value = cfg_get("limit_max_total_cad", ""))),
-            column(4, textInput("adm_limit_max_items", "Max total items (blank = no limit)", value = cfg_get("limit_max_items_total", "")))
-          ),
-          hr(),
-
-          h4("Tabs (enable/disable)"),
-          fluidRow(
-            column(3, checkboxInput("adm_tab_daypass",    "Day Pass",       value = cfg_bool("tab_daypass_enabled", TRUE))),
-            column(3, checkboxInput("adm_tab_christmas",  "Christmas Pass", value = cfg_bool("tab_christmas_enabled", TRUE))),
-            column(3, checkboxInput("adm_tab_season",     "Season Pass",    value = cfg_bool("tab_season_enabled", TRUE))),
-            column(3, checkboxInput("adm_tab_programs",   "Programs",       value = cfg_bool("tab_programs_enabled", TRUE)))
-          ),
-          fluidRow(
-            column(3, checkboxInput("adm_tab_events",     "Special Events", value = cfg_bool("tab_events_enabled", TRUE))),
-            column(3, checkboxInput("adm_tab_donation",   "Donation",       value = cfg_bool("tab_donation_enabled", TRUE)))
-          ),
-          br(),
-          actionButton("admin_save_toggles_limits", "Save settings / tabs / limits"),
-          hr(),
-
-          h4("Prices (CAD) — leave blank for N/A"),
-          tags$h5("Day Pass"),
-          fluidRow(
-            column(3, textInput("adm_price_day_adult",  "Adult",   value = cfg_get("price_day_adult", ""))),
-            column(3, textInput("adm_price_day_youth",  "Youth",   value = cfg_get("price_day_youth", ""))),
-            column(3, textInput("adm_price_day_under9", "Under 9", value = cfg_get("price_day_under9", ""))),
-            column(3, textInput("adm_price_day_family", "Family",  value = cfg_get("price_day_family", "")))
-          ),
-
-          tags$h5("Season Pass — early bird"),
-          fluidRow(
-            column(6, textInput("adm_price_seb_adult", "Adult", value = cfg_get("price_season_eb_adult", ""))),
-            column(6, textInput("adm_price_seb_youth", "Youth", value = cfg_get("price_season_eb_youth", "")))
-          ),
-
-          tags$h5("Season Pass — regular"),
-          fluidRow(
-            column(6, textInput("adm_price_sreg_adult", "Adult", value = cfg_get("price_season_reg_adult", ""))),
-            column(6, textInput("adm_price_sreg_youth", "Youth", value = cfg_get("price_season_reg_youth", "")))
-          ),
-
-          tags$h5("Christmas Pass"),
-          fluidRow(
-            column(6, textInput("adm_price_christmas", "Christmas pass price", value = cfg_get("price_christmas_pass", "")))
-          ),
-
-          tags$h5("Programs"),
-          uiOutput("adm_program_prices_ui"),
-          br(),
-          actionButton("admin_save_prices", "Save prices"),
-          hr(),
-
-          h4("Special events (create / edit / enable / delete)"),
-          fluidRow(
-            column(
-              6,
-              uiOutput("admin_event_select_ui"),
-              br(),
-              textInput("adm_ev_name", "Event name", value = ""),
-              dateInput("adm_ev_date", "Event date", value = Sys.Date()),
-              textInput("adm_ev_price","Price CAD (blank = N/A)", value = ""),
-              textInput("adm_ev_cap",  "Capacity (blank = N/A)", value = ""),
-              checkboxInput("adm_ev_enabled", "Enabled (visible to public)", value = TRUE),
-              br(),
-              actionButton("admin_ev_create", "Create new event"),
-              actionButton("admin_ev_update", "Update selected event"),
-              actionButton("admin_ev_delete", "Delete selected event")
-            ),
-            column(
-              6,
-              h5("Existing events"),
-              tableOutput("admin_events_table"),
-              p("Tip: select an event above to load it, then update/delete.", style="color:#666;")
-            )
-          ),
-          hr(),
-
-          h4("Blocked dates"),
-          fluidRow(
-            column(
-              6,
-              dateInput("adm_block_date", "Date to block", value = Sys.Date()),
-              textInput("adm_block_reason", "Reason (optional)", value = ""),
-              br(),
-              actionButton("admin_block_add", "Add blocked date"),
-              actionButton("admin_block_remove", "Remove blocked date")
-            ),
-            column(
-              6,
-              h5("Blocked dates list"),
-              tableOutput("admin_blocked_table")
-            )
-          )
-        )
-      ),
-      tabPanel(
-        "Reports",
-        tagList(
-          h4("Reports"),
-          p("Generate a summary and export CSV for a date range. Uses transaction created_at timestamps."),
-          fluidRow(
-            column(6, dateRangeInput("adm_report_range", "Date range", start = def_start, end = def_end)),
-            column(6,
-              br(),
-              actionButton("admin_run_report", "Run report"),
-              br(), br(),
-              downloadButton("admin_dl_tx_csv", "Download transactions CSV"),
-              downloadButton("admin_dl_items_csv", "Download line-items CSV")
-            )
-          ),
-          br(),
-          h5("Report summary"),
-          tableOutput("admin_report_summary"),
-          br(),
-          h5("Line items (aggregated)"),
-          tableOutput("admin_report_items"),
-          hr(),
-          h4("Recent transactions (last 10)"),
-          tableOutput("admin_recent_tx")
-        )
-      )
-    )
-  })
-
-  observeEvent(input$admin_save_toggles_limits, {
-    req(rv$admin_logged_in)
-
-    eb <- suppressWarnings(as.Date(input$adm_early_bird_cutoff))
-    cfg_set("early_bird_cutoff", if (is.na(eb)) "" else as.character(eb))
-
-    cfg_set("limit_max_total_cad",   input$adm_limit_max_total %||% "")
-    cfg_set("limit_max_items_total", input$adm_limit_max_items %||% "")
-
-    cfg_set("tab_daypass_enabled",   if (isTRUE(input$adm_tab_daypass)) "1" else "0")
-    cfg_set("tab_christmas_enabled", if (isTRUE(input$adm_tab_christmas)) "1" else "0")
-    cfg_set("tab_season_enabled",    if (isTRUE(input$adm_tab_season)) "1" else "0")
-    cfg_set("tab_programs_enabled",  if (isTRUE(input$adm_tab_programs)) "1" else "0")
-    cfg_set("tab_events_enabled",    if (isTRUE(input$adm_tab_events)) "1" else "0")
-    cfg_set("tab_donation_enabled",  if (isTRUE(input$adm_tab_donation)) "1" else "0")
-
-    showNotification("Saved settings/tabs/limits. Refresh tabs if needed.", type = "message")
-  })
-
-  observeEvent(input$admin_save_prices, {
-    req(rv$admin_logged_in)
-
-    cfg_set("price_day_adult",   input$adm_price_day_adult %||% "")
-    cfg_set("price_day_youth",   input$adm_price_day_youth %||% "")
-    cfg_set("price_day_under9",  input$adm_price_day_under9 %||% "")
-    cfg_set("price_day_family",  input$adm_price_day_family %||% "")
-
-    cfg_set("price_season_eb_adult",  input$adm_price_seb_adult %||% "")
-    cfg_set("price_season_eb_youth",  input$adm_price_seb_youth %||% "")
-
-    cfg_set("price_season_reg_adult", input$adm_price_sreg_adult %||% "")
-    cfg_set("price_season_reg_youth", input$adm_price_sreg_youth %||% "")
-
-    cfg_set("price_christmas_pass", input$adm_price_christmas %||% "")
-
-    cat <- program_catalog()
-    for (i in seq_len(nrow(cat))) {
-      rid <- cat$id[i]
-      key <- cat$price_key[i]
-      inp <- paste0("adm_prog_", rid)
-      cfg_set(key, input[[inp]] %||% "")
-    }
-
-    showNotification("Prices saved.", type = "message")
-  })
-
-  # -----------------------------------------------------------------------------
-  # REPORTS
-  # -----------------------------------------------------------------------------
-
-  parse_cart_json_to_df <- function(cart_json) {
-    if (!nzchar(cart_json %||% "")) return(NULL)
-    out <- tryCatch(jsonlite::fromJSON(cart_json), error = function(e) NULL)
-    if (is.null(out)) return(NULL)
-    if (!all(c("category","description","quantity","unit_price") %in% names(out))) return(NULL)
-    out
-  }
-
-  run_report <- function(start_date, end_date) {
-    start_date <- suppressWarnings(as.Date(start_date))
-    end_date   <- suppressWarnings(as.Date(end_date))
-    if (is.na(start_date) || is.na(end_date) || end_date < start_date) return(NULL)
-
-    start_ts <- paste0(format(start_date), " 00:00:00")
-    end_ts   <- paste0(format(end_date),   " 23:59:59")
-
-    tx <- db_get1(
-      "SELECT id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json, status
-       FROM transactions
-       WHERE created_at >= ?start_ts AND created_at <= ?end_ts
-       ORDER BY created_at DESC",
-      start_ts = start_ts,
-      end_ts   = end_ts
-    )
-
-    items_all <- data.frame(
-      tx_id = character(),
-      created_at = character(),
-      status = character(),
-      category = character(),
-      description = character(),
-      quantity = integer(),
-      unit_price = numeric(),
-      line_total = numeric(),
-      stringsAsFactors = FALSE
-    )
-
-    if (nrow(tx) > 0) {
-      for (i in seq_len(nrow(tx))) {
-        cart_df <- parse_cart_json_to_df(tx$cart_json[i] %||% "")
-        if (is.null(cart_df) || nrow(cart_df) == 0) next
-
-        tmp <- data.frame(
-          tx_id       = tx$id[i],
-          created_at  = tx$created_at[i],
-          status      = tx$status[i],
-          category    = as.character(cart_df$category),
-          description = as.character(cart_df$description),
-          quantity    = as.integer(cart_df$quantity),
-          unit_price  = as.numeric(cart_df$unit_price),
-          stringsAsFactors = FALSE
-        )
-        tmp$line_total <- tmp$quantity * tmp$unit_price
-        items_all <- rbind(items_all, tmp)
-      }
-    }
-
-n_tx <- nrow(tx)
-
-# Totals
-total_all_cad <- if (n_tx == 0) 0 else sum(tx$total_amount_cents, na.rm = TRUE) / 100
-
-completed_statuses <- c("COMPLETED", "SANDBOX_TEST_OK")
-tx_completed <- if (n_tx == 0) tx[0, , drop = FALSE] else tx[tx$status %in% completed_statuses, , drop = FALSE]
-total_completed_cad <- if (nrow(tx_completed) == 0) 0 else sum(tx_completed$total_amount_cents, na.rm = TRUE) / 100
-
-# Status breakdown
-by_status <- if (n_tx == 0) {
-  data.frame(status = character(), n = integer(), stringsAsFactors = FALSE)
-} else {
-  as.data.frame(table(tx$status), stringsAsFactors = FALSE)
-}
-names(by_status) <- c("status","n")
-
-    items_agg <- data.frame()
-    if (nrow(items_all) > 0) {
-      key <- paste(items_all$category, items_all$description, sep="|||")
-      agg_qty <- tapply(items_all$quantity, key, sum, na.rm = TRUE)
-      agg_rev <- tapply(items_all$line_total, key, sum, na.rm = TRUE)
-
-      parts <- strsplit(names(agg_qty), "\\|\\|\\|", perl = TRUE)
-      items_agg <- data.frame(
-        category = vapply(parts, `[[`, character(1), 1),
-        description = vapply(parts, `[[`, character(1), 2),
-        quantity = as.integer(agg_qty),
-        revenue = as.numeric(agg_rev),
-        stringsAsFactors = FALSE
-      )
-      items_agg <- items_agg[order(items_agg$revenue, decreasing = TRUE), , drop = FALSE]
-      rownames(items_agg) <- NULL
-    }
-
-summary_tbl <- data.frame(
-  metric = c("Start date","End date","Transactions","Total completed (CAD)","Total all statuses (CAD)"),
-  value  = c(
-    as.character(start_date),
-    as.character(end_date),
-    as.character(n_tx),
-    sprintf("$%.2f", total_completed_cad),
-    sprintf("$%.2f", total_all_cad)
-  ),
-  stringsAsFactors = FALSE
-)
-
-    list(
-      tx = tx,
-      items_all = items_all,
-      items_agg = items_agg,
-      summary_tbl = summary_tbl,
-      by_status = by_status
-    )
-  }
-
-  observeEvent(input$admin_run_report, {
-    req(rv$admin_logged_in)
-    dr <- input$adm_report_range
-    if (is.null(dr) || length(dr) != 2) {
-      showNotification("Select a valid report date range.", type="error")
-      return()
-    }
-    rep <- run_report(dr[1], dr[2])
-    if (is.null(rep)) {
-      showNotification("Report failed. Check date range.", type="error")
-      return()
-    }
-    report_state(rep)
-    showNotification("Report generated.", type="message")
-  })
-
-  output$admin_report_summary <- renderTable({
-    if (!rv$admin_logged_in) return(NULL)
-    rep <- report_state()
-    if (is.null(rep)) return(NULL)
-
-    out <- rep$summary_tbl
-    if (nrow(rep$by_status) > 0) {
-      out <- rbind(out, data.frame(metric="---", value="---", stringsAsFactors=FALSE))
-      for (i in seq_len(nrow(rep$by_status))) {
-        out <- rbind(out, data.frame(
-          metric = paste0("Status: ", rep$by_status$status[i]),
-          value  = as.character(rep$by_status$n[i]),
-          stringsAsFactors = FALSE
-        ))
-      }
-    }
-    out
-  }, striped = TRUE, bordered = TRUE, spacing = "s")
-
-  output$admin_report_items <- renderTable({
-    if (!rv$admin_logged_in) return(NULL)
-    rep <- report_state()
-    if (is.null(rep)) return(NULL)
-    if (nrow(rep$items_agg) == 0) return(NULL)
-    rep$items_agg
-  }, digits = 2)
-
-  output$admin_dl_tx_csv <- downloadHandler(
-    filename = function() {
-      dr <- input$adm_report_range
-      if (is.null(dr) || length(dr) != 2) return("transactions.csv")
-      paste0("transactions_", dr[1], "_to_", dr[2], ".csv")
-    },
-    content = function(file) {
-      rep <- report_state()
-      if (is.null(rep)) {
-        write.csv(data.frame(), file, row.names = FALSE)
-        return()
-      }
-      tx <- rep$tx
-      if (nrow(tx) > 0) tx$total_amount_cad <- tx$total_amount_cents / 100
-      write.csv(tx, file, row.names = FALSE)
-    }
-  )
-
-  output$admin_dl_items_csv <- downloadHandler(
-    filename = function() {
-      dr <- input$adm_report_range
-      if (is.null(dr) || length(dr) != 2) return("line_items.csv")
-      paste0("line_items_", dr[1], "_to_", dr[2], ".csv")
-    },
-    content = function(file) {
-      rep <- report_state()
-      if (is.null(rep)) {
-        write.csv(data.frame(), file, row.names = FALSE)
-        return()
-      }
-      write.csv(rep$items_all, file, row.names = FALSE)
-    }
-  )
-
-  # ---- Admin event CRUD ------------------------------------------------------
-
-  output$admin_event_select_ui <- renderUI({
-    if (!rv$admin_logged_in) return(NULL)
-
-    events_nonce()
-    ev <- get_special_events(enabled_only = FALSE)
-
-    if (nrow(ev) == 0) {
-      return(tags$div(style="color:#666;", "No events yet. Create one below."))
-    }
-
-    choices <- setNames(ev$id, paste0(ev$name, " (", ev$event_date, ")"))
-    selectInput("adm_ev_selected_id", "Select existing event (for update/delete)", choices = choices)
-  })
-
-  observeEvent(input$adm_ev_selected_id, {
-    req(rv$admin_logged_in)
-
-    id <- input$adm_ev_selected_id %||% ""
-    if (!nzchar(id)) return()
-
-    ev <- get_special_events(enabled_only = FALSE)
-    row <- ev[ev$id == id, , drop = FALSE]
-    if (nrow(row) != 1) return()
-
-    updateTextInput(session, "adm_ev_name",  value = row$name[1] %||% "")
-    updateDateInput(session, "adm_ev_date",  value = suppressWarnings(as.Date(row$event_date[1])))
-    updateTextInput(session, "adm_ev_price", value = ifelse(is.na(row$price_cad[1]), "", as.character(row$price_cad[1])))
-    updateTextInput(session, "adm_ev_cap",   value = ifelse(is.na(row$capacity[1]),  "", as.character(row$capacity[1])))
-    updateCheckboxInput(session, "adm_ev_enabled", value = isTRUE(as.integer(row$enabled[1] %||% 0) == 1L))
   }, ignoreInit = TRUE)
 
-  output$admin_events_table <- renderTable({
-    if (!rv$admin_logged_in) return(NULL)
-    ev <- get_special_events(enabled_only = FALSE)
-    if (nrow(ev) == 0) return(NULL)
-    ev[, c("id","name","event_date","price_cad","capacity","enabled")]
-  }, digits = 2)
+  # -----------------------------------------------------------------------------
+  # ADMIN UI
+  # -----------------------------------------------------------------------------
 
-  observeEvent(input$admin_ev_create, {
-    req(rv$admin_logged_in)
+  admin_keys_prices <- list(
+    list(key="early_bird_cutoff", label="Early-bird cutoff (YYYY-MM-DD)", type="date"),
+    list(key="price_day_adult",   label="Day pass – Adult",   type="num"),
+    list(key="price_day_youth",   label="Day pass – Youth",   type="num"),
+    list(key="price_day_under9",  label="Day pass – Under 9", type="num"),
+    list(key="price_day_family",  label="Day pass – Family",  type="num"),
+    list(key="price_christmas_pass", label="Christmas pass (per person)", type="num"),
+    list(key="price_season_eb_adult", label="Season pass (Early-bird) – Adult", type="num"),
+    list(key="price_season_eb_youth", label="Season pass (Early-bird) – Youth", type="num"),
+    list(key="price_season_reg_adult", label="Season pass (Regular) – Adult", type="num"),
+    list(key="price_season_reg_youth", label="Season pass (Regular) – Youth", type="num"),
+    list(key="price_program_bunnies", label="Program – Bunnies", type="num"),
+    list(key="price_program_rabbits", label="Program – Rabbits", type="num"),
+    list(key="price_program_u10", label="Program – U10", type="num"),
+    list(key="price_program_u12", label="Program – U12", type="num"),
+    list(key="price_program_u14", label="Program – U14", type="num"),
+    list(key="price_program_u16", label="Program – U16", type="num"),
+    list(key="price_program_u18", label="Program – U18", type="num"),
+    list(key="price_program_u20", label="Program – U20", type="num"),
+    list(key="price_program_biathlon_adp", label="Program – Biathlon ADP", type="num"),
+    list(key="price_program_biathlon_rifle_rental_adp", label="Program – Biathlon Rifle Rental ADP", type="num"),
+    list(key="price_program_biathlon_youth_intro", label="Program – Biathlon Youth Intro", type="num"),
+    list(key="price_program_masters_2x", label="Program – Masters 2X", type="num"),
+    list(key="price_program_masters_1x", label="Program – Masters 1X", type="num"),
+    list(key="price_program_biathlon_masters", label="Program – Biathlon Masters", type="num"),
+    list(key="price_program_biathlon_masters_rifle_rental", label="Program – Biathlon Masters Rifle Rental", type="num")
+  )
 
-    name <- trimws(input$adm_ev_name %||% "")
-    d    <- suppressWarnings(as.Date(input$adm_ev_date))
+  admin_keys_toggles <- list(
+    list(key="tab_daypass_enabled",    label="Enable Day Pass tab", default=TRUE),
+    list(key="tab_christmas_enabled",  label="Enable Christmas Pass tab", default=TRUE),
+    list(key="tab_season_enabled",     label="Enable Season Pass tab", default=TRUE),
+    list(key="tab_programs_enabled",   label="Enable Programs tab", default=TRUE),
+    list(key="tab_events_enabled",     label="Enable Special Events tab", default=TRUE),
+    list(key="tab_donation_enabled",   label="Enable Donation tab", default=TRUE)
+  )
 
-    if (!nzchar(name) || is.na(d)) {
-      showNotification("Event name and a valid date are required.", type="error")
-      return()
+  admin_keys_limits <- list(
+    list(key="limit_max_total_cad", label="Max total (CAD)", default="2000"),
+    list(key="limit_max_items_total", label="Max items total", default="20")
+  )
+
+  output$admin_content <- renderUI({
+    admin_nonce()
+    if (!isTRUE(rv$admin_logged_in)) {
+      return(tags$div(style="color:#666;", "Log in to see admin controls."))
     }
 
-    id <- UUIDgenerate()
-
-    price <- {
-      s <- trimws(input$adm_ev_price %||% "")
-      if (!nzchar(s) || toupper(s) %in% c("N/A","NA")) NA_real_
-      else suppressWarnings(as.numeric(gsub("[\\$,]", "", s)))
-    }
-    if (!is.na(price) && price < 0) { showNotification("Invalid price.", type="error"); return() }
-
-    cap <- {
-      s <- trimws(input$adm_ev_cap %||% "")
-      if (!nzchar(s) || toupper(s) %in% c("N/A","NA")) NA_integer_
-      else suppressWarnings(as.integer(s))
-    }
-    if (!is.na(cap) && cap < 0) { showNotification("Invalid capacity.", type="error"); return() }
-
-    en <- if (isTRUE(input$adm_ev_enabled)) 1L else 0L
-
-    ok <- tryCatch({
-      db_exec1(
-        "INSERT INTO special_events (id, name, event_date, price_cad, capacity, enabled, created_at)
-         VALUES (?id, ?name, ?event_date, ?price_cad, ?capacity, ?enabled, ?created_at)",
-        id         = id,
-        name       = name,
-        event_date = as.character(d),
-        price_cad  = ifelse(is.na(price), NA, price),
-        capacity   = ifelse(is.na(cap), NA, cap),
-        enabled    = en,
-        created_at = now_ts()
+    tabsetPanel(
+      id = "admin_tabs",
+      tabPanel(
+        "Prices",
+        p("Set prices and early-bird cutoff. Leave blank for N/A (but then users cannot buy that item)."),
+        uiOutput("admin_prices_ui"),
+        actionButton("admin_prices_save", "Save prices")
+      ),
+      tabPanel(
+        "Toggles",
+        p("Enable/disable public tabs."),
+        uiOutput("admin_toggles_ui"),
+        actionButton("admin_toggles_save", "Save toggles")
+      ),
+      tabPanel(
+        "Limits",
+        p("Set transaction limits. These apply to the merged cart."),
+        uiOutput("admin_limits_ui"),
+        actionButton("admin_limits_save", "Save limits")
+      ),
+      tabPanel(
+        "Blocked dates",
+        p("Block specific dates from allowing payment (Day Pass)."),
+        uiOutput("admin_blocked_ui")
+      ),
+      tabPanel(
+        "Events",
+        p("Create, enable/disable, and delete special events."),
+        uiOutput("admin_events_ui")
+      ),
+      tabPanel(
+        "Transactions",
+        p("Search and view transactions. Receipt status is only COMPLETED when verified with Square (or sandbox test)."),
+        uiOutput("admin_tx_ui")
       )
-      TRUE
-    }, error = function(e) FALSE)
-
-    if (!ok) showNotification("Create failed. That ID may already exist.", type="error")
-    else {
-      showNotification("Event created.", type="message")
-      events_nonce(events_nonce() + 1L)
-    }
-  })
-
-  observeEvent(input$admin_ev_update, {
-    req(rv$admin_logged_in)
-
-    id <- input$adm_ev_selected_id %||% ""
-    if (!nzchar(id)) { showNotification("Select an existing event to update.", type="error"); return() }
-
-    name <- trimws(input$adm_ev_name %||% "")
-    d    <- suppressWarnings(as.Date(input$adm_ev_date))
-    if (!nzchar(name) || is.na(d)) { showNotification("Name and a valid date are required.", type="error"); return() }
-
-    price <- {
-      s <- trimws(input$adm_ev_price %||% "")
-      if (!nzchar(s) || toupper(s) %in% c("N/A","NA")) NA_real_
-      else suppressWarnings(as.numeric(gsub("[\\$,]", "", s)))
-    }
-    cap <- {
-      s <- trimws(input$adm_ev_cap %||% "")
-      if (!nzchar(s) || toupper(s) %in% c("N/A","NA")) NA_integer_
-      else suppressWarnings(as.integer(s))
-    }
-    en <- if (isTRUE(input$adm_ev_enabled)) 1L else 0L
-
-    n <- db_exec1(
-      "UPDATE special_events
-       SET name = ?name, event_date = ?event_date, price_cad = ?price_cad, capacity = ?capacity, enabled = ?enabled
-       WHERE id = ?id",
-      name       = name,
-      event_date = as.character(d),
-      price_cad  = ifelse(is.na(price), NA, price),
-      capacity   = ifelse(is.na(cap), NA, cap),
-      enabled    = en,
-      id         = id
     )
-
-    if (n == 0) showNotification("No event found with that ID.", type="error")
-    else {
-      showNotification("Event updated.", type="message")
-      events_nonce(events_nonce() + 1L)
-    }
   })
 
-  observeEvent(input$admin_ev_delete, {
-    req(rv$admin_logged_in)
-    id <- input$adm_ev_selected_id %||% ""
-    if (!nzchar(id)) { showNotification("Select an existing event to delete.", type="error"); return() }
-
-    n <- db_exec1("DELETE FROM special_events WHERE id = ?id", id = id)
-    if (n == 0) showNotification("No event found with that ID.", type="error")
-    else {
-      showNotification("Event deleted.", type="message")
-      events_nonce(events_nonce() + 1L)
-    }
-  })
-
-  # ---- Blocked dates ---------------------------------------------------------
-
-  output$admin_blocked_table <- renderTable({
+  output$admin_prices_ui <- renderUI({
+    admin_nonce()
     if (!rv$admin_logged_in) return(NULL)
-    get_blocked_dates()
+
+    ui_list <- lapply(admin_keys_prices, function(it) {
+      key <- it$key
+      label <- it$label
+      if (identical(it$type, "date")) {
+        val <- cfg_get(key, "")
+        d <- suppressWarnings(as.Date(val))
+        dateInput(paste0("cfg_", key), label, value = if (is.na(d)) NULL else d)
+      } else {
+        val <- cfg_get(key, "")
+        textInput(paste0("cfg_", key), label, value = val)
+      }
+    })
+    do.call(tagList, ui_list)
+  })
+
+  output$admin_toggles_ui <- renderUI({
+    admin_nonce()
+    if (!rv$admin_logged_in) return(NULL)
+
+    ui_list <- lapply(admin_keys_toggles, function(it) {
+      key <- it$key
+      val <- cfg_bool(key, it$default)
+      checkboxInput(paste0("cfg_", key), it$label, value = isTRUE(val))
+    })
+    do.call(tagList, ui_list)
+  })
+
+  output$admin_limits_ui <- renderUI({
+    admin_nonce()
+    if (!rv$admin_logged_in) return(NULL)
+
+    ui_list <- lapply(admin_keys_limits, function(it) {
+      key <- it$key
+      val <- cfg_get(key, it$default)
+      textInput(paste0("cfg_", key), it$label, value = val)
+    })
+    do.call(tagList, ui_list)
+  })
+
+  observeEvent(input$admin_prices_save, {
+    if (!rv$admin_logged_in) return()
+    for (it in admin_keys_prices) {
+      key <- it$key
+      id  <- paste0("cfg_", key)
+      val <- input[[id]] %||% ""
+      if (identical(it$type, "date")) {
+        if (is.null(val) || !nzchar(as.character(val))) {
+          cfg_set(key, "")
+        } else {
+          cfg_set(key, as.character(as.Date(val)))
+        }
+      } else {
+        cfg_set(key, as.character(val))
+      }
+    }
+    showNotification("Prices saved.", type = "message")
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$admin_toggles_save, {
+    if (!rv$admin_logged_in) return()
+    for (it in admin_keys_toggles) {
+      key <- it$key
+      id  <- paste0("cfg_", key)
+      val <- isTRUE(input[[id]])
+      cfg_set(key, if (val) "1" else "0")
+    }
+    showNotification("Toggles saved. Reloading tabs…", type = "message")
+    admin_nonce(admin_nonce() + 1L)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$admin_limits_save, {
+    if (!rv$admin_logged_in) return()
+    for (it in admin_keys_limits) {
+      key <- it$key
+      id  <- paste0("cfg_", key)
+      cfg_set(key, as.character(input[[id]] %||% ""))
+    }
+    showNotification("Limits saved.", type = "message")
+  }, ignoreInit = TRUE)
+
+  # -----------------------------------------------------------------------------
+  # ADMIN: Blocked dates
+  # -----------------------------------------------------------------------------
+
+  output$admin_blocked_ui <- renderUI({
+    admin_nonce()
+    if (!rv$admin_logged_in) return(NULL)
+
+    bd <- blocked_df()
+
+    tagList(
+      fluidRow(
+        column(4,
+               dateInput("admin_block_date", "Date to block", value = Sys.Date()),
+               textInput("admin_block_reason", "Reason (optional)", value = ""),
+               actionButton("admin_block_add", "Add blocked date")
+        ),
+        column(8,
+               tags$h4("Blocked dates"),
+               if (nrow(bd) == 0) tags$div(style="color:#666;", "None.") else
+                 tags$table(
+                   class="table table-condensed",
+                   tags$thead(tags$tr(tags$th("Date"), tags$th("Reason"), tags$th("Action"))),
+                   tags$tbody(lapply(seq_len(nrow(bd)), function(i) {
+                     d <- as.character(bd$date[i] %||% "")
+                     tags$tr(
+                       tags$td(d),
+                       tags$td(as.character(bd$reason[i] %||% "")),
+                       tags$td(actionButton(paste0("admin_block_del_", i), "Delete"))
+                     )
+                   }))
+                 )
+        )
+      )
+    )
   })
 
   observeEvent(input$admin_block_add, {
-    req(rv$admin_logged_in)
-    d <- suppressWarnings(as.Date(input$adm_block_date))
-    rs <- trimws(input$adm_block_reason %||% "")
-    if (is.na(d)) { showNotification("Invalid date.", type = "error"); return() }
+    if (!rv$admin_logged_in) return()
+    d <- suppressWarnings(as.Date(input$admin_block_date))
+    if (is.na(d)) { showNotification("Invalid date.", type="error"); return() }
+    r <- trimws(input$admin_block_reason %||% "")
 
     ok <- tryCatch({
+      with_db(function(con) {
+        DBI::dbWithTransaction(con, {
+          db_exec(con,
+                  'INSERT INTO blocked_dates("date", reason) VALUES (?d, ?r)',
+                  d = as.character(d), r = r)
+        })
+      })
+      TRUE
+    }, error = function(e) {
+      showNotification(paste("DB error:", conditionMessage(e)), type="error")
+      FALSE
+    })
+    if (ok) {
+      blocked_nonce(blocked_nonce() + 1L)
+      showNotification("Blocked date added.", type="message")
+    }
+  }, ignoreInit = TRUE)
+
+  observe({
+    if (!rv$admin_logged_in) return()
+    bd <- blocked_df()
+    if (nrow(bd) == 0) return()
+
+    lapply(seq_len(nrow(bd)), function(i) {
+      btn <- paste0("admin_block_del_", i)
+      observeEvent(input[[btn]], {
+        d <- as.character(bd$date[i] %||% "")
+        if (!nzchar(d)) return()
+        tryCatch({
+          db_exec1('DELETE FROM blocked_dates WHERE "date" = ?d', d = d)
+          blocked_nonce(blocked_nonce() + 1L)
+          showNotification("Blocked date deleted.", type="message")
+        }, error = function(e) {
+          showNotification(paste("DB error:", conditionMessage(e)), type="error")
+        })
+      }, ignoreInit = TRUE)
+    })
+  })
+
+  # -----------------------------------------------------------------------------
+  # ADMIN: Events
+  # -----------------------------------------------------------------------------
+
+  output$admin_events_ui <- renderUI({
+    admin_nonce()
+    if (!rv$admin_logged_in) return(NULL)
+
+    ev <- get_special_events(enabled_only = FALSE)
+
+    tagList(
+      fluidRow(
+        column(4,
+               textInput("admin_event_name", "Event name", value = ""),
+               dateInput("admin_event_date", "Event date", value = Sys.Date()),
+               textInput("admin_event_price", "Price (CAD)", value = ""),
+               textInput("admin_event_capacity", "Capacity (optional)", value = ""),
+               checkboxInput("admin_event_enabled", "Enabled", value = TRUE),
+               actionButton("admin_event_add", "Create event")
+        ),
+        column(8,
+               tags$h4("Existing events"),
+               if (nrow(ev) == 0) tags$div(style="color:#666;", "None.") else
+                 tags$table(
+                   class="table table-condensed",
+                   tags$thead(tags$tr(
+                     tags$th("Name"), tags$th("Date"), tags$th("Price"), tags$th("Capacity"),
+                     tags$th("Enabled"), tags$th("Actions")
+                   )),
+                   tags$tbody(lapply(seq_len(nrow(ev)), function(i) {
+                     tags$tr(
+                       tags$td(as.character(ev$name[i] %||% "")),
+                       tags$td(as.character(ev$event_date[i] %||% "")),
+                       tags$td(as.character(ev$price_cad[i] %||% "")),
+                       tags$td(as.character(ev$capacity[i] %||% "")),
+                       tags$td(if (as.integer(ev$enabled[i] %||% 0L) == 1L) "Yes" else "No"),
+                       tags$td(
+                         actionButton(paste0("admin_event_toggle_", i), "Toggle"),
+                         actionButton(paste0("admin_event_delete_", i), "Delete")
+                       )
+                     )
+                   }))
+                 )
+        )
+      )
+    )
+  })
+
+  observeEvent(input$admin_event_add, {
+    if (!rv$admin_logged_in) return()
+
+    nm <- trimws(input$admin_event_name %||% "")
+    d  <- suppressWarnings(as.Date(input$admin_event_date))
+    pr <- suppressWarnings(as.numeric(gsub("\\$", "", trimws(input$admin_event_price %||% ""))))
+    cap <- suppressWarnings(as.integer(trimws(input$admin_event_capacity %||% "")))
+    en <- if (isTRUE(input$admin_event_enabled)) 1L else 0L
+
+    if (!nzchar(nm)) { showNotification("Event name required.", type="error"); return() }
+    if (is.na(d)) { showNotification("Event date invalid.", type="error"); return() }
+    if (is.na(pr) || pr < 0) { showNotification("Event price invalid.", type="error"); return() }
+    if (is.na(cap)) cap <- NA_integer_
+
+    id <- UUIDgenerate()
+    ok <- tryCatch({
       db_exec1(
-        'INSERT INTO blocked_dates("date", reason) VALUES (?date, ?reason)',
-        date   = as.character(d),
-        reason = ifelse(nzchar(rs), rs, NA_character_)
+        "INSERT INTO special_events (id, name, event_date, price_cad, capacity, enabled, created_at)
+         VALUES (?id, ?nm, ?d, ?pr, ?cap, ?en, ?ts)",
+        id = id, nm = nm, d = as.character(d), pr = pr, cap = cap, en = en, ts = now_ts()
       )
       TRUE
-    }, error = function(e) FALSE)
+    }, error = function(e) {
+      showNotification(paste("DB error:", conditionMessage(e)), type="error")
+      FALSE
+    })
 
-    if (!ok) {
-      showNotification("Block failed. Date may already be blocked.", type = "error")
-    } else {
-      showNotification("Date blocked.", type = "message")
-      blocked_nonce(blocked_nonce() + 1L)
-      bump_day_date_ui()
+    if (ok) {
+      events_nonce(events_nonce() + 1L)
+      admin_nonce(admin_nonce() + 1L)
+      showNotification("Event created.", type="message")
     }
+  }, ignoreInit = TRUE)
+
+  observe({
+    if (!rv$admin_logged_in) return()
+    ev <- get_special_events(enabled_only = FALSE)
+    if (nrow(ev) == 0) return()
+
+    lapply(seq_len(nrow(ev)), function(i) {
+
+      observeEvent(input[[paste0("admin_event_toggle_", i)]], {
+        id <- as.character(ev$id[i] %||% "")
+        if (!nzchar(id)) return()
+        cur <- as.integer(ev$enabled[i] %||% 0L)
+        new <- if (cur == 1L) 0L else 1L
+        tryCatch({
+          db_exec1("UPDATE special_events SET enabled = ?en WHERE id = ?id", en = new, id = id)
+          events_nonce(events_nonce() + 1L)
+          admin_nonce(admin_nonce() + 1L)
+          showNotification("Event updated.", type="message")
+        }, error = function(e) {
+          showNotification(paste("DB error:", conditionMessage(e)), type="error")
+        })
+      }, ignoreInit = TRUE)
+
+      observeEvent(input[[paste0("admin_event_delete_", i)]], {
+        id <- as.character(ev$id[i] %||% "")
+        if (!nzchar(id)) return()
+        tryCatch({
+          db_exec1("DELETE FROM special_events WHERE id = ?id", id = id)
+          events_nonce(events_nonce() + 1L)
+          admin_nonce(admin_nonce() + 1L)
+          showNotification("Event deleted.", type="message")
+        }, error = function(e) {
+          showNotification(paste("DB error:", conditionMessage(e)), type="error")
+        })
+      }, ignoreInit = TRUE)
+
+    })
   })
 
-  observeEvent(input$admin_block_remove, {
-    req(rv$admin_logged_in)
-    d <- suppressWarnings(as.Date(input$adm_block_date))
-    if (is.na(d)) { showNotification("Invalid date.", type = "error"); return() }
+  # -----------------------------------------------------------------------------
+  # ADMIN: Transactions
+  # -----------------------------------------------------------------------------
 
-    n <- db_exec1('DELETE FROM blocked_dates WHERE "date" = ?date', date = as.character(d))
-    if (n == 0) {
-      showNotification("That date was not blocked.", type = "warning")
-    } else {
-      showNotification("Blocked date removed.", type = "message")
-      blocked_nonce(blocked_nonce() + 1L)
-      bump_day_date_ui()
+  fetch_transactions <- function(limit = 50L, email = "", status = "", receipt = "") {
+    limit <- max(1L, min(500L, as.integer(limit %||% 50L)))
+    email <- trimws(email %||% "")
+    status <- trimws(status %||% "")
+    receipt <- trimws(receipt %||% "")
+
+    where <- c()
+    args <- list()
+
+    if (nzchar(email)) {
+      where <- c(where, "LOWER(buyer_email) LIKE LOWER(?email)")
+      args$email <- paste0("%", email, "%")
     }
-  })
+    if (nzchar(status)) {
+      where <- c(where, "status = ?status")
+      args$status <- status
+    }
+    if (nzchar(receipt)) {
+      where <- c(where, "receipt_token = ?receipt")
+      args$receipt <- receipt
+    }
 
-  output$admin_recent_tx <- renderTable({
+    q <- "SELECT created_at, buyer_name, buyer_email, total_amount_cents, currency, receipt_token, status, square_order_id
+          FROM transactions"
+    if (length(where) > 0) q <- paste(q, "WHERE", paste(where, collapse = " AND "))
+    q <- paste(q, "ORDER BY created_at DESC LIMIT", limit)
+
+    do.call(db_get1, c(list(sql = q), args))
+  }
+
+  output$admin_tx_ui <- renderUI({
+    admin_nonce()
     if (!rv$admin_logged_in) return(NULL)
-    x <- db_get1(
-      "SELECT created_at, buyer_name, buyer_email, total_amount_cents, status
-       FROM transactions
-       ORDER BY created_at DESC
-       LIMIT 10"
+
+    tagList(
+      fluidRow(
+        column(3, textInput("admin_tx_email", "Search email contains", value = "")),
+        column(3, textInput("admin_tx_status", "Status equals", value = "")),
+        column(3, textInput("admin_tx_receipt", "Receipt token equals", value = "")),
+        column(3, numericInput("admin_tx_limit", "Limit", value = 50, min = 1, max = 500, step = 1))
+      ),
+      actionButton("admin_tx_refresh", "Refresh"),
+      actionButton("admin_tx_download", "Download CSV"),
+      br(), br(),
+      uiOutput("admin_tx_table_ui")
     )
-    if (nrow(x) > 0) x$total_amount_cad <- x$total_amount_cents / 100
-    x
   })
+
+  output$admin_tx_table_ui <- renderUI({
+    admin_nonce()
+    if (!rv$admin_logged_in) return(NULL)
+
+    tx_nonce()
+    df <- fetch_transactions(
+      limit = input$admin_tx_limit %||% 50,
+      email = input$admin_tx_email %||% "",
+      status = input$admin_tx_status %||% "",
+      receipt = input$admin_tx_receipt %||% ""
+    )
+
+    if (nrow(df) == 0) return(tags$div(style="color:#666;", "No results."))
+
+    df$Total <- vapply(df$total_amount_cents, function(x) sprintf("$%.2f", as.numeric(x %||% 0) / 100), character(1))
+    tagList(
+      tags$table(
+        class="table table-condensed",
+        tags$thead(tags$tr(
+          tags$th("Created"),
+          tags$th("Name"),
+          tags$th("Email"),
+          tags$th("Total"),
+          tags$th("Status"),
+          tags$th("Receipt token"),
+          tags$th("Action")
+        )),
+        tags$tbody(lapply(seq_len(nrow(df)), function(i) {
+          tags$tr(
+            tags$td(as.character(df$created_at[i] %||% "")),
+            tags$td(as.character(df$buyer_name[i] %||% "")),
+            tags$td(as.character(df$buyer_email[i] %||% "")),
+            tags$td(df$Total[i]),
+            tags$td(as.character(df$status[i] %||% "")),
+            tags$td(as.character(df$receipt_token[i] %||% "")),
+            tags$td(actionButton(paste0("admin_tx_load_", i), "Load receipt"))
+          )
+        }))
+      )
+    )
+  })
+
+  observeEvent(input$admin_tx_refresh, {
+    tx_nonce(tx_nonce() + 1L)
+  }, ignoreInit = TRUE)
+
+  output$admin_tx_download <- downloadHandler(
+    filename = function() paste0("transactions_", format(Sys.Date()), ".csv"),
+    content = function(file) {
+      df <- fetch_transactions(
+        limit = input$admin_tx_limit %||% 50,
+        email = input$admin_tx_email %||% "",
+        status = input$admin_tx_status %||% "",
+        receipt = input$admin_tx_receipt %||% ""
+      )
+      write.csv(df, file, row.names = FALSE)
+    }
+  )
+
+  observe({
+    if (!rv$admin_logged_in) return()
+    df <- fetch_transactions(
+      limit = input$admin_tx_limit %||% 50,
+      email = input$admin_tx_email %||% "",
+      status = input$admin_tx_status %||% "",
+      receipt = input$admin_tx_receipt %||% ""
+    )
+    if (nrow(df) == 0) return()
+
+    lapply(seq_len(nrow(df)), function(i) {
+      observeEvent(input[[paste0("admin_tx_load_", i)]], {
+        token <- as.character(df$receipt_token[i] %||% "")
+        if (!nzchar(token)) return()
+        tx <- load_receipt_token(token)
+        if (is.null(tx)) {
+          showNotification("Receipt not found.", type = "error")
+          return()
+        }
+        receipt_tx(tx)
+        poll_count(0L)
+        updateTabsetPanel(session, "main_nav", selected = "Receipt")
+      }, ignoreInit = TRUE)
+    })
+  })
+
 }
 
 shinyApp(ui = ui, server = server)
