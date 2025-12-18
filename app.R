@@ -499,6 +499,24 @@ create_square_checkout_from_cart <- function(cart_df,
 # UI
 # -----------------------------------------------------------------------------
 
+checkout_panel_ui <- function(prefix, title = "Checkout & Pay") {
+  tagList(
+    tags$div(
+      class = "mini-cart-box",
+      h4(title),
+      uiOutput(paste0(prefix, "_cart_list")),
+      br(),
+      textInput(paste0(prefix, "_buyer_name"),  "Name for receipt",  value = ""),
+      textInput(paste0(prefix, "_buyer_email"), "Email for receipt", value = ""),
+      br(),
+      strong(textOutput(paste0(prefix, "_cart_total"))),
+      br(), br(),
+      actionButton(paste0(prefix, "_cart_clear"), "Clear cart"),
+      actionButton(paste0(prefix, "_cart_pay"),   "Pay now")
+    )
+  )
+}
+
 css_tabs <- "
 .navbar-nav > li > a { font-weight: 600; }
 .navbar-nav > li.active > a,
