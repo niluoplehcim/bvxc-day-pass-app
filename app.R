@@ -661,6 +661,7 @@ server <- function(input, output, session) {
     cart = empty_cart_df(),
     buyer_name   = "",
     buyer_email  = "",
+    buyer_syncing = FALSE,
     admin_logged_in  = FALSE,
     admin_fail_count = 0L,
     admin_lock_until = as.POSIXct(NA)
@@ -1662,12 +1663,58 @@ server <- function(input, output, session) {
     clear_cart()
   }
 
+  # -----------------------------------------------------------------------------
+  # PER-TAB PAY / CLEAR + BUYER FIELD SYNC (prevents cycling on mobile/desktop)
+  # -----------------------------------------------------------------------------
+
   for (p in checkout_prefixes) {
     local({
       prefix <- p
 
       observeEvent(input[[paste0(prefix, "_cart_clear")]], {
         clear_cart()
+      }, ignoreInit = TRUE)
+
+      observeEvent(input[[paste0(prefix, "_buyer_name")]], {
+        if (isTRUE(rv$buyer_syncing)) return()
+
+        new_val <- trimws(input[[paste0(prefix, "_buyer_name")]] %||% "")
+        if (identical(new_val, rv$buyer_name %||% "")) return()
+
+        rv$buyer_name <- new_val
+
+        rv$buyer_syncing <- TRUE
+        on.exit({ rv$buyer_syncing <- FALSE }, add = TRUE)
+
+        for (other in setdiff(checkout_prefixes, prefix)) {
+          other_id <- paste0(other, "_buyer_name")
+          cur <- trimws(isolate(input[[other_id]] %||% ""))
+          if (!identical(cur, new_val)) {
+            freezeReactiveValue(input, other_id)
+            try(updateTextInput(session, other_id, value = new_val), silent = TRUE)
+          }
+        }
+      }, ignoreInit = TRUE)
+
+      observeEvent(input[[paste0(prefix, "_buyer_email")]], {
+        if (isTRUE(rv$buyer_syncing)) return()
+
+        new_val <- trimws(input[[paste0(prefix, "_buyer_email")]] %||% "")
+        if (identical(new_val, rv$buyer_email %||% "")) return()
+
+        rv$buyer_email <- new_val
+
+        rv$buyer_syncing <- TRUE
+        on.exit({ rv$buyer_syncing <- FALSE }, add = TRUE)
+
+        for (other in setdiff(checkout_prefixes, prefix)) {
+          other_id <- paste0(other, "_buyer_email")
+          cur <- trimws(isolate(input[[other_id]] %||% ""))
+          if (!identical(cur, new_val)) {
+            freezeReactiveValue(input, other_id)
+            try(updateTextInput(session, other_id, value = new_val), silent = TRUE)
+          }
+        }
       }, ignoreInit = TRUE)
 
       observeEvent(input[[paste0(prefix, "_cart_pay")]], {
