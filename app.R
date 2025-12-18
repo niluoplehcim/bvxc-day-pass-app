@@ -14,9 +14,9 @@ suppressPackageStartupMessages({
   library(RSQLite)
   library(uuid)
   library(jsonlite)
-  library(qrcode)
   library(pool)
   library(RPostgres)
+library(qrencoder)
 })
 
 # -----------------------------------------------------------------------------
@@ -2102,37 +2102,54 @@ if (is.null(res) || !nzchar(res$checkout_url %||% "")) {
     }
   }
 
-output$receipt_qr <- renderImage({
-  tx <- receipt_tx()
-  if (is.null(tx) || nrow(tx) != 1) return(NULL)
+  output$receipt_qr <- renderImage({
+    tx <- receipt_tx()
+    if (is.null(tx) || nrow(tx) != 1) return(NULL)
 
-  token <- as.character(tx$receipt_token[1] %||% "")
-  if (!nzchar(token)) return(NULL)
+    token <- as.character(tx$receipt_token[1] %||% "")
+    if (!nzchar(token)) return(NULL)
 
-  url <- receipt_url_for_token(token)
-  if (!nzchar(url)) return(NULL)
+    url <- receipt_url_for_token(token)
+    if (!nzchar(url)) return(NULL)
 
-  tf <- tempfile(fileext = ".png")
+    tf <- tempfile(fileext = ".png")
 
-  ok <- tryCatch({
-    grDevices::png(tf, width = 260, height = 260)
-    op <- par(mar = c(0, 0, 0, 0))
-    on.exit({
-      par(op)
-      grDevices::dev.off()
-    }, add = TRUE)
+    ok <- FALSE
+    tryCatch({
+      m <- qrencoder::qrencode(url)            # TRUE/FALSE matrix
+      m <- ifelse(m, 1L, 0L)
+      m <- m[nrow(m):1, , drop = FALSE]        # flip vertically
 
-    qrcode::qrcode_gen(url, plotQRcode = TRUE)
-    TRUE
-  }, error = function(e) {
-    try(grDevices::dev.off(), silent = TRUE)
-    FALSE
-  })
+      cols <- ifelse(m == 1L, "#000000", "#FFFFFF")
+      rmat <- matrix(cols, nrow = nrow(cols), ncol = ncol(cols))
+      rast <- as.raster(rmat)
 
-  if (!ok || !file.exists(tf)) return(NULL)
+      grDevices::png(tf, width = 300, height = 300)
+      op <- par(mar = c(0, 0, 0, 0), xaxs = "i", yaxs = "i")
+      on.exit({ par(op); grDevices::dev.off() }, add = TRUE)
 
-  list(src = tf, contentType = "image/png", width = 220, height = 220, alt = "Receipt QR")
-}, deleteFile = TRUE)
+      plot.new()
+      plot.window(xlim = c(0, 1), ylim = c(0, 1), asp = 1)
+      rasterImage(rast, 0, 0, 1, 1, interpolate = FALSE)
+
+      ok <- TRUE
+    }, error = function(e) {
+      cat("Receipt QR render error:", conditionMessage(e), "\n")
+      flush.console()
+      try(grDevices::dev.off(), silent = TRUE)
+    })
+
+    if (!isTRUE(ok)) return(NULL)
+    if (!file.exists(tf)) return(NULL)
+
+    return(list(
+      src         = tf,
+      contentType = "image/png",
+      width       = 220,
+      height      = 220,
+      alt         = "Receipt QR"
+    ))
+  }, deleteFile = TRUE)
 
   output$receipt_items <- renderUI({
     tx <- receipt_tx()
