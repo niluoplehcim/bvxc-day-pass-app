@@ -17,6 +17,7 @@ suppressPackageStartupMessages({
   library(qrcode)
   library(pool)
   library(RPostgres)
+  library(DT)
 })
 
 # -----------------------------------------------------------------------------
@@ -167,6 +168,78 @@ db_exec <- function(con, sql, ...) DBI::dbExecute(con, DBI::sqlInterpolate(con, 
 
 db_get1  <- function(sql, ...) with_db(function(con) db_get(con, sql, ...))
 db_exec1 <- function(sql, ...) with_db(function(con) db_exec(con, sql, ...))
+
+# -----------------------------------------------------------------------------
+# ADMIN: Transactions helper (query)
+# -----------------------------------------------------------------------------
+
+fetch_transactions <- function(limit = 50L,
+                               start_date = NULL,
+                               end_date   = NULL,
+                               name       = "",
+                               email      = "",
+                               status     = "",
+                               tx_type    = "",
+                               sort_by    = "created_at") {
+
+  limit <- max(1L, min(500L, as.integer(limit %||% 50L)))
+
+  name    <- trimws(as.character(name %||% ""))
+  email   <- trimws(as.character(email %||% ""))
+  status  <- trimws(as.character(status %||% ""))
+  tx_type <- trimws(as.character(tx_type %||% ""))
+
+  sd <- suppressWarnings(as.Date(start_date))
+  ed <- suppressWarnings(as.Date(end_date))
+
+  # Whitelist sorting (avoid SQL injection)
+  sort_by <- if (sort_by %in% c("created_at", "total_amount_cents")) sort_by else "created_at"
+  sort_dir <- "DESC"
+
+  where <- character()
+  args  <- list()
+
+  # created_at is stored as ISO string "YYYY-MM-DD HH:MM:SS" -> string compare works
+  if (!is.na(sd)) {
+    where <- c(where, "created_at >= ?start_ts")
+    args$start_ts <- paste0(as.character(sd), " 00:00:00")
+  }
+  if (!is.na(ed)) {
+    where <- c(where, "created_at <= ?end_ts")
+    args$end_ts <- paste0(as.character(ed), " 23:59:59")
+  }
+
+  if (nzchar(name)) {
+    where <- c(where, "LOWER(buyer_name) LIKE LOWER(?name)")
+    args$name <- paste0("%", name, "%")
+  }
+  if (nzchar(email)) {
+    where <- c(where, "LOWER(buyer_email) LIKE LOWER(?email)")
+    args$email <- paste0("%", email, "%")
+  }
+  if (nzchar(status)) {
+    where <- c(where, "status = ?status")
+    args$status <- status
+  }
+  if (nzchar(tx_type)) {
+    where <- c(where, "tx_type = ?tx_type")
+    args$tx_type <- tx_type
+  }
+
+  q <- "
+    SELECT created_at, buyer_name, buyer_email, tx_type,
+           total_amount_cents, currency, receipt_token, status
+    FROM transactions
+  "
+
+  if (length(where) > 0) {
+    q <- paste(q, "WHERE", paste(where, collapse = " AND "))
+  }
+
+  q <- paste0(q, " ORDER BY ", sort_by, " ", sort_dir, " LIMIT ", limit)
+
+  do.call(db_get1, c(list(sql = q), args))
+}
 
 # -----------------------------------------------------------------------------
 # DB INIT
@@ -707,8 +780,8 @@ ui <- fluidPage(
 $(document).off('click.bvxc', 'a.admin-tx-load');
 $(document).on('click.bvxc', 'a.admin-tx-load', function(e){
   e.preventDefault();
-  var id = $(this).data('id');
-  Shiny.setInputValue('admin_tx_load', {id: id, nonce: Math.random()}, {priority: 'event'});
+  var tok = $(this).data('token');
+  Shiny.setInputValue('admin_tx_load', {token: tok, nonce: Math.random()}, {priority: 'event'});
 });
 
     Shiny.addCustomMessageHandler('disableBuyerAutofill', function(message) {
@@ -759,9 +832,9 @@ server <- function(input, output, session) {
   }
 
   rv <- reactiveValues(
-    cart = empty_cart_df(),
-    buyer_name   = "",
-    buyer_email  = "",
+    cart             = empty_cart_df(),
+    buyer_name       = "",
+    buyer_email      = "",
     admin_logged_in  = FALSE,
     admin_fail_count = 0L,
     admin_lock_until = as.POSIXct(NA)
@@ -789,14 +862,14 @@ server <- function(input, output, session) {
     as.integer(round(sum(df$quantity * df$unit_price, na.rm = TRUE) * 100))
   }
 
-infer_tx_type <- function(cart_df) {
-  if (is.null(cart_df) || nrow(cart_df) == 0) return("unknown")
-  cats <- unique(as.character(cart_df$category %||% ""))
-  cats <- cats[nzchar(cats)]
-  if (length(cats) == 0) return("unknown")
-  if (length(cats) == 1) return(cats[1])
-  "mixed"
-}
+  infer_tx_type <- function(cart_df) {
+    if (is.null(cart_df) || nrow(cart_df) == 0) return("unknown")
+    cats <- unique(as.character(cart_df$category %||% ""))
+    cats <- cats[nzchar(cats)]
+    if (length(cats) == 0) return("unknown")
+    if (length(cats) == 1) return(cats[1])
+    "mixed"
+  }
 
   qty_int <- function(x, label = "Quantity") {
     if (is.null(x) || length(x) == 0) return(0L)
@@ -3023,80 +3096,12 @@ observeEvent(input$admin_event_del, {
 }, ignoreInit = TRUE)
 
 # -----------------------------------------------------------------------------
-# ADMIN: Transactions
+# ADMIN: Transactions (DT sortable table + download)
 # -----------------------------------------------------------------------------
-
-fetch_transactions <- function(limit = 50L,
-                               start_date = NULL,
-                               end_date   = NULL,
-                               name       = "",
-                               email      = "",
-                               status     = "",
-                               tx_type    = "",
-                               sort_by    = "created_at") {
-
-  limit   <- max(1L, min(500L, as.integer(limit %||% 50L)))
-
-  name    <- trimws(as.character(name %||% ""))
-  email   <- trimws(as.character(email %||% ""))
-  status  <- trimws(as.character(status %||% ""))
-  tx_type <- trimws(as.character(tx_type %||% ""))
-
-  sd <- suppressWarnings(as.Date(start_date))
-  ed <- suppressWarnings(as.Date(end_date))
-
-  # Whitelist sorting to prevent SQL injection
-  sort_by <- if (sort_by %in% c("created_at", "total_amount_cents")) sort_by else "created_at"
-  sort_dir <- "DESC"  # fixed direction (simple)
-
-  where <- c()
-  args  <- list()
-
-  # created_at stored as ISO string "YYYY-MM-DD HH:MM:SS" → string compare works
-  if (!is.na(sd)) {
-    where <- c(where, "created_at >= ?start_ts")
-    args$start_ts <- paste0(as.character(sd), " 00:00:00")
-  }
-  if (!is.na(ed)) {
-    where <- c(where, "created_at <= ?end_ts")
-    args$end_ts <- paste0(as.character(ed), " 23:59:59")
-  }
-
-  if (nzchar(name)) {
-    where <- c(where, "LOWER(buyer_name) LIKE LOWER(?name)")
-    args$name <- paste0("%", name, "%")
-  }
-  if (nzchar(email)) {
-    where <- c(where, "LOWER(buyer_email) LIKE LOWER(?email)")
-    args$email <- paste0("%", email, "%")
-  }
-  if (nzchar(status)) {
-    where <- c(where, "status = ?status")
-    args$status <- status
-  }
-  if (nzchar(tx_type)) {
-    where <- c(where, "tx_type = ?tx_type")
-    args$tx_type <- tx_type
-  }
-
-  q <- "
-    SELECT created_at, buyer_name, buyer_email, tx_type,
-           total_amount_cents, currency, receipt_token, status
-    FROM transactions
-  "
-
-  if (length(where) > 0) {
-    q <- paste(q, "WHERE", paste(where, collapse = " AND "))
-  }
-
-  q <- paste0(q, " ORDER BY ", sort_by, " ", sort_dir, " LIMIT ", limit)
-
-  do.call(db_get1, c(list(sql = q), args))
-}
 
 output$admin_tx_ui <- renderUI({
   admin_nonce()
-  if (!rv$admin_logged_in) return(NULL)
+  if (!isTRUE(rv$admin_logged_in)) return(NULL)
 
   tagList(
     fluidRow(
@@ -3106,14 +3111,14 @@ output$admin_tx_ui <- renderUI({
       column(3, selectInput(
         "admin_tx_type", "Transaction type",
         choices = c(
-          "All"="",
-          "Day pass"="day_pass",
-          "Christmas pass"="christmas_pass",
-          "Season pass"="season_pass",
-          "Program"="program",
-          "Special event"="event",
-          "Donation"="donation",
-          "Mixed"="mixed"
+          "All" = "",
+          "Day pass" = "day_pass",
+          "Christmas pass" = "christmas_pass",
+          "Season pass" = "season_pass",
+          "Program" = "program",
+          "Special event" = "event",
+          "Donation" = "donation",
+          "Mixed" = "mixed"
         ),
         selected = ""
       ))
@@ -3122,33 +3127,41 @@ output$admin_tx_ui <- renderUI({
       column(3, selectInput(
         "admin_tx_status", "Status",
         choices = c(
-          "All"="",
-          "COMPLETED"="COMPLETED",
-          "PENDING"="PENDING",
-          "FAILED"="FAILED",
-          "SANDBOX_TEST_OK"="SANDBOX_TEST_OK",
-          "UNKNOWN"="UNKNOWN"
+          "All" = "",
+          "COMPLETED" = "COMPLETED",
+          "PENDING" = "PENDING",
+          "FAILED" = "FAILED",
+          "SANDBOX_TEST_OK" = "SANDBOX_TEST_OK",
+          "UNKNOWN" = "UNKNOWN"
         ),
         selected = ""
       )),
       column(3, textInput("admin_tx_email", "Email contains", value = "")),
       column(3, selectInput(
         "admin_tx_sort_by", "Sort by",
-        choices = c("Date (newest first)"="created_at", "Value (highest first)"="total_amount_cents"),
+        choices = c(
+          "Date (newest first)" = "created_at",
+          "Value (highest first)" = "total_amount_cents"
+        ),
         selected = "created_at"
       )),
       column(3, numericInput("admin_tx_limit", "Limit", value = 50, min = 1, max = 500, step = 1))
     ),
-    actionButton("admin_tx_refresh", "Refresh"),
-    actionButton("admin_tx_download", "Download CSV"),
-    br(), br(),
-    uiOutput("admin_tx_table_ui")
+    fluidRow(
+      column(12,
+        actionButton("admin_tx_refresh", "Refresh"),
+        tags$span(" "),
+        downloadButton("admin_tx_download", "Download CSV")
+      )
+    ),
+    br(),
+    DT::DTOutput("admin_tx_table")
   )
 })
 
-output$admin_tx_table_ui <- renderUI({
+output$admin_tx_table <- DT::renderDT({
   admin_nonce()
-  if (!rv$admin_logged_in) return(NULL)
+  if (!isTRUE(rv$admin_logged_in)) return(NULL)
 
   tx_nonce()
 
@@ -3163,59 +3176,55 @@ output$admin_tx_table_ui <- renderUI({
     sort_by    = input$admin_tx_sort_by %||% "created_at"
   )
 
-  if (nrow(df) == 0) return(tags$div(style = "color:#666;", "No results."))
+  if (nrow(df) == 0) {
+    return(DT::datatable(
+      data.frame(Message = "No results."),
+      rownames = FALSE,
+      options = list(dom = "t"),
+      class = "compact"
+    ))
+  }
 
-  df$Total <- vapply(
-    df$total_amount_cents,
-    function(x) sprintf("$%.2f", as.numeric(x %||% 0) / 100),
-    character(1)
+  df$Total <- sprintf("$%.2f", as.numeric(df$total_amount_cents) / 100)
+
+  df_out <- data.frame(
+    Created = as.character(df$created_at %||% ""),
+    Name    = as.character(df$buyer_name %||% ""),
+    Email   = as.character(df$buyer_email %||% ""),
+    Type    = as.character(df$tx_type %||% ""),
+    Total   = df$Total,
+    Status  = as.character(df$status %||% ""),
+    Action  = ifelse(
+      nzchar(as.character(df$receipt_token %||% "")),
+      paste0(
+        "<a href='#' class='admin-tx-load' data-token='",
+        htmltools::htmlEscape(as.character(df$receipt_token), attribute = TRUE),
+        "'>View receipt</a>"
+      ),
+      "—"
+    ),
+    stringsAsFactors = FALSE
   )
 
-  tagList(
-    tags$table(
-      class = "table table-condensed",
-      tags$thead(tags$tr(
-        tags$th("Created"),
-        tags$th("Name"),
-        tags$th("Email"),
-        tags$th("Type"),
-        tags$th("Total"),
-        tags$th("Status"),
-        tags$th("Action")
-      )),
-      tags$tbody(lapply(seq_len(nrow(df)), function(i) {
-        tok <- as.character(df$receipt_token[i] %||% "")
-        tags$tr(
-          tags$td(as.character(df$created_at[i] %||% "")),
-          tags$td(as.character(df$buyer_name[i] %||% "")),
-          tags$td(as.character(df$buyer_email[i] %||% "")),
-          tags$td(as.character(df$tx_type[i] %||% "")),
-          tags$td(df$Total[i]),
-          tags$td(as.character(df$status[i] %||% "")),
-          tags$td(
-            if (nzchar(tok)) {
-              tags$a(
-                href = "#",
-                class = "admin-tx-load",
-                `data-token` = htmltools::htmlEscape(tok, attribute = TRUE),
-                "View receipt"
-              )
-            } else {
-              tags$span(style = "color:#999;", "—")
-            }
-          )
-        )
-      }))
+  DT::datatable(
+    df_out,
+    rownames = FALSE,
+    escape   = FALSE,
+    class    = "compact stripe hover",
+    options  = list(
+      order = list(list(0, "desc")),
+      pageLength = 25,
+      lengthMenu = list(c(25, 50, 100, 200, 500), c(25, 50, 100, 200, 500))
     )
   )
-})
+}, server = FALSE)
 
 observeEvent(input$admin_tx_refresh, {
   tx_nonce(tx_nonce() + 1L)
 }, ignoreInit = TRUE)
 
 observeEvent(input$admin_tx_load, {
-  if (!rv$admin_logged_in) return()
+  if (!isTRUE(rv$admin_logged_in)) return()
 
   tok <- as.character(input$admin_tx_load$token %||% "")
   if (!nzchar(tok)) return()
@@ -3245,9 +3254,7 @@ output$admin_tx_download <- downloadHandler(
       sort_by    = input$admin_tx_sort_by %||% "created_at"
     )
 
-    # hide receipt token in export too
     if ("receipt_token" %in% names(df)) df$receipt_token <- NULL
-
     write.csv(df, file, row.names = FALSE)
   }
 )
