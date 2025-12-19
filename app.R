@@ -17,8 +17,10 @@ suppressPackageStartupMessages({
   library(qrcode)
   library(pool)
   library(RPostgres)
-  library(DT)
 })
+
+# DT is optional on Connect Cloud (prevents app startup crash)
+HAVE_DT <- requireNamespace("DT", quietly = TRUE)
 
 # -----------------------------------------------------------------------------
 # GLOBAL SETTINGS / ENV
@@ -3147,77 +3149,92 @@ output$admin_tx_ui <- renderUI({
       )),
       column(3, numericInput("admin_tx_limit", "Limit", value = 50, min = 1, max = 500, step = 1))
     ),
+
     fluidRow(
-      column(12,
+      column(
+        12,
         actionButton("admin_tx_refresh", "Refresh"),
         tags$span(" "),
         downloadButton("admin_tx_download", "Download CSV")
       )
     ),
     br(),
-    DT::DTOutput("admin_tx_table")
+
+    if (isTRUE(HAVE_DT)) {
+      DT::DTOutput("admin_tx_table")
+    } else {
+      tags$div(
+        class = "alert alert-warning",
+        "DT package is not available on this host. Transactions table is disabled."
+      )
+    }
   )
 })
 
-output$admin_tx_table <- DT::renderDT({
-  admin_nonce()
-  if (!isTRUE(rv$admin_logged_in)) return(NULL)
+# Only register the DT output if DT exists on this host
+if (isTRUE(HAVE_DT)) {
 
-  tx_nonce()
+  output$admin_tx_table <- DT::renderDT({
+    admin_nonce()
+    if (!isTRUE(rv$admin_logged_in)) return(NULL)
 
-  df <- fetch_transactions(
-    limit      = input$admin_tx_limit %||% 50,
-    start_date = input$admin_tx_start %||% NULL,
-    end_date   = input$admin_tx_end %||% NULL,
-    name       = input$admin_tx_name %||% "",
-    email      = input$admin_tx_email %||% "",
-    status     = input$admin_tx_status %||% "",
-    tx_type    = input$admin_tx_type %||% "",
-    sort_by    = input$admin_tx_sort_by %||% "created_at"
-  )
+    tx_nonce()
 
-  if (nrow(df) == 0) {
-    return(DT::datatable(
-      data.frame(Message = "No results."),
-      rownames = FALSE,
-      options = list(dom = "t"),
-      class = "compact"
-    ))
-  }
-
-  df$Total <- sprintf("$%.2f", as.numeric(df$total_amount_cents) / 100)
-
-  df_out <- data.frame(
-    Created = as.character(df$created_at %||% ""),
-    Name    = as.character(df$buyer_name %||% ""),
-    Email   = as.character(df$buyer_email %||% ""),
-    Type    = as.character(df$tx_type %||% ""),
-    Total   = df$Total,
-    Status  = as.character(df$status %||% ""),
-    Action  = ifelse(
-      nzchar(as.character(df$receipt_token %||% "")),
-      paste0(
-        "<a href='#' class='admin-tx-load' data-token='",
-        htmltools::htmlEscape(as.character(df$receipt_token), attribute = TRUE),
-        "'>View receipt</a>"
-      ),
-      "—"
-    ),
-    stringsAsFactors = FALSE
-  )
-
-  DT::datatable(
-    df_out,
-    rownames = FALSE,
-    escape   = FALSE,
-    class    = "compact stripe hover",
-    options  = list(
-      order = list(list(0, "desc")),
-      pageLength = 25,
-      lengthMenu = list(c(25, 50, 100, 200, 500), c(25, 50, 100, 200, 500))
+    df <- fetch_transactions(
+      limit      = input$admin_tx_limit %||% 50,
+      start_date = input$admin_tx_start %||% NULL,
+      end_date   = input$admin_tx_end %||% NULL,
+      name       = input$admin_tx_name %||% "",
+      email      = input$admin_tx_email %||% "",
+      status     = input$admin_tx_status %||% "",
+      tx_type    = input$admin_tx_type %||% "",
+      sort_by    = input$admin_tx_sort_by %||% "created_at"
     )
-  )
-}, server = FALSE)
+
+    if (nrow(df) == 0) {
+      return(DT::datatable(
+        data.frame(Message = "No results.", stringsAsFactors = FALSE),
+        rownames = FALSE,
+        options  = list(dom = "t"),
+        class    = "compact"
+      ))
+    }
+
+    df$Total <- sprintf("$%.2f", as.numeric(df$total_amount_cents %||% 0) / 100)
+
+    df_out <- data.frame(
+      Created = as.character(df$created_at %||% ""),
+      Name    = as.character(df$buyer_name %||% ""),
+      Email   = as.character(df$buyer_email %||% ""),
+      Type    = as.character(df$tx_type %||% ""),
+      Total   = df$Total,
+      Status  = as.character(df$status %||% ""),
+      Action  = ifelse(
+        nzchar(as.character(df$receipt_token %||% "")),
+        paste0(
+          "<a href='#' class='admin-tx-load' data-token='",
+          htmltools::htmlEscape(as.character(df$receipt_token), attribute = TRUE),
+          "'>View receipt</a>"
+        ),
+        "—"
+      ),
+      stringsAsFactors = FALSE
+    )
+
+    DT::datatable(
+      df_out,
+      rownames = FALSE,
+      escape   = FALSE,
+      class    = "compact stripe hover",
+      options  = list(
+        order      = list(list(0, "desc")),
+        pageLength = 25,
+        lengthMenu = list(c(25, 50, 100, 200, 500), c(25, 50, 100, 200, 500))
+      )
+    )
+  }, server = FALSE)
+
+}
 
 observeEvent(input$admin_tx_refresh, {
   tx_nonce(tx_nonce() + 1L)
