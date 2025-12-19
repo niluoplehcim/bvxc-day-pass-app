@@ -372,6 +372,9 @@ init_db()
 # -----------------------------------------------------------------------------
 
 cfg_get <- function(key, default = "") {
+  key <- as.character(key %||% "")
+  if (!nzchar(trimws(key))) return(default)
+
   x <- db_get1("SELECT value FROM config WHERE key = ?key LIMIT 1", key = key)
   if (nrow(x) == 0) return(default)
   x$value[1]
@@ -381,18 +384,39 @@ cfg_set <- function(key, value) {
   key   <- as.character(key %||% "")
   value <- as.character(value %||% "")
 
+  # No-op guard (prevents writing blank keys)
+  if (!nzchar(trimws(key))) return(invisible(FALSE))
+
   with_db(function(con) {
     DBI::dbWithTransaction(con, {
-      n <- db_exec(con, "UPDATE config SET value = ?value WHERE key = ?key", key = key, value = value)
-      if (isTRUE(n == 0)) {
-        tryCatch({
-          db_exec(con, "INSERT INTO config(key, value) VALUES (?key, ?value)", key = key, value = value)
-        }, error = function(e) {
-          db_exec(con, "UPDATE config SET value = ?value WHERE key = ?key", key = key, value = value)
-        })
+
+      # ---- upsert helper (works in both Postgres+SQLite via your db_exec/sqlInterpolate) ----
+      upsert_config <- function(k, v) {
+        n <- db_exec(con, "UPDATE config SET value = ?value WHERE key = ?key", key = k, value = v)
+        if (isTRUE(n == 0)) {
+          tryCatch(
+            db_exec(con, "INSERT INTO config(key, value) VALUES (?key, ?value)", key = k, value = v),
+            error = function(e) {
+              # If a concurrent insert happened, fall back to update
+              db_exec(con, "UPDATE config SET value = ?value WHERE key = ?key", key = k, value = v)
+            }
+          )
+        }
+        invisible(TRUE)
+      }
+
+      # 1) Save requested key/value
+      upsert_config(key, value)
+
+      # 2) Touch marker so UI can react (reactivePoll watches this)
+      #    IMPORTANT: do not re-touch when writing the marker itself.
+      if (!identical(key, "__config_updated_at")) {
+        upsert_config("__config_updated_at", now_ts())
       }
     })
   })
+
+  invisible(TRUE)
 }
 
 cfg_bool <- function(key, default = FALSE) {
@@ -964,7 +988,15 @@ server <- function(input, output, session) {
     checkout_lock    = FALSE
   )
 
-
+  # -----------------------------------------------------------------------------
+  # CONFIG REACTIVITY: re-render nav when config changes
+  # -----------------------------------------------------------------------------
+  config_updated_at <- reactivePoll(
+    intervalMillis = 1500,
+    session        = session,
+    checkFunc      = function() cfg_get("__config_updated_at", ""),
+    valueFunc      = function() cfg_get("__config_updated_at", "")
+  )
 
   # Run once after the UI is ready: disable autofill on buyer fields
   session$onFlushed(function() {
@@ -1052,16 +1084,16 @@ server <- function(input, output, session) {
     admin_nonce()
     if (!isTRUE(rv$admin_logged_in)) return(NULL)
 
-    tagList(
-      # Transactions UI you pasted exists, so this guarantees you see something.
-      uiOutput("admin_tx_ui")
-
-      # If you have other admin panels elsewhere in app.R, add them here, e.g.:
-      # uiOutput("admin_prices_ui"),
-      # uiOutput("admin_blocked_ui"),
-      # uiOutput("admin_events_ui")
-    )
-  })
+  tagList(
+    uiOutput("admin_prices_ui"),
+    hr(),
+    uiOutput("admin_blocked_ui"),
+    hr(),
+    uiOutput("admin_events_ui"),
+    hr(),
+    uiOutput("admin_tx_ui")
+  )
+ })
 
   poll_count <- reactiveVal(0L)
 
@@ -1811,6 +1843,7 @@ server <- function(input, output, session) {
   # -----------------------------------------------------------------------------
 
   output$main_nav_ui <- renderUI({
+   config_updated_at()
     tab_on <- function(key, default = TRUE) cfg_bool(key, default)
     tabs <- list()
 
@@ -3047,6 +3080,342 @@ server <- function(input, output, session) {
     poll_count(0L)
     updateTabsetPanel(session, "main_nav", selected = "Receipt")
   }, ignoreInit = TRUE)
+
+# -----------------------------------------------------------------------------
+# ADMIN: Prices / Config
+# -----------------------------------------------------------------------------
+
+parse_money <- function(x) {
+  if (is.null(x)) return(NA_real_)
+  v <- suppressWarnings(as.numeric(gsub(",", "", gsub("\\$", "", trimws(as.character(x))))))
+  if (is.na(v) || v < 0) NA_real_ else v
+}
+
+parse_int_or_na <- function(x) {
+  s <- trimws(as.character(x %||% ""))
+  if (!nzchar(s)) return(NA_integer_)
+  v <- suppressWarnings(as.integer(s))
+  if (is.na(v) || v < 0) NA_integer_ else v
+}
+
+output$admin_prices_ui <- renderUI({
+  admin_nonce()
+  if (!isTRUE(rv$admin_logged_in)) return(NULL)
+
+  prog <- get_program_list()
+
+  panel <- function(title, ...) {
+    tags$div(
+      class = "panel panel-default admin-block",
+      tags$div(class = "panel-heading", title),
+      tags$div(class = "panel-body", ...)
+    )
+  }
+
+  tagList(
+    h3("Prices / Config"),
+
+    panel("Early-bird + Global limits",
+      dateInput("admin_cfg_early_bird_cutoff", "Early-bird cutoff (YYYY-MM-DD)",
+                value = cfg_date("early_bird_cutoff", Sys.Date())),
+      fluidRow(
+        column(6, numericInput("admin_cfg_limit_max_total_cad", "Max total (CAD) — blank/NA = no limit",
+                               value = cfg_num("limit_max_total_cad", NA_real_), min = 0, step = 10)),
+        column(6, numericInput("admin_cfg_limit_max_items_total", "Max items — blank/NA = no limit",
+                               value = cfg_int("limit_max_items_total", NA_integer_), min = 0, step = 1))
+      )
+    ),
+
+    panel("Day pass prices (CAD)",
+      fluidRow(
+        column(3, numericInput("admin_price_day_adult",   "Adult",   value = cfg_num("price_day_adult", NA_real_),   min = 0, step = 1)),
+        column(3, numericInput("admin_price_day_youth",   "Youth",   value = cfg_num("price_day_youth", NA_real_),   min = 0, step = 1)),
+        column(3, numericInput("admin_price_day_under9",  "Under 9", value = cfg_num("price_day_under9", NA_real_),  min = 0, step = 1)),
+        column(3, numericInput("admin_price_day_family",  "Family",  value = cfg_num("price_day_family", NA_real_),  min = 0, step = 1))
+      )
+    ),
+
+    panel("Christmas pass (CAD)",
+      numericInput("admin_price_christmas_pass", "Christmas pass price",
+                   value = cfg_num("price_christmas_pass", NA_real_), min = 0, step = 1)
+    ),
+
+    panel("Season pass prices (CAD)",
+      fluidRow(
+        column(6, h4("Early-bird"),
+               numericInput("admin_price_season_eb_adult", "Adult (EB)", value = cfg_num("price_season_eb_adult", NA_real_), min = 0, step = 1),
+               numericInput("admin_price_season_eb_youth", "Youth (EB)", value = cfg_num("price_season_eb_youth", NA_real_), min = 0, step = 1)
+        ),
+        column(6, h4("Regular"),
+               numericInput("admin_price_season_reg_adult", "Adult (REG)", value = cfg_num("price_season_reg_adult", NA_real_), min = 0, step = 1),
+               numericInput("admin_price_season_reg_youth", "Youth (REG)", value = cfg_num("price_season_reg_youth", NA_real_), min = 0, step = 1)
+        )
+      )
+    ),
+
+    panel("Programs (price + capacity)",
+      tags$p(style="color:#666;",
+             "Capacity: leave blank for unlimited. Price must be set (or program will show N/A)."),
+      lapply(seq_len(nrow(prog)), function(i) {
+        r <- prog[i, , drop = FALSE]
+        fluidRow(
+          column(5, tags$strong(r$name[1])),
+          column(3, numericInput(paste0("admin_prog_price_", r$id[1]), "Price (CAD)",
+                                 value = cfg_num(r$price_key[1], NA_real_), min = 0, step = 1)),
+          column(4, textInput(paste0("admin_prog_cap_", r$id[1]), "Capacity (blank = unlimited)",
+                              value = { v <- cfg_get(r$cap_key[1], ""); if (!nzchar(v)) "" else v }))
+        )
+      })
+    ),
+
+    panel("Tabs enabled",
+      checkboxInput("admin_tab_daypass_enabled",     "Day Pass",      value = cfg_bool("tab_daypass_enabled", TRUE)),
+      checkboxInput("admin_tab_christmas_enabled",   "Christmas Pass",value = cfg_bool("tab_christmas_enabled", TRUE)),
+      checkboxInput("admin_tab_season_enabled",      "Season Pass",   value = cfg_bool("tab_season_enabled", TRUE)),
+      checkboxInput("admin_tab_programs_enabled",    "Programs",      value = cfg_bool("tab_programs_enabled", TRUE)),
+      checkboxInput("admin_tab_events_enabled",      "Special Events",value = cfg_bool("tab_events_enabled", TRUE)),
+      checkboxInput("admin_tab_donation_enabled",    "Donation",      value = cfg_bool("tab_donation_enabled", TRUE))
+    ),
+
+    actionButton("admin_prices_save", "Save Prices / Config")
+  )
+})
+
+observeEvent(input$admin_prices_save, {
+  if (!isTRUE(rv$admin_logged_in)) return()
+
+  cfg_set("early_bird_cutoff", as.character(as.Date(input$admin_cfg_early_bird_cutoff)))
+
+  # limits (numericInput returns NA if empty)
+  cfg_set("limit_max_total_cad", if (is.na(input$admin_cfg_limit_max_total_cad)) "" else as.character(input$admin_cfg_limit_max_total_cad))
+  cfg_set("limit_max_items_total", if (is.na(input$admin_cfg_limit_max_items_total)) "" else as.character(as.integer(input$admin_cfg_limit_max_items_total)))
+
+  # day
+  cfg_set("price_day_adult",  if (is.na(input$admin_price_day_adult))  "" else as.character(input$admin_price_day_adult))
+  cfg_set("price_day_youth",  if (is.na(input$admin_price_day_youth))  "" else as.character(input$admin_price_day_youth))
+  cfg_set("price_day_under9", if (is.na(input$admin_price_day_under9)) "" else as.character(input$admin_price_day_under9))
+  cfg_set("price_day_family", if (is.na(input$admin_price_day_family)) "" else as.character(input$admin_price_day_family))
+
+  # christmas
+  cfg_set("price_christmas_pass", if (is.na(input$admin_price_christmas_pass)) "" else as.character(input$admin_price_christmas_pass))
+
+  # season
+  cfg_set("price_season_eb_adult",  if (is.na(input$admin_price_season_eb_adult))  "" else as.character(input$admin_price_season_eb_adult))
+  cfg_set("price_season_eb_youth",  if (is.na(input$admin_price_season_eb_youth))  "" else as.character(input$admin_price_season_eb_youth))
+  cfg_set("price_season_reg_adult", if (is.na(input$admin_price_season_reg_adult)) "" else as.character(input$admin_price_season_reg_adult))
+  cfg_set("price_season_reg_youth", if (is.na(input$admin_price_season_reg_youth)) "" else as.character(input$admin_price_season_reg_youth))
+
+  # programs (catalog-driven)
+  cat <- program_catalog()
+  for (i in seq_len(nrow(cat))) {
+    pid <- cat$id[i]
+    price_id <- paste0("admin_prog_price_", pid)
+    cap_id   <- paste0("admin_prog_cap_", pid)
+
+    cfg_set(cat$price_key[i], if (is.na(input[[price_id]])) "" else as.character(input[[price_id]]))
+
+    cap_val <- parse_int_or_na(input[[cap_id]])
+    cfg_set(cat$cap_key[i], if (is.na(cap_val)) "" else as.character(cap_val))
+  }
+
+  # tabs
+  cfg_set("tab_daypass_enabled",    if (isTRUE(input$admin_tab_daypass_enabled)) "1" else "0")
+  cfg_set("tab_christmas_enabled",  if (isTRUE(input$admin_tab_christmas_enabled)) "1" else "0")
+  cfg_set("tab_season_enabled",     if (isTRUE(input$admin_tab_season_enabled)) "1" else "0")
+  cfg_set("tab_programs_enabled",   if (isTRUE(input$admin_tab_programs_enabled)) "1" else "0")
+  cfg_set("tab_events_enabled",     if (isTRUE(input$admin_tab_events_enabled)) "1" else "0")
+  cfg_set("tab_donation_enabled",   if (isTRUE(input$admin_tab_donation_enabled)) "1" else "0")
+
+  showNotification("Saved Prices / Config.", type = "message")
+}, ignoreInit = TRUE)
+
+# -----------------------------------------------------------------------------
+# ADMIN: Blocked Dates
+# -----------------------------------------------------------------------------
+
+output$admin_blocked_ui <- renderUI({
+  admin_nonce()
+  if (!isTRUE(rv$admin_logged_in)) return(NULL)
+
+  blocked_nonce()
+  bd <- get_blocked_dates()
+
+  rows <- if (nrow(bd) == 0) {
+    tags$tr(tags$td(colspan=3, style="color:#666;", "No blocked dates."))
+  } else {
+    lapply(seq_len(nrow(bd)), function(i) {
+      d <- as.character(bd$date[i] %||% "")
+      r <- as.character(bd$reason[i] %||% "")
+      tags$tr(
+        tags$td(d),
+        tags$td(htmltools::htmlEscape(r)),
+        tags$td(HTML(paste0("<a href='#' class='admin-block-del' data-date='",
+                            htmltools::htmlEscape(d, attribute = TRUE),
+                            "'>Delete</a>")))
+      )
+    })
+  }
+
+  tagList(
+    h3("Blocked Dates"),
+    fluidRow(
+      column(4, dateInput("admin_block_date", "Date", value = Sys.Date())),
+      column(8, textInput("admin_block_reason", "Reason (optional)", value = ""))
+    ),
+    actionButton("admin_block_add", "Add / Update"),
+    br(), br(),
+    tags$table(
+      class = "table table-condensed",
+      tags$thead(tags$tr(tags$th("Date"), tags$th("Reason"), tags$th("Action"))),
+      tags$tbody(rows)
+    )
+  )
+})
+
+observeEvent(input$admin_block_add, {
+  if (!isTRUE(rv$admin_logged_in)) return()
+  d <- suppressWarnings(as.Date(input$admin_block_date))
+  if (is.na(d)) { showNotification("Pick a valid date.", type="error"); return() }
+  reason <- trimws(as.character(input$admin_block_reason %||% ""))
+
+  with_db(function(con) {
+    DBI::dbWithTransaction(con, {
+      n <- db_exec(con, 'UPDATE blocked_dates SET reason = ?reason WHERE "date" = ?d',
+                  reason = if (nzchar(reason)) reason else NA_character_,
+                  d = as.character(d))
+      if (isTRUE(n == 0)) {
+        tryCatch(
+          db_exec(con, 'INSERT INTO blocked_dates("date", reason) VALUES (?d, ?reason)',
+                  d = as.character(d),
+                  reason = if (nzchar(reason)) reason else NA_character_),
+          error = function(e) {
+            db_exec(con, 'UPDATE blocked_dates SET reason = ?reason WHERE "date" = ?d',
+                    reason = if (nzchar(reason)) reason else NA_character_,
+                    d = as.character(d))
+          }
+        )
+      }
+    })
+  })
+
+  blocked_nonce(blocked_nonce() + 1L)
+  showNotification("Blocked date saved.", type="message")
+}, ignoreInit = TRUE)
+
+observeEvent(input$admin_block_del, {
+  if (!isTRUE(rv$admin_logged_in)) return()
+  d <- trimws(as.character(input$admin_block_del$date %||% ""))
+  if (!nzchar(d)) return()
+
+  db_exec1('DELETE FROM blocked_dates WHERE "date" = ?d', d = d)
+  blocked_nonce(blocked_nonce() + 1L)
+  showNotification("Blocked date deleted.", type="message")
+}, ignoreInit = TRUE)
+
+# -----------------------------------------------------------------------------
+# ADMIN: Events
+# -----------------------------------------------------------------------------
+
+output$admin_events_ui <- renderUI({
+  admin_nonce()
+  if (!isTRUE(rv$admin_logged_in)) return(NULL)
+
+  events_nonce()
+  ev <- db_get1("SELECT id, name, event_date, price_cad, capacity, enabled FROM special_events ORDER BY event_date ASC")
+
+  choices <- c("NEW" = "NEW")
+  if (nrow(ev) > 0) {
+    lab <- paste0(ev$name, " (", ev$event_date, ")")
+    choices <- c(choices, setNames(ev$id, lab))
+  }
+
+  tagList(
+    h3("Special Events"),
+    selectInput("admin_event_pick", "Select event", choices = choices, selected = "NEW"),
+    textInput("admin_event_name", "Event name", value = ""),
+    dateInput("admin_event_date", "Event date", value = Sys.Date()),
+    numericInput("admin_event_price", "Price (CAD)", value = NA_real_, min = 0, step = 1),
+    textInput("admin_event_capacity", "Capacity (blank = unlimited)", value = ""),
+    checkboxInput("admin_event_enabled", "Enabled", value = TRUE),
+    actionButton("admin_event_save", "Save / Update"),
+    tags$span(" "),
+    actionButton("admin_event_delete", "Delete")
+  )
+})
+
+observeEvent(input$admin_event_pick, {
+  if (!isTRUE(rv$admin_logged_in)) return()
+  events_nonce()
+
+  id <- as.character(input$admin_event_pick %||% "NEW")
+  if (identical(id, "NEW")) {
+    updateTextInput(session, "admin_event_name", value = "")
+    updateDateInput(session, "admin_event_date", value = Sys.Date())
+    updateNumericInput(session, "admin_event_price", value = NA_real_)
+    updateTextInput(session, "admin_event_capacity", value = "")
+    updateCheckboxInput(session, "admin_event_enabled", value = TRUE)
+    return()
+  }
+
+  row <- db_get1("SELECT id, name, event_date, price_cad, capacity, enabled FROM special_events WHERE id = ?id LIMIT 1", id = id)
+  if (nrow(row) != 1) return()
+
+  updateTextInput(session, "admin_event_name", value = as.character(row$name[1] %||% ""))
+  updateDateInput(session, "admin_event_date", value = suppressWarnings(as.Date(row$event_date[1])))
+  updateNumericInput(session, "admin_event_price", value = suppressWarnings(as.numeric(row$price_cad[1])))
+  cap <- row$capacity[1]
+  updateTextInput(session, "admin_event_capacity", value = if (is.na(cap)) "" else as.character(cap))
+  updateCheckboxInput(session, "admin_event_enabled", value = isTRUE(as.integer(row$enabled[1] %||% 0L) == 1L))
+}, ignoreInit = TRUE)
+
+observeEvent(input$admin_event_save, {
+  if (!isTRUE(rv$admin_logged_in)) return()
+
+  id <- as.character(input$admin_event_pick %||% "NEW")
+  nm <- trimws(as.character(input$admin_event_name %||% ""))
+  d  <- suppressWarnings(as.Date(input$admin_event_date))
+  pr <- suppressWarnings(as.numeric(input$admin_event_price))
+  cap <- parse_int_or_na(input$admin_event_capacity)
+  en <- if (isTRUE(input$admin_event_enabled)) 1L else 0L
+
+  if (!nzchar(nm)) { showNotification("Event name is required.", type="error"); return() }
+  if (is.na(d)) { showNotification("Event date is required.", type="error"); return() }
+  if (is.na(pr) || pr < 0) { showNotification("Event price must be set (>= 0).", type="error"); return() }
+
+  if (identical(id, "NEW")) {
+    id <- UUIDgenerate()
+    db_exec1(
+      "INSERT INTO special_events (id, name, event_date, price_cad, capacity, enabled, created_at)
+       VALUES (?id, ?name, ?event_date, ?price_cad, ?capacity, ?enabled, ?created_at)",
+      id = id, name = nm, event_date = as.character(d),
+      price_cad = pr, capacity = if (is.na(cap)) NA_integer_ else cap,
+      enabled = en, created_at = now_ts()
+    )
+  } else {
+    db_exec1(
+      "UPDATE special_events
+       SET name = ?name, event_date = ?event_date, price_cad = ?price_cad, capacity = ?capacity, enabled = ?enabled
+       WHERE id = ?id",
+      id = id, name = nm, event_date = as.character(d),
+      price_cad = pr, capacity = if (is.na(cap)) NA_integer_ else cap,
+      enabled = en
+    )
+  }
+
+  events_nonce(events_nonce() + 1L)
+  showNotification("Event saved.", type="message")
+}, ignoreInit = TRUE)
+
+observeEvent(input$admin_event_delete, {
+  if (!isTRUE(rv$admin_logged_in)) return()
+  id <- as.character(input$admin_event_pick %||% "NEW")
+  if (identical(id, "NEW")) return()
+
+  db_exec1("DELETE FROM special_events WHERE id = ?id", id = id)
+  events_nonce(events_nonce() + 1L)
+  updateSelectInput(session, "admin_event_pick", selected = "NEW")
+  showNotification("Event deleted.", type="message")
+}, ignoreInit = TRUE)
 
 # -----------------------------------------------------------------------------
 # ADMIN: Transactions (DT sortable table + download)
