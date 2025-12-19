@@ -667,6 +667,9 @@ css_tabs <- "
   text-decoration-thickness: 3px;
   text-underline-offset: 6px;
 }
+.admin-block { margin-bottom: 14px; }
+.admin-block .panel-heading { font-weight: 700; }
+.admin-block .panel-body { padding-top: 12px; }
 "
 
 ui <- fluidPage(
@@ -700,13 +703,13 @@ ui <- fluidPage(
       Shiny.setInputValue('admin_block_del', {date: d, nonce: Math.random()}, {priority: 'event'});
     });
 
-    // Admin table actions: Transactions load receipt
-    $(document).off('click.bvxc', 'a.admin-tx-load');
-    $(document).on('click.bvxc', 'a.admin-tx-load', function(e){
-      e.preventDefault();
-      var tok = $(this).data('token');
-      Shiny.setInputValue('admin_tx_load', {token: tok, nonce: Math.random()}, {priority: 'event'});
-    });
+// Admin table actions: Transactions load receipt
+$(document).off('click.bvxc', 'a.admin-tx-load');
+$(document).on('click.bvxc', 'a.admin-tx-load', function(e){
+  e.preventDefault();
+  var id = $(this).data('id');
+  Shiny.setInputValue('admin_tx_load', {id: id, nonce: Math.random()}, {priority: 'event'});
+});
 
     Shiny.addCustomMessageHandler('disableBuyerAutofill', function(message) {
       try {
@@ -2460,6 +2463,14 @@ polling_note <- if (!is_final_ok) {
     list(key="limit_max_items_total", label="Max items total", default="20")
   )
 
+admin_block <- function(title, ...) {
+  tags$div(
+    class = "admin-block panel panel-default",
+    tags$div(class = "panel-heading", title),
+    tags$div(class = "panel-body", ...)
+  )
+}
+
   output$admin_content <- renderUI({
     admin_nonce()
     if (!isTRUE(rv$admin_logged_in)) {
@@ -2508,12 +2519,11 @@ output$admin_prices_ui <- renderUI({
   admin_nonce()
   if (!rv$admin_logged_in) return(NULL)
 
-  # --- helper to get current value ---
-  v <- function(key) cfg_get(key, "")
+  v <- function(key, default = "") cfg_get(key, default)
 
   # cutoff
-  cutoff_val <- v("early_bird_cutoff")
-  cutoff_d <- suppressWarnings(as.Date(cutoff_val))
+  cutoff_val <- v("early_bird_cutoff", "")
+  cutoff_d   <- suppressWarnings(as.Date(cutoff_val))
 
   # season values
   reg_adult <- v("price_season_reg_adult")
@@ -2521,55 +2531,121 @@ output$admin_prices_ui <- renderUI({
   reg_youth <- v("price_season_reg_youth")
   eb_youth  <- v("price_season_eb_youth")
 
-  # other keys (everything except cutoff + the four season keys)
-  skip_keys <- c(
-    "early_bird_cutoff",
-    "price_season_reg_adult","price_season_eb_adult",
-    "price_season_reg_youth","price_season_eb_youth"
+  # compact helpers
+  price_input <- function(key, label, placeholder = "e.g. 25") {
+    textInput(paste0("cfg_", key), label, value = v(key), placeholder = placeholder)
+  }
+
+  price_row4 <- function(keys, labels, placeholders) {
+    stopifnot(length(keys) == 4, length(labels) == 4)
+    if (missing(placeholders) || length(placeholders) != 4) {
+      placeholders <- rep("e.g. 25", 4)
+    }
+
+    fluidRow(
+      column(3, price_input(keys[1], labels[1], placeholders[1])),
+      column(3, price_input(keys[2], labels[2], placeholders[2])),
+      column(3, price_input(keys[3], labels[3], placeholders[3])),
+      column(3, price_input(keys[4], labels[4], placeholders[4]))
+    )
+  }
+
+  # program list in one place (easy to maintain)
+  program_keys <- c(
+    "price_program_bunnies",
+    "price_program_rabbits",
+    "price_program_u10",
+    "price_program_u12",
+    "price_program_u14",
+    "price_program_u16",
+    "price_program_u18",
+    "price_program_u20",
+    "price_program_biathlon_adp",
+    "price_program_biathlon_rifle_rental_adp",
+    "price_program_biathlon_youth_intro",
+    "price_program_masters_2x",
+    "price_program_masters_1x",
+    "price_program_biathlon_masters",
+    "price_program_biathlon_masters_rifle_rental"
   )
 
-  other_items <- Filter(function(it) !(it$key %in% skip_keys), admin_keys_prices)
+  program_labels <- c(
+    "Program – Bunnies",
+    "Program – Rabbits",
+    "Program – U10",
+    "Program – U12",
+    "Program – U14",
+    "Program – U16",
+    "Program – U18",
+    "Program – U20",
+    "Program – Biathlon ADP",
+    "Program – Biathlon Rifle Rental ADP",
+    "Program – Biathlon Youth Intro",
+    "Program – Masters 2X",
+    "Program – Masters 1X",
+    "Program – Biathlon Masters",
+    "Program – Biathlon Masters Rifle Rental"
+  )
+
+  program_placeholders <- c(
+    rep("e.g. 120", 9),
+    "e.g. 20",      # rifle rental ADP
+    "e.g. 120",
+    "e.g. 120",
+    "e.g. 120",
+    "e.g. 120",
+    "e.g. 20"       # masters rifle rental
+  )
 
   tagList(
-    tags$h4("Early-bird cutoff"),
-    dateInput("cfg_early_bird_cutoff", "Early-bird cutoff (YYYY-MM-DD)",
-              value = if (is.na(cutoff_d)) NULL else cutoff_d),
-
-    tags$hr(),
-    tags$h4("Season pass pricing"),
-
-    fluidRow(
-      column(6, tags$strong("")),
-      column(3, tags$strong("Regular")),
-      column(3, tags$strong("Early-bird"))
+    admin_block(
+      "Early-bird cutoff",
+      dateInput(
+        "cfg_early_bird_cutoff",
+        "Early-bird cutoff (YYYY-MM-DD)",
+        value = if (is.na(cutoff_d)) NULL else cutoff_d
+      )
     ),
 
-    fluidRow(
-      column(6, tags$div(style="padding-top:8px; font-weight:600;", "Adult")),
-      column(3, textInput("cfg_price_season_reg_adult", label = NULL, value = reg_adult, placeholder = "e.g. 250")),
-      column(3, textInput("cfg_price_season_eb_adult",  label = NULL, value = eb_adult,  placeholder = "e.g. 220"))
+    admin_block(
+      "Day pass pricing",
+      price_row4(
+        keys = c("price_day_family", "price_day_adult", "price_day_youth", "price_day_under9"),
+        labels = c("Family", "Adult", "Youth", "Under 9"),
+        placeholders = c("e.g. 35", "e.g. 15", "e.g. 10", "e.g. 0")
+      )
     ),
 
-    fluidRow(
-      column(6, tags$div(style="padding-top:8px; font-weight:600;", "Youth")),
-      column(3, textInput("cfg_price_season_reg_youth", label = NULL, value = reg_youth, placeholder = "e.g. 120")),
-      column(3, textInput("cfg_price_season_eb_youth",  label = NULL, value = eb_youth,  placeholder = "e.g. 100"))
+    admin_block(
+      "Christmas pass pricing",
+      price_input("price_christmas_pass", "Christmas pass (per person)", "e.g. 60")
     ),
 
-    tags$hr(),
-    tags$h4("Other pricing"),
+    admin_block(
+      "Season pass pricing",
+      fluidRow(
+        column(6, tags$strong("")),
+        column(3, tags$strong("Regular")),
+        column(3, tags$strong("Early-bird"))
+      ),
+      fluidRow(
+        column(6, tags$div(style="padding-top:8px; font-weight:600;", "Adult")),
+        column(3, textInput("cfg_price_season_reg_adult", label = NULL, value = reg_adult, placeholder = "e.g. 250")),
+        column(3, textInput("cfg_price_season_eb_adult",  label = NULL, value = eb_adult,  placeholder = "e.g. 220"))
+      ),
+      fluidRow(
+        column(6, tags$div(style="padding-top:8px; font-weight:600;", "Youth")),
+        column(3, textInput("cfg_price_season_reg_youth", label = NULL, value = reg_youth, placeholder = "e.g. 120")),
+        column(3, textInput("cfg_price_season_eb_youth",  label = NULL, value = eb_youth,  placeholder = "e.g. 100"))
+      )
+    ),
 
-    do.call(tagList, lapply(other_items, function(it) {
-      key <- it$key
-      label <- it$label
-      if (identical(it$type, "date")) {
-        val <- v(key)
-        d <- suppressWarnings(as.Date(val))
-        dateInput(paste0("cfg_", key), label, value = if (is.na(d)) NULL else d)
-      } else {
-        textInput(paste0("cfg_", key), label, value = v(key))
-      }
-    }))
+    admin_block(
+      "Program pricing",
+      do.call(tagList, lapply(seq_along(program_keys), function(i) {
+        price_input(program_keys[i], program_labels[i], program_placeholders[i])
+      }))
+    )
   )
 })
 
@@ -2957,9 +3033,7 @@ fetch_transactions <- function(limit = 50L,
                                email      = "",
                                status     = "",
                                tx_type    = "",
-                               receipt    = "",
-                               sort_by    = "created_at",
-                               sort_dir   = "DESC") {
+                               sort_by    = "created_at") {
 
   limit   <- max(1L, min(500L, as.integer(limit %||% 50L)))
 
@@ -2967,17 +3041,15 @@ fetch_transactions <- function(limit = 50L,
   email   <- trimws(as.character(email %||% ""))
   status  <- trimws(as.character(status %||% ""))
   tx_type <- trimws(as.character(tx_type %||% ""))
-  receipt <- trimws(as.character(receipt %||% ""))
 
   sd <- suppressWarnings(as.Date(start_date))
   ed <- suppressWarnings(as.Date(end_date))
 
   # Whitelist sorting to prevent SQL injection
-  sort_by  <- if (sort_by %in% c("created_at", "total_amount_cents")) sort_by else "created_at"
-  sort_dir <- toupper(trimws(as.character(sort_dir %||% "DESC")))
-  sort_dir <- if (sort_dir %in% c("ASC", "DESC")) sort_dir else "DESC"
+  sort_by <- if (sort_by %in% c("created_at", "total_amount_cents")) sort_by else "created_at"
+  sort_dir <- "DESC"  # fixed direction (simple)
 
-  where <- character()
+  where <- c()
   args  <- list()
 
   # created_at stored as ISO string "YYYY-MM-DD HH:MM:SS" → string compare works
@@ -3006,22 +3078,10 @@ fetch_transactions <- function(limit = 50L,
     where <- c(where, "tx_type = ?tx_type")
     args$tx_type <- tx_type
   }
-  if (nzchar(receipt)) {
-    where <- c(where, "receipt_token = ?receipt")
-    args$receipt <- receipt
-  }
 
   q <- "
-    SELECT
-      created_at,
-      buyer_name,
-      buyer_email,
-      tx_type,
-      total_amount_cents,
-      currency,
-      receipt_token,
-      status,
-      square_order_id
+    SELECT created_at, buyer_name, buyer_email, tx_type,
+           total_amount_cents, currency, receipt_token, status
     FROM transactions
   "
 
@@ -3036,7 +3096,7 @@ fetch_transactions <- function(limit = 50L,
 
 output$admin_tx_ui <- renderUI({
   admin_nonce()
-  if (!isTRUE(rv$admin_logged_in)) return(NULL)
+  if (!rv$admin_logged_in) return(NULL)
 
   tagList(
     fluidRow(
@@ -3072,18 +3132,10 @@ output$admin_tx_ui <- renderUI({
         selected = ""
       )),
       column(3, textInput("admin_tx_email", "Email contains", value = "")),
-      column(3, textInput("admin_tx_receipt", "Receipt token (exact)", value = "")),
       column(3, selectInput(
         "admin_tx_sort_by", "Sort by",
-        choices = c("Date"="created_at", "Value"="total_amount_cents"),
+        choices = c("Date (newest first)"="created_at", "Value (highest first)"="total_amount_cents"),
         selected = "created_at"
-      ))
-    ),
-    fluidRow(
-      column(3, selectInput(
-        "admin_tx_sort_dir", "Order",
-        choices = c("Newest first"="DESC", "Oldest first"="ASC"),
-        selected = "DESC"
       )),
       column(3, numericInput("admin_tx_limit", "Limit", value = 50, min = 1, max = 500, step = 1))
     ),
@@ -3096,7 +3148,7 @@ output$admin_tx_ui <- renderUI({
 
 output$admin_tx_table_ui <- renderUI({
   admin_nonce()
-  if (!isTRUE(rv$admin_logged_in)) return(NULL)
+  if (!rv$admin_logged_in) return(NULL)
 
   tx_nonce()
 
@@ -3108,12 +3160,10 @@ output$admin_tx_table_ui <- renderUI({
     email      = input$admin_tx_email %||% "",
     status     = input$admin_tx_status %||% "",
     tx_type    = input$admin_tx_type %||% "",
-    receipt    = input$admin_tx_receipt %||% "",
-    sort_by    = input$admin_tx_sort_by %||% "created_at",
-    sort_dir   = input$admin_tx_sort_dir %||% "DESC"
+    sort_by    = input$admin_tx_sort_by %||% "created_at"
   )
 
-  if (is.null(df) || nrow(df) == 0) return(tags$div(style = "color:#666;", "No results."))
+  if (nrow(df) == 0) return(tags$div(style = "color:#666;", "No results."))
 
   df$Total <- vapply(
     df$total_amount_cents,
@@ -3131,35 +3181,31 @@ output$admin_tx_table_ui <- renderUI({
         tags$th("Type"),
         tags$th("Total"),
         tags$th("Status"),
-        tags$th("Receipt token"),
         tags$th("Action")
       )),
-      tags$tbody(
-        lapply(seq_len(nrow(df)), function(i) {
-          tok <- as.character(df$receipt_token[i] %||% "")
-          tags$tr(
-            tags$td(as.character(df$created_at[i] %||% "")),
-            tags$td(as.character(df$buyer_name[i] %||% "")),
-            tags$td(as.character(df$buyer_email[i] %||% "")),
-            tags$td(as.character(df$tx_type[i] %||% "")),
-            tags$td(df$Total[i]),
-            tags$td(as.character(df$status[i] %||% "")),
-            tags$td(tok),
-            tags$td(
-              if (nzchar(tok)) {
-                tags$a(
-                  href = "#",
-                  class = "admin-tx-load",
-                  `data-token` = htmltools::htmlEscape(tok, attribute = TRUE),
-                  "Load receipt"
-                )
-              } else {
-                tags$span(style = "color:#999;", "—")
-              }
-            )
+      tags$tbody(lapply(seq_len(nrow(df)), function(i) {
+        tok <- as.character(df$receipt_token[i] %||% "")
+        tags$tr(
+          tags$td(as.character(df$created_at[i] %||% "")),
+          tags$td(as.character(df$buyer_name[i] %||% "")),
+          tags$td(as.character(df$buyer_email[i] %||% "")),
+          tags$td(as.character(df$tx_type[i] %||% "")),
+          tags$td(df$Total[i]),
+          tags$td(as.character(df$status[i] %||% "")),
+          tags$td(
+            if (nzchar(tok)) {
+              tags$a(
+                href = "#",
+                class = "admin-tx-load",
+                `data-token` = htmltools::htmlEscape(tok, attribute = TRUE),
+                "View receipt"
+              )
+            } else {
+              tags$span(style = "color:#999;", "—")
+            }
           )
-        })
-      )
+        )
+      }))
     )
   )
 })
@@ -3169,14 +3215,14 @@ observeEvent(input$admin_tx_refresh, {
 }, ignoreInit = TRUE)
 
 observeEvent(input$admin_tx_load, {
-  if (!isTRUE(rv$admin_logged_in)) return()
+  if (!rv$admin_logged_in) return()
 
   tok <- as.character(input$admin_tx_load$token %||% "")
   if (!nzchar(tok)) return()
 
   tx <- load_receipt_token(tok)
   if (is.null(tx)) {
-    showNotification("Receipt token not found.", type = "error")
+    showNotification("Receipt not found.", type = "error")
     return()
   }
 
@@ -3196,10 +3242,12 @@ output$admin_tx_download <- downloadHandler(
       email      = input$admin_tx_email %||% "",
       status     = input$admin_tx_status %||% "",
       tx_type    = input$admin_tx_type %||% "",
-      receipt    = input$admin_tx_receipt %||% "",
-      sort_by    = input$admin_tx_sort_by %||% "created_at",
-      sort_dir   = input$admin_tx_sort_dir %||% "DESC"
+      sort_by    = input$admin_tx_sort_by %||% "created_at"
     )
+
+    # hide receipt token in export too
+    if ("receipt_token" %in% names(df)) df$receipt_token <- NULL
+
     write.csv(df, file, row.names = FALSE)
   }
 )
