@@ -964,6 +964,8 @@ server <- function(input, output, session) {
     checkout_lock    = FALSE
   )
 
+
+
   # Run once after the UI is ready: disable autofill on buyer fields
   session$onFlushed(function() {
     session$sendCustomMessage("disableBuyerAutofill", list())
@@ -977,6 +979,89 @@ server <- function(input, output, session) {
   events_nonce        <- reactiveVal(0L)
   admin_nonce         <- reactiveVal(0L)
   tx_nonce            <- reactiveVal(0L)
+
+  # -----------------------------------------------------------------------------
+  # ADMIN LOGIN + ADMIN UI OUTPUTS (RESTORED)
+  # -----------------------------------------------------------------------------
+
+  observeEvent(input$admin_login, {
+    # Must be configured
+    if (is.na(ADMIN_PASSWORD) || !nzchar(ADMIN_PASSWORD)) {
+      rv$admin_logged_in <- FALSE
+      showNotification("Admin password is not configured on this host.", type = "error")
+      admin_nonce(admin_nonce() + 1L)
+      return()
+    }
+
+    # Lockout check
+    now <- Sys.time()
+    if (!is.na(rv$admin_lock_until) && now < rv$admin_lock_until) {
+      showNotification("Admin login temporarily locked. Try again shortly.", type = "error")
+      admin_nonce(admin_nonce() + 1L)
+      return()
+    }
+
+    entered <- trimws(as.character(input$admin_password %||% ""))
+
+    if (identical(entered, ADMIN_PASSWORD)) {
+      rv$admin_logged_in  <- TRUE
+      rv$admin_fail_count <- 0L
+      rv$admin_lock_until <- as.POSIXct(NA)
+
+      showNotification("Admin unlocked.", type = "message")
+      admin_nonce(admin_nonce() + 1L)
+    } else {
+      rv$admin_logged_in <- FALSE
+      rv$admin_fail_count <- as.integer(rv$admin_fail_count %||% 0L) + 1L
+
+      if (rv$admin_fail_count >= 5L) {
+        rv$admin_lock_until <- Sys.time() + 60
+        rv$admin_fail_count <- 0L
+        showNotification("Too many attempts. Locked for 60 seconds.", type = "error")
+      } else {
+        showNotification("Incorrect admin password.", type = "error")
+      }
+
+      admin_nonce(admin_nonce() + 1L)
+    }
+  }, ignoreInit = TRUE)
+
+  output$admin_lock_msg <- renderUI({
+    admin_nonce()
+
+    now <- Sys.time()
+    if (!is.na(rv$admin_lock_until) && now < rv$admin_lock_until) {
+      secs <- ceiling(as.numeric(difftime(rv$admin_lock_until, now, units = "secs")))
+      return(tags$div(class = "alert alert-warning",
+                      paste("Login locked. Try again in", secs, "seconds.")))
+    }
+
+    if (isTRUE(rv$admin_logged_in)) {
+      return(tags$div(class = "alert alert-success", "Admin unlocked."))
+    }
+
+    if (isTRUE(rv$admin_fail_count > 0L)) {
+      return(tags$div(class = "alert alert-warning",
+                      paste0("Incorrect password. Attempts: ", rv$admin_fail_count, "/5")))
+    }
+
+    NULL
+  })
+
+  output$admin_content <- renderUI({
+    admin_nonce()
+    if (!isTRUE(rv$admin_logged_in)) return(NULL)
+
+    tagList(
+      # Transactions UI you pasted exists, so this guarantees you see something.
+      uiOutput("admin_tx_ui")
+
+      # If you have other admin panels elsewhere in app.R, add them here, e.g.:
+      # uiOutput("admin_prices_ui"),
+      # uiOutput("admin_blocked_ui"),
+      # uiOutput("admin_events_ui")
+    )
+  })
 
   poll_count <- reactiveVal(0L)
 
