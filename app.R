@@ -127,6 +127,22 @@ parse_kv_conn <- function(s) {
   out
 }
 
+# -----------------------------------------------------------------------------
+# PERF TIMING (startup + Square calls)
+# -----------------------------------------------------------------------------
+tlog <- function(label, t0) {
+  dt <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+  cat(sprintf("[PERF] %-28s %6.3fs\n", label, dt))
+  flush.console()
+  invisible(dt)
+}
+
+timed <- function(label, expr) {
+  t0 <- Sys.time()
+  on.exit(tlog(label, t0), add = TRUE)
+  force(expr)
+}
+
 make_pool <- function() {
   if (db_is_postgres()) {
     s <- trimws(DB_URL)
@@ -152,7 +168,8 @@ make_pool <- function() {
   pool::dbPool(RSQLite::SQLite(), dbname = DB_PATH)
 }
 
-DB_POOL <- make_pool()
+DB_POOL <- timed("make_pool()", make_pool())
+
 
 onStop(function() {
   try(pool::poolClose(DB_POOL), silent = TRUE)
@@ -342,10 +359,26 @@ init_db <- function() {
     }
 
     # -----------------------------
+    # tx_items (for fast capacity counts)
+    # -----------------------------
+    db_exec(con, "
+      CREATE TABLE IF NOT EXISTS tx_items (
+        id TEXT PRIMARY KEY,
+        tx_id TEXT NOT NULL,
+        category TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        qty INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )
+    ")
+
+    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_tx_items_item_cat_status ON tx_items(item_id, category, status)"), silent = TRUE)
+    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_tx_items_tx_id          ON tx_items(tx_id)"), silent = TRUE)
+
+    # -----------------------------
     # indexes + constraints
     # -----------------------------
-
-    # Transactions indexes (Admin/search performance)
     try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_transactions_created_at     ON transactions(created_at)"), silent = TRUE)
     try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_transactions_receipt_token  ON transactions(receipt_token)"), silent = TRUE)
     try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_transactions_status         ON transactions(status)"), silent = TRUE)
@@ -353,10 +386,8 @@ init_db <- function() {
     try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_transactions_buyer_email    ON transactions(buyer_email)"), silent = TRUE)
     try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_transactions_buyer_name     ON transactions(buyer_name)"), silent = TRUE)
 
-    # Events index
     try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_events_event_date           ON special_events(event_date)"), silent = TRUE)
 
-    # Receipt token must be unique (Postgres + SQLite both support UNIQUE index)
     try(db_exec(con, "CREATE UNIQUE INDEX IF NOT EXISTS ux_transactions_receipt_token ON transactions(receipt_token)"), silent = TRUE)
 
     invisible(NULL)
@@ -365,7 +396,8 @@ init_db <- function() {
   invisible(NULL)
 }
 
-init_db()
+# Call it ONCE (timed)
+timed("init_db()", init_db())
 
 # -----------------------------------------------------------------------------
 # CONFIG HELPERS
@@ -985,14 +1017,16 @@ server <- function(input, output, session) {
 
     checkout_started = FALSE,
     checkout_token   = "",
-    checkout_lock    = FALSE
+    checkout_lock    = FALSE,
+    receipt_qr_token = "",
+    receipt_qr_file  = ""
   )
 
   # -----------------------------------------------------------------------------
   # CONFIG REACTIVITY: re-render nav when config changes
   # -----------------------------------------------------------------------------
   config_updated_at <- reactivePoll(
-    intervalMillis = 1500,
+    intervalMillis = 5000,
     session        = session,
     checkFunc      = function() cfg_get("__config_updated_at", ""),
     valueFunc      = function() cfg_get("__config_updated_at", "")
@@ -1547,33 +1581,21 @@ server <- function(input, output, session) {
     as.integer(q)
   }
 
-  event_sold_qty_completed <- function(event_id) {
-    if (!nzchar(event_id %||% "")) return(0L)
+event_sold_qty_completed <- function(event_id) {
+  if (!nzchar(event_id %||% "")) return(0L)
 
-    tx <- db_get1(
-      "SELECT cart_json
-       FROM transactions
-       WHERE status IN ('COMPLETED','SANDBOX_TEST_OK')
-         AND (tx_type IN ('event','mixed') OR tx_type IS NULL)"
-    )
-    if (nrow(tx) == 0) return(0L)
+  x <- db_get1(
+    "SELECT COALESCE(SUM(qty), 0) AS sold
+     FROM tx_items
+     WHERE category = 'event'
+       AND item_id  = ?event_id
+       AND status IN ('COMPLETED','SANDBOX_TEST_OK')",
+    event_id = as.character(event_id)
+  )
 
-    sold <- 0L
-    for (i in seq_len(nrow(tx))) {
-      cart_df <- tryCatch(jsonlite::fromJSON(tx$cart_json[i] %||% ""), error = function(e) NULL)
-      if (is.null(cart_df) || nrow(cart_df) == 0) next
-      if (!all(c("category", "quantity", "meta_json") %in% names(cart_df))) next
-
-      ix <- which(cart_df$category == "event")
-      if (length(ix) == 0) next
-
-      for (j in ix) {
-        eid <- parse_event_id_from_meta(cart_df$meta_json[j] %||% "")
-        if (identical(eid, event_id)) sold <- sold + as.integer(cart_df$quantity[j] %||% 0L)
-      }
-    }
-    as.integer(sold)
-  }
+  sold <- suppressWarnings(as.integer(x$sold[1]))
+  if (is.na(sold)) 0L else sold
+}
 
   validate_event_capacities_for_cart <- function(cart_df) {
     if (is.null(cart_df) || nrow(cart_df) == 0) return(NULL)
@@ -1649,33 +1671,21 @@ server <- function(input, output, session) {
     as.integer(q)
   }
 
-  program_sold_qty_completed <- function(program_id) {
-    if (!nzchar(program_id %||% "")) return(0L)
+program_sold_qty_completed <- function(program_id) {
+  if (!nzchar(program_id %||% "")) return(0L)
 
-    tx <- db_get1(
-      "SELECT cart_json
-       FROM transactions
-       WHERE status IN ('COMPLETED','SANDBOX_TEST_OK')
-         AND (tx_type IN ('program','mixed') OR tx_type IS NULL)"
-    )
-    if (nrow(tx) == 0) return(0L)
+  x <- db_get1(
+    "SELECT COALESCE(SUM(qty), 0) AS sold
+     FROM tx_items
+     WHERE category = 'program'
+       AND item_id  = ?program_id
+       AND status IN ('COMPLETED','SANDBOX_TEST_OK')",
+    program_id = as.character(program_id)
+  )
 
-    sold <- 0L
-    for (i in seq_len(nrow(tx))) {
-      cart_df <- tryCatch(jsonlite::fromJSON(tx$cart_json[i] %||% ""), error = function(e) NULL)
-      if (is.null(cart_df) || nrow(cart_df) == 0) next
-      if (!all(c("category", "quantity", "meta_json") %in% names(cart_df))) next
-
-      ix <- which(cart_df$category == "program")
-      if (length(ix) == 0) next
-
-      for (j in ix) {
-        pid <- parse_program_id_from_meta(cart_df$meta_json[j] %||% "")
-        if (identical(pid, program_id)) sold <- sold + as.integer(cart_df$quantity[j] %||% 0L)
-      }
-    }
-    as.integer(sold)
-  }
+  sold <- suppressWarnings(as.integer(x$sold[1]))
+  if (is.na(sold)) 0L else sold
+}
 
   validate_program_capacities_for_cart <- function(cart_df) {
     if (is.null(cart_df) || nrow(cart_df) == 0) return(NULL)
@@ -1733,11 +1743,155 @@ server <- function(input, output, session) {
     if (nrow(x) == 1) x else NULL
   }
 
-  update_tx_status <- function(tx_id, status) {
-    if (!nzchar(tx_id %||% "")) return(FALSE)
-    db_exec1("UPDATE transactions SET status = ?st WHERE id = ?id", st = as.character(status), id = tx_id)
-    TRUE
+update_tx_status <- function(tx_id, status) {
+  if (!nzchar(tx_id %||% "")) return(FALSE)
+
+  with_db(function(con) {
+    DBI::dbWithTransaction(con, {
+
+      # transactions table
+      db_exec(
+        con,
+        "UPDATE transactions SET status = ?st WHERE id = ?id",
+        st = as.character(status),
+        id = as.character(tx_id)
+      )
+
+      # tx_items table (keep sold-counters correct)
+      db_exec(
+        con,
+        "UPDATE tx_items SET status = ?st WHERE tx_id = ?id",
+        st = as.character(status),
+        id = as.character(tx_id)
+      )
+    })
+  })
+
+  TRUE
+}
+
+# -----------------------------------------------------------------------------
+# tx_items helpers (fast capacity counts)
+# -----------------------------------------------------------------------------
+
+tx_items_missing_backfill_done <- FALSE
+
+extract_item_id_for_tx_item <- function(category, meta_json) {
+  cat <- as.character(category %||% "")
+  s   <- as.character(meta_json %||% "")
+  if (!nzchar(cat) || !nzchar(s)) return("")
+
+  obj <- tryCatch(jsonlite::fromJSON(s, simplifyVector = FALSE), error = function(e) NULL)
+  if (is.null(obj)) return("")
+
+  if (identical(cat, "event"))   return(as.character(obj$event_id   %||% ""))
+  if (identical(cat, "program")) return(as.character(obj$program_id %||% ""))
+
+  ""
+}
+
+# Backfill only if you have old COMPLETED tx without tx_items rows (prevents oversell)
+ensure_tx_items_backfill_completed <- function(batch = 200L, max_batches = 20L) {
+  if (isTRUE(tx_items_missing_backfill_done)) return(invisible(TRUE))
+
+  for (b in seq_len(max_batches)) {
+
+    # Find completed tx that have no tx_items yet
+    tx <- db_get1(
+      "
+      SELECT id, created_at, status, cart_json
+      FROM transactions t
+      WHERE t.status IN ('COMPLETED','SANDBOX_TEST_OK')
+        AND NOT EXISTS (SELECT 1 FROM tx_items x WHERE x.tx_id = t.id)
+      LIMIT ?n
+      ",
+      n = as.integer(batch)
+    )
+
+    if (nrow(tx) == 0) {
+      tx_items_missing_backfill_done <<- TRUE
+      return(invisible(TRUE))
+    }
+
+    # Insert tx_items for each tx
+    for (i in seq_len(nrow(tx))) {
+      cart_df <- tryCatch(jsonlite::fromJSON(tx$cart_json[i] %||% ""), error = function(e) NULL)
+      if (is.null(cart_df) || nrow(cart_df) == 0) next
+      if (!all(c("category", "quantity", "meta_json") %in% names(cart_df))) next
+
+      st  <- as.character(tx$status[i] %||% "")
+      tid <- as.character(tx$id[i] %||% "")
+      ca  <- as.character(tx$created_at[i] %||% now_ts())
+      if (!nzchar(tid)) next
+
+      # only event/program matter for capacity; store only those
+      ix <- which(cart_df$category %in% c("event", "program"))
+      if (length(ix) == 0) next
+
+      with_db(function(con) {
+        DBI::dbWithTransaction(con, {
+          for (j in ix) {
+            item_id <- extract_item_id_for_tx_item(cart_df$category[j], cart_df$meta_json[j])
+            if (!nzchar(item_id)) next
+
+            q <- suppressWarnings(as.integer(cart_df$quantity[j] %||% 0L))
+            if (is.na(q) || q <= 0L) next
+
+            db_exec(
+              con,
+              "INSERT INTO tx_items (id, tx_id, category, item_id, qty, status, created_at)
+               VALUES (?id, ?tx_id, ?category, ?item_id, ?qty, ?status, ?created_at)",
+              id         = UUIDgenerate(),
+              tx_id      = tid,
+              category   = as.character(cart_df$category[j]),
+              item_id    = item_id,
+              qty        = q,
+              status     = st,
+              created_at = ca
+            )
+          }
+        })
+      })
+    }
   }
+
+  invisible(TRUE)
+}
+
+insert_tx_items_for_cart <- function(tx_id, created_at, status, cart_df) {
+  if (!nzchar(tx_id %||% "")) return(invisible(TRUE))
+  if (is.null(cart_df) || nrow(cart_df) == 0) return(invisible(TRUE))
+
+  ix <- which(cart_df$category %in% c("event", "program"))
+  if (length(ix) == 0) return(invisible(TRUE))
+
+  with_db(function(con) {
+    DBI::dbWithTransaction(con, {
+      for (j in ix) {
+        item_id <- extract_item_id_for_tx_item(cart_df$category[j], cart_df$meta_json[j])
+        if (!nzchar(item_id)) next
+
+        q <- suppressWarnings(as.integer(cart_df$quantity[j] %||% 0L))
+        if (is.na(q) || q <= 0L) next
+
+        db_exec(
+          con,
+          "INSERT INTO tx_items (id, tx_id, category, item_id, qty, status, created_at)
+           VALUES (?id, ?tx_id, ?category, ?item_id, ?qty, ?status, ?created_at)",
+          id         = UUIDgenerate(),
+          tx_id      = tx_id,
+          category   = as.character(cart_df$category[j]),
+          item_id    = item_id,
+          qty        = q,
+          status     = as.character(status %||% ""),
+          created_at = as.character(created_at %||% now_ts())
+        )
+      }
+    })
+  })
+
+  invisible(TRUE)
+}
 
   # -----------------------------------------------------------------------------
   # RECEIPT VERIFICATION (Square)
@@ -2217,139 +2371,165 @@ server <- function(input, output, session) {
 
     if (!validate_buyer_or_notify(buyer_name, buyer_email)) return()
 
+    # Normalize/merge cart lines before checks
     df <- normalize_cart(df)
 
-    tx_type <- infer_tx_type(df)
-
-    msg <- validate_cart_limits(df)
+    # ---- PERF: checkout prechecks (run ONCE) ----
+    msg <- timed("validate_cart_limits()", validate_cart_limits(df))
     if (!is.null(msg)) {
       showNotification(msg, type = "error")
       return()
     }
 
-    cap_msg <- validate_event_capacities_for_cart(df)
+    cap_msg <- timed("validate_event_capacities()", validate_event_capacities_for_cart(df))
     if (!is.null(cap_msg)) {
       showNotification(cap_msg, type = "error")
       return()
     }
 
-    prog_msg <- validate_program_capacities_for_cart(df)
+    prog_msg <- timed("validate_program_capacities()", validate_program_capacities_for_cart(df))
     if (!is.null(prog_msg)) {
       showNotification(prog_msg, type = "error")
       return()
     }
 
+    tx_type <- infer_tx_type(df)
     total_cents <- cart_total_cents(df)
 
-    # ---------------------------------------------------------------------------
-    # Sandbox fake mode
-    # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Sandbox fake mode
+# ---------------------------------------------------------------------------
 
-    if (SQUARE_ENV == "sandbox" && SANDBOX_MODE == "fake") {
-      receipt_token <- UUIDgenerate()
+if (SQUARE_ENV == "sandbox" && SANDBOX_MODE == "fake") {
 
-      ok <- tryCatch({
-        db_exec1(
-          "INSERT INTO transactions (
-             id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
-             tx_type,
-             square_checkout_id, square_order_id, receipt_token, status
-           ) VALUES (
-             ?id, ?created_at, ?buyer_name, ?buyer_email, ?total_cents, 'CAD', ?cart_json,
-             ?tx_type,
-             NULL, NULL, ?receipt_token, 'SANDBOX_TEST_OK'
-           )",
-          id            = UUIDgenerate(),
-          created_at    = now_ts(),
-          buyer_name    = buyer_name,
-          buyer_email   = buyer_email,
-          total_cents   = total_cents,
-          cart_json     = as.character(jsonlite::toJSON(df, auto_unbox = TRUE, null = "null")),
-          tx_type       = tx_type,
-          receipt_token = receipt_token
-        )
-        TRUE
-      }, error = function(e) {
-        showNotification(paste("DB error saving sandbox transaction:", conditionMessage(e)), type = "error")
-        FALSE
-      })
+  receipt_token <- UUIDgenerate()
+  tx_id         <- UUIDgenerate()
+  created_at    <- now_ts()
+  status0       <- "SANDBOX_TEST_OK"
 
-      if (!ok) return()
-
-      receipt_tx(load_receipt_token(receipt_token))
-      poll_count(0L)
-      clear_cart()
-      updateTabsetPanel(session, "main_nav", selected = "Receipt")
-
-      showModal(modalDialog(
-        title = "Sandbox test payment simulated",
-        "No real payment was processed. This is a TEST ONLY transaction in sandbox fake mode.",
-        easyClose = TRUE,
-        footer = modalButton("OK")
-      ))
-      return()
-    }
-
-    # ---------------------------------------------------------------------------
-    # Square mode
-    # ---------------------------------------------------------------------------
-    if (!HAVE_SQUARE_CREDS) {
-      showNotification("Square credentials missing. Set SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID.", type = "error")
-      return()
-    }
-
-    receipt_token <- UUIDgenerate()
-    redirect_url  <- build_redirect_url(receipt_token)
-
-    res <- create_square_checkout_from_cart(
-      cart_df      = df,
-      buyer_email  = buyer_email,
-      note         = paste("BVXC", if (SQUARE_ENV == "sandbox") "sandbox" else "production", source, "checkout"),
-      redirect_url = redirect_url
+  ok <- timed("DB insert sandbox transaction", tryCatch({
+    db_exec1(
+      "INSERT INTO transactions (
+         id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
+         tx_type,
+         square_checkout_id, square_order_id, receipt_token, status
+       ) VALUES (
+         ?id, ?created_at, ?buyer_name, ?buyer_email, ?total_cents, 'CAD', ?cart_json,
+         ?tx_type,
+         NULL, NULL, ?receipt_token, ?status
+       )",
+      id            = tx_id,
+      created_at    = created_at,
+      buyer_name    = buyer_name,
+      buyer_email   = buyer_email,
+      total_cents   = total_cents,
+      cart_json     = as.character(jsonlite::toJSON(df, auto_unbox = TRUE, null = "null")),
+      tx_type       = tx_type,
+      receipt_token = receipt_token,
+      status        = status0
     )
+    TRUE
+  }, error = function(e) {
+    showNotification(paste("DB error saving sandbox transaction:", conditionMessage(e)), type = "error")
+    FALSE
+  }))
 
-    if (is.null(res) || !nzchar(res$checkout_url %||% "")) {
-      showNotification("Unable to start checkout. Please try again.", type = "error")
-      return()
-    }
+  if (!ok) return()
 
-    ok <- tryCatch({
-      db_exec1(
-        "INSERT INTO transactions (
-           id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
-           tx_type,
-           square_checkout_id, square_order_id, receipt_token, status
-         ) VALUES (
-           ?id, ?created_at, ?buyer_name, ?buyer_email, ?total_cents, 'CAD', ?cart_json,
-           ?tx_type,
-           ?checkout_id, ?order_id, ?receipt_token, ?status
-         )",
-        id            = UUIDgenerate(),
-        created_at    = now_ts(),
-        buyer_name    = buyer_name,
-        buyer_email   = buyer_email,
-        total_cents   = total_cents,
-        cart_json     = as.character(jsonlite::toJSON(df, auto_unbox = TRUE, null = "null")),
-        tx_type       = tx_type,
-        checkout_id   = res$checkout_id %||% NA_character_,
-        order_id      = res$square_order %||% NA_character_,
-        receipt_token = receipt_token,
-        status        = "PENDING"
-      )
-      TRUE
-    }, error = function(e) {
-      showNotification(paste("DB error saving transaction:", conditionMessage(e)), type = "error")
-      FALSE
-    })
+  timed("tx_items insert (sandbox)", insert_tx_items_for_cart(
+    tx_id      = tx_id,
+    created_at = created_at,
+    status     = status0,
+    cart_df    = df
+  ))
 
-    if (!ok) return()
+  receipt_tx(load_receipt_token(receipt_token))
+  poll_count(0L)
+  clear_cart()
+  updateTabsetPanel(session, "main_nav", selected = "Receipt")
 
-    rv$checkout_started <- TRUE
-    rv$checkout_token   <- receipt_token
+  showModal(modalDialog(
+    title = "Sandbox test payment simulated",
+    "No real payment was processed. This is a TEST ONLY transaction in sandbox fake mode.",
+    easyClose = TRUE,
+    footer = modalButton("OK")
+  ))
+  return()
+}
 
-    session$sendCustomMessage("redirect", list(url = res$checkout_url))
-    # DO NOT clear cart here; clear only after buyer returns with ?receipt=...
-  }
+# ---------------------------------------------------------------------------
+# Square mode
+# ---------------------------------------------------------------------------
+if (!HAVE_SQUARE_CREDS) {
+  showNotification("Square credentials missing. Set SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID.", type = "error")
+  return()
+}
+
+receipt_token <- UUIDgenerate()
+redirect_url  <- build_redirect_url(receipt_token)
+
+res <- timed("Square payment-link POST", create_square_checkout_from_cart(
+  cart_df      = df,
+  buyer_email  = buyer_email,
+  note         = paste("BVXC", if (SQUARE_ENV == "sandbox") "sandbox" else "production", source, "checkout"),
+  redirect_url = redirect_url
+))
+
+if (is.null(res) || !nzchar(res$checkout_url %||% "")) {
+  showNotification("Unable to start checkout. Please try again.", type = "error")
+  return()
+}
+
+tx_id      <- UUIDgenerate()
+created_at <- now_ts()
+status0    <- "PENDING"
+
+ok <- timed("DB insert transaction (PENDING)", tryCatch({
+  db_exec1(
+    "INSERT INTO transactions (
+       id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
+       tx_type,
+       square_checkout_id, square_order_id, receipt_token, status
+     ) VALUES (
+       ?id, ?created_at, ?buyer_name, ?buyer_email, ?total_cents, 'CAD', ?cart_json,
+       ?tx_type,
+       ?checkout_id, ?order_id, ?receipt_token, ?status
+     )",
+    id            = tx_id,
+    created_at    = created_at,
+    buyer_name    = buyer_name,
+    buyer_email   = buyer_email,
+    total_cents   = total_cents,
+    cart_json     = as.character(jsonlite::toJSON(df, auto_unbox = TRUE, null = "null")),
+    tx_type       = tx_type,
+    checkout_id   = res$checkout_id %||% NA_character_,
+    order_id      = res$square_order %||% NA_character_,
+    receipt_token = receipt_token,
+    status        = status0
+  )
+  TRUE
+}, error = function(e) {
+  showNotification(paste("DB error saving transaction:", conditionMessage(e)), type = "error")
+  FALSE
+}))
+
+if (!ok) return()
+
+timed("tx_items insert (PENDING)", insert_tx_items_for_cart(
+  tx_id      = tx_id,
+  created_at = created_at,
+  status     = status0,
+  cart_df    = df
+))
+
+rv$checkout_started <- TRUE
+rv$checkout_token   <- receipt_token
+
+session$sendCustomMessage("redirect", list(url = res$checkout_url))
+# DO NOT clear cart here; clear only after buyer returns with ?receipt=...
+
+return(invisible(TRUE))
+}  # END do_checkout
 
   # -----------------------------------------------------------------------------
   # DAY PASS
@@ -2903,50 +3083,65 @@ server <- function(input, output, session) {
     }
   }
 
-  output$receipt_qr <- renderImage({
-    tx <- receipt_tx()
-    if (is.null(tx) || nrow(tx) != 1) return(NULL)
+observeEvent(receipt_tx(), {
+  tx <- receipt_tx()
+  if (is.null(tx) || nrow(tx) != 1) {
+    rv$receipt_qr_token <- ""
+    rv$receipt_qr_file  <- ""
+    return()
+  }
 
-    token <- as.character(tx$receipt_token[1] %||% "")
-    if (!nzchar(token)) return(NULL)
+  st <- toupper(trimws(as.character(tx$status[1] %||% "")))
+  if (!st %in% c("COMPLETED", "SANDBOX_TEST_OK")) return()
 
-    url <- receipt_url_for_token(token)
-    if (!nzchar(url)) return(NULL)
+  token <- as.character(tx$receipt_token[1] %||% "")
+  if (!nzchar(token)) return()
 
-    tf <- tempfile(fileext = ".png")
-    if (!is.character(tf) || length(tf) != 1) return(NULL)
+  # If already generated for this token, do nothing
+  if (identical(rv$receipt_qr_token, token) &&
+      nzchar(rv$receipt_qr_file) &&
+      file.exists(rv$receipt_qr_file)) {
+    return()
+  }
 
+  url <- receipt_url_for_token(token)
+  if (!nzchar(url)) return()
+
+  tf <- tempfile(fileext = ".png")
+
+  ok <- FALSE
+  tryCatch({
+    qr <- qrcode::qr_code(url)
+
+    grDevices::png(filename = tf, width = 360, height = 360)
+    op <- par(mar = c(0, 0, 0, 0))
+    on.exit({ par(op); grDevices::dev.off() }, add = TRUE)
+
+    plot(qr)
+    ok <- TRUE
+  }, error = function(e) {
+    try(grDevices::dev.off(), silent = TRUE)
     ok <- FALSE
-    tryCatch({
-      qr <- qrcode::qr_code(url)
+  })
 
-      grDevices::png(filename = tf, width = 360, height = 360)
-      op <- par(mar = c(0, 0, 0, 0))
-      on.exit({
-        par(op)
-        grDevices::dev.off()
-      }, add = TRUE)
+  if (isTRUE(ok) && file.exists(tf)) {
+    rv$receipt_qr_token <- token
+    rv$receipt_qr_file  <- tf
+  }
+}, ignoreInit = TRUE)
 
-      plot(qr)
-      ok <- TRUE
-    }, error = function(e) {
-      cat("Receipt QR render error:", conditionMessage(e), "\n")
-      flush.console()
-      try(grDevices::dev.off(), silent = TRUE)
-      ok <- FALSE
-    })
+output$receipt_qr <- renderImage({
+  tf <- as.character(rv$receipt_qr_file %||% "")
+  if (!nzchar(tf) || !file.exists(tf)) return(NULL)
 
-    if (!isTRUE(ok)) return(NULL)
-    if (!file.exists(tf)) return(NULL)
-
-    list(
-      src = normalizePath(tf, winslash = "/", mustWork = TRUE),
-      contentType = "image/png",
-      width = 220,
-      height = 220,
-      alt = "Receipt QR"
-    )
-  }, deleteFile = TRUE)
+  list(
+    src = normalizePath(tf, winslash = "/", mustWork = TRUE),
+    contentType = "image/png",
+    width = 220,
+    height = 220,
+    alt = "Receipt QR"
+  )
+}, deleteFile = FALSE)
 
   output$receipt_items <- renderUI({
     tx <- receipt_tx()
