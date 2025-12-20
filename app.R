@@ -863,7 +863,14 @@ css_tabs <- "
   border-bottom: 3px solid #0d6efd !important;
   padding-bottom: 10px;
 }
-.mini-cart-box { margin-top: 14px; padding: 10px; border: 1px solid #ddd; border-radius: 8px; background: #fafafa; }
+
+.mini-cart-box {
+  margin-top: 14px;
+  padding: 10px;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  background: #fafafa;
+}
 
 .cart-line {
   display: flex;
@@ -874,6 +881,7 @@ css_tabs <- "
 }
 .cart-desc { flex: 1; font-weight: 600; }
 .cart-controls { display: flex; align-items: center; gap: 12px; }
+
 .cart-qty-input {
   font-size: 20px;
   height: 44px;
@@ -910,6 +918,7 @@ css_tabs <- "
 }
 .receipt-ok .receipt-title,
 .receipt-ok .receipt-sub{ color:#0f5132; }
+
 .receipt-pending{
   border-color: #ffecb5;
   background: #fff3cd;
@@ -917,6 +926,7 @@ css_tabs <- "
 }
 .receipt-pending .receipt-title,
 .receipt-pending .receipt-sub{ color:#664d03; }
+
 .receipt-bad{
   border-color: #f5c2c7;
   background: #f8d7da;
@@ -924,11 +934,16 @@ css_tabs <- "
 }
 .receipt-bad .receipt-title,
 .receipt-bad .receipt-sub{ color:#842029; }
+
 .receipt-neutral{
   border-color: #dee2e6;
   background: #f8f9fa;
   color: #495057;
 }
+
+/* ---- Receipt QR rendering (pixelated) ---- */
+#receipt_qr img { image-rendering: pixelated; }
+
 .receipt-spinner{
   display:inline-block;
   width:14px; height:14px;
@@ -938,6 +953,7 @@ css_tabs <- "
   animation: receiptSpin .8s linear infinite;
   vertical-align: -2px;
 }
+
 @keyframes receiptSpin { to { transform: rotate(360deg); } }
 
 /* ---- Pay button emphasis (ONLY when cart has items) ---- */
@@ -949,6 +965,7 @@ css_tabs <- "
   text-decoration-thickness: 3px;
   text-underline-offset: 6px;
 }
+
 .admin-block { margin-bottom: 14px; }
 .admin-block .panel-heading { font-weight: 700; }
 .admin-block .panel-body { padding-top: 12px; }
@@ -1051,8 +1068,6 @@ server <- function(input, output, session) {
     checkout_started = FALSE,
     checkout_token   = "",
     checkout_lock    = FALSE,
-    receipt_qr_token = "",
-    receipt_qr_file  = ""
   )
 
   # -----------------------------------------------------------------------------
@@ -3117,73 +3132,39 @@ return(invisible(TRUE))
     }
   }
 
-observeEvent(receipt_tx(), {
+output$receipt_qr <- renderImage({
+
   tx <- receipt_tx()
-  if (is.null(tx) || nrow(tx) != 1) {
-    rv$receipt_qr_token <- ""
-    rv$receipt_qr_file  <- ""
-    return()
-  }
+  if (is.null(tx) || nrow(tx) != 1) return(NULL)
 
   st <- toupper(trimws(as.character(tx$status[1] %||% "")))
-  if (!st %in% c("COMPLETED", "SANDBOX_TEST_OK")) return()
+  if (!st %in% c("COMPLETED", "SANDBOX_TEST_OK")) return(NULL)
 
   token <- as.character(tx$receipt_token[1] %||% "")
-  if (!nzchar(token)) return()
-
-  # If already generated for this token, do nothing
-  if (identical(rv$receipt_qr_token, token) &&
-      nzchar(rv$receipt_qr_file) &&
-      file.exists(rv$receipt_qr_file)) {
-    return()
-  }
+  if (!nzchar(token)) return(NULL)
 
   url <- receipt_url_for_token(token)
-  if (!nzchar(url)) return()
+  if (!nzchar(url)) return(NULL)
 
   tf <- tempfile(fileext = ".png")
 
-  ok <- FALSE
-  tryCatch({
-    qr <- qrcode::qr_code(url)
+  qr <- qrcode::qr_code(url)
 
-    grDevices::png(filename = tf, width = 360, height = 360)
-    op <- par(mar = c(0, 0, 0, 0))
-    on.exit({ par(op); grDevices::dev.off() }, add = TRUE)
+  grDevices::png(filename = tf, width = 360, height = 360)
+  op <- par(mar = c(0, 0, 0, 0))
+  on.exit({ par(op); grDevices::dev.off() }, add = TRUE)
 
-    plot(qr)
-    ok <- TRUE
-  }, error = function(e) {
-    try(grDevices::dev.off(), silent = TRUE)
-    ok <- FALSE
-  })
+  plot(qr)
 
-  if (isTRUE(ok) && file.exists(tf)) {
-    rv$receipt_qr_token <- token
-    rv$receipt_qr_file  <- tf
-  }
-}, ignoreInit = TRUE)
-
-output$receipt_qr <- renderUI({
-  tf <- rv$receipt_qr_file
-
-  # Normalize whatever rv$receipt_qr_file is into a single character path
-  if (is.null(tf)) return(NULL)
-  if (is.list(tf) && !is.null(tf$path)) tf <- tf$path
-  tf <- as.character(tf)[1]
-  tf <- trimws(tf %||% "")
-
-  if (!nzchar(tf) || !file.exists(tf)) return(NULL)
-
-  b64 <- base64enc::base64encode(tf)
-  tags$img(
-    src    = paste0("data:image/png;base64,", b64),
-    width  = 220,
+  list(
+    src = tf,
+    contentType = "image/png",
+    width = 220,
     height = 220,
-    alt    = "Receipt QR",
-    style  = "image-rendering: pixelated;"
+    alt = "Receipt QR"
   )
-})
+
+}, deleteFile = TRUE)
 
   output$receipt_items <- renderUI({
     tx <- receipt_tx()
@@ -3284,7 +3265,7 @@ output$receipt_qr <- renderUI({
           tags$h4("Receipt QR"),
           if (is_final_ok) {
             tagList(
-              uiOutput("receipt_qr"),
+              imageOutput("receipt_qr"),
               tags$div(
                 style="margin-top:8px; color:#666; font-size:0.95em;",
                 "Scan to reload this receipt status."
