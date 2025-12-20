@@ -400,36 +400,67 @@ init_db <- function() {
 timed("init_db()", init_db())
 
 # -----------------------------------------------------------------------------
-# CONFIG HELPERS
+# CONFIG HELPERS (CACHED)
 # -----------------------------------------------------------------------------
 
-cfg_get <- function(key, default = "") {
+CFG_CACHE <- new.env(parent = emptyenv())
+CFG_CACHE$map <- NULL
+CFG_CACHE$loaded_at <- as.POSIXct(0, origin = "1970-01-01")
+
+cfg_refresh_cache <- function(force = FALSE, ttl_secs = 2) {
+  if (!force && !is.null(CFG_CACHE$map)) {
+    age <- as.numeric(difftime(Sys.time(), CFG_CACHE$loaded_at, units = "secs"))
+    if (!is.na(age) && age <= ttl_secs) return(invisible(TRUE))
+  }
+
+  x <- db_get1("SELECT key, value FROM config")
+  m <- list()
+  if (nrow(x) > 0) {
+    for (i in seq_len(nrow(x))) {
+      k <- as.character(x$key[i] %||% "")
+      if (nzchar(k)) m[[k]] <- as.character(x$value[i] %||% "")
+    }
+  }
+
+  CFG_CACHE$map <- m
+  CFG_CACHE$loaded_at <- Sys.time()
+  invisible(TRUE)
+}
+
+# Always-hit-DB read (used ONLY by reactivePoll marker)
+cfg_get_db <- function(key, default = "") {
   key <- as.character(key %||% "")
   if (!nzchar(trimws(key))) return(default)
 
   x <- db_get1("SELECT value FROM config WHERE key = ?key LIMIT 1", key = key)
   if (nrow(x) == 0) return(default)
-  x$value[1]
+  as.character(x$value[1] %||% default)
+}
+
+cfg_get <- function(key, default = "") {
+  key <- as.character(key %||% "")
+  if (!nzchar(trimws(key))) return(default)
+
+  cfg_refresh_cache(force = FALSE, ttl_secs = 2)
+
+  v <- CFG_CACHE$map[[key]]
+  if (is.null(v) || is.na(v)) default else v
 }
 
 cfg_set <- function(key, value) {
   key   <- as.character(key %||% "")
   value <- as.character(value %||% "")
-
-  # No-op guard (prevents writing blank keys)
   if (!nzchar(trimws(key))) return(invisible(FALSE))
 
   with_db(function(con) {
     DBI::dbWithTransaction(con, {
 
-      # ---- upsert helper (works in both Postgres+SQLite via your db_exec/sqlInterpolate) ----
       upsert_config <- function(k, v) {
         n <- db_exec(con, "UPDATE config SET value = ?value WHERE key = ?key", key = k, value = v)
         if (isTRUE(n == 0)) {
           tryCatch(
             db_exec(con, "INSERT INTO config(key, value) VALUES (?key, ?value)", key = k, value = v),
             error = function(e) {
-              # If a concurrent insert happened, fall back to update
               db_exec(con, "UPDATE config SET value = ?value WHERE key = ?key", key = k, value = v)
             }
           )
@@ -437,16 +468,16 @@ cfg_set <- function(key, value) {
         invisible(TRUE)
       }
 
-      # 1) Save requested key/value
       upsert_config(key, value)
 
-      # 2) Touch marker so UI can react (reactivePoll watches this)
-      #    IMPORTANT: do not re-touch when writing the marker itself.
       if (!identical(key, "__config_updated_at")) {
         upsert_config("__config_updated_at", now_ts())
       }
     })
   })
+
+  # Refresh local cache immediately after writes
+  cfg_refresh_cache(force = TRUE)
 
   invisible(TRUE)
 }
@@ -1025,12 +1056,13 @@ server <- function(input, output, session) {
   # -----------------------------------------------------------------------------
   # CONFIG REACTIVITY: re-render nav when config changes
   # -----------------------------------------------------------------------------
-  config_updated_at <- reactivePoll(
-    intervalMillis = 5000,
-    session        = session,
-    checkFunc      = function() cfg_get("__config_updated_at", ""),
-    valueFunc      = function() cfg_get("__config_updated_at", "")
-  )
+ 
+config_updated_at <- reactivePoll(
+  intervalMillis = 5000,
+  session        = session,
+  checkFunc      = function() cfg_get_db("__config_updated_at", ""),
+  valueFunc      = function() cfg_get_db("__config_updated_at", "")
+)
 
   # Run once after the UI is ready: disable autofill on buyer fields
   session$onFlushed(function() {
@@ -3134,8 +3166,14 @@ output$receipt_qr <- renderImage({
   tf <- as.character(rv$receipt_qr_file %||% "")
   if (!nzchar(tf) || !file.exists(tf)) return(NULL)
 
+  # Prevent hard crash if the temp file disappears between checks
+  srcp <- tryCatch(
+    normalizePath(tf, winslash = "/", mustWork = FALSE),
+    error = function(e) tf
+  )
+
   list(
-    src = normalizePath(tf, winslash = "/", mustWork = TRUE),
+    src = srcp,
     contentType = "image/png",
     width = 220,
     height = 220,
