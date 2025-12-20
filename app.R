@@ -18,6 +18,8 @@ suppressPackageStartupMessages({
   library(pool)
   library(RPostgres)
   library(htmltools)
+  library(base64enc)
+
 })
 
 # DT is optional on Connect Cloud (prevents app startup crash)
@@ -3162,24 +3164,26 @@ observeEvent(receipt_tx(), {
   }
 }, ignoreInit = TRUE)
 
-output$receipt_qr <- renderImage({
-  tf <- as.character(rv$receipt_qr_file %||% "")
+output$receipt_qr <- renderUI({
+  tf <- rv$receipt_qr_file
+
+  # Normalize whatever rv$receipt_qr_file is into a single character path
+  if (is.null(tf)) return(NULL)
+  if (is.list(tf) && !is.null(tf$path)) tf <- tf$path
+  tf <- as.character(tf)[1]
+  tf <- trimws(tf %||% "")
+
   if (!nzchar(tf) || !file.exists(tf)) return(NULL)
 
-  # Prevent hard crash if the temp file disappears between checks
-  srcp <- tryCatch(
-    normalizePath(tf, winslash = "/", mustWork = FALSE),
-    error = function(e) tf
-  )
-
-  list(
-    src = srcp,
-    contentType = "image/png",
-    width = 220,
+  b64 <- base64enc::base64encode(tf)
+  tags$img(
+    src    = paste0("data:image/png;base64,", b64),
+    width  = 220,
     height = 220,
-    alt = "Receipt QR"
+    alt    = "Receipt QR",
+    style  = "image-rendering: pixelated;"
   )
-}, deleteFile = FALSE)
+})
 
   output$receipt_items <- renderUI({
     tx <- receipt_tx()
@@ -3280,7 +3284,7 @@ output$receipt_qr <- renderImage({
           tags$h4("Receipt QR"),
           if (is_final_ok) {
             tagList(
-              imageOutput("receipt_qr"),
+              uiOutput("receipt_qr"),
               tags$div(
                 style="margin-top:8px; color:#666; font-size:0.95em;",
                 "Scan to reload this receipt status."
