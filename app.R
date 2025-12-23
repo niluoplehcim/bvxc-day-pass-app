@@ -437,7 +437,7 @@ CFG_CACHE <- new.env(parent = emptyenv())
 CFG_CACHE$map <- NULL
 CFG_CACHE$loaded_at <- as.POSIXct(0, origin = "1970-01-01")
 
-cfg_refresh_cache <- function(force = FALSE, ttl_secs = 2) {
+cfg_refresh_cache <- function(force = FALSE, ttl_secs = 60) {
   if (!force && !is.null(CFG_CACHE$map)) {
     age <- as.numeric(difftime(Sys.time(), CFG_CACHE$loaded_at, units = "secs"))
     if (!is.na(age) && age <= ttl_secs) return(invisible(TRUE))
@@ -471,7 +471,7 @@ cfg_get <- function(key, default = "") {
   key <- as.character(key %||% "")
   if (!nzchar(trimws(key))) return(default)
 
-  cfg_refresh_cache(force = FALSE, ttl_secs = 2)
+  cfg_refresh_cache(force = FALSE, ttl_secs = 60)
 
   v <- CFG_CACHE$map[[key]]
   if (is.null(v) || is.na(v)) default else v
@@ -1102,12 +1102,27 @@ server <- function(input, output, session) {
 
   )
 
+# ---- tiny cache so reactivePoll doesn't hit DB twice every interval ----
+CFG_UPDATED_CACHE <- new.env(parent = emptyenv())
+CFG_UPDATED_CACHE$val <- ""
+CFG_UPDATED_CACHE$t   <- as.POSIXct(0, origin = "1970-01-01")
+
+cfg_get_updated_at_cached <- function(ttl_secs = 1) {
+  age <- as.numeric(difftime(Sys.time(), CFG_UPDATED_CACHE$t, units = "secs"))
+  if (!is.na(age) && age <= ttl_secs) return(CFG_UPDATED_CACHE$val)
+
+  v <- cfg_get_db("__config_updated_at", "")
+  CFG_UPDATED_CACHE$val <- as.character(v %||% "")
+  CFG_UPDATED_CACHE$t   <- Sys.time()
+  CFG_UPDATED_CACHE$val
+}
+
   # -----------------------------------------------------------------------------
   # CONFIG REACTIVITY: re-render nav when config changes
   # -----------------------------------------------------------------------------
  
 config_updated_at <- reactivePoll(
-  intervalMillis = 15000,
+  intervalMillis = 60000,
   session        = session,
   checkFunc      = function() cfg_get_db("__config_updated_at", ""),
   valueFunc      = function() cfg_get_db("__config_updated_at", "")
@@ -2421,14 +2436,20 @@ observeEvent(session$clientData$url_search, {
         )
       })
 
-      observeEvent(input[[change_id]], {
-        x <- input[[change_id]]
-        if (!is.null(x$qty)) {
-          set_cart_qty(x$id, x$qty)
-        } else if (!is.null(x$amt)) {
-          set_cart_amount(x$id, x$amt)
-        }
-      }, ignoreInit = TRUE)
+# Debounce cart edit events coming from JS-driven inputs
+cart_change <- reactive(input[[change_id]])
+cart_change_d <- debounce(cart_change, millis = 300)
+
+observeEvent(cart_change_d(), {
+  x <- cart_change_d()
+  if (is.null(x) || is.null(x$id)) return()
+
+  if (!is.null(x$qty)) {
+    set_cart_qty(x$id, x$qty)
+  } else if (!is.null(x$amt)) {
+    set_cart_amount(x$id, x$amt)
+  }
+}, ignoreInit = TRUE)
 
       observeEvent(input[[paste0(prefix, "_cart_clear")]], {
         clear_cart()
