@@ -151,7 +151,14 @@ make_pool <- function() {
 
     # URI form: postgresql://USER:PASSWORD@HOST:5432/DB?sslmode=require
     if (grepl("^postgres(ql)?://", s, ignore.case = TRUE)) {
-      return(pool::dbPool(RPostgres::Postgres(), dbname = s))
+      return(pool::dbPool(
+        drv = RPostgres::Postgres(),
+        dbname = s,
+        minSize = 1,
+        maxSize = 5,
+        idleTimeout = 600000,        # 10 minutes (ms)
+        validationInterval = 60000   # 1 minute (ms)
+      ))
     }
 
     # KV form: host=... port=... dbname=... user=... password=...
@@ -164,7 +171,20 @@ make_pool <- function() {
         "\nUse URI form: postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require"
       )
     }
-    return(do.call(pool::dbPool, c(list(RPostgres::Postgres()), args)))
+
+    return(do.call(
+      pool::dbPool,
+      c(
+        list(drv = RPostgres::Postgres()),
+        args,
+        list(
+          minSize = 1,
+          maxSize = 5,
+          idleTimeout = 600000,        # 10 minutes (ms)
+          validationInterval = 60000   # 1 minute (ms)
+        )
+      )
+    ))
   }
 
   pool::dbPool(RSQLite::SQLite(), dbname = DB_PATH)
@@ -172,14 +192,22 @@ make_pool <- function() {
 
 DB_POOL <- timed("make_pool()", make_pool())
 
-
 onStop(function() {
   try(pool::poolClose(DB_POOL), silent = TRUE)
 })
 
+# -----------------------------------------------------------------------------
+# DB HELPERS (safe checkout/return; DO NOT swallow poolReturn errors)
+# -----------------------------------------------------------------------------
+
 with_db <- function(fun) {
   con <- pool::poolCheckout(DB_POOL)
-  on.exit(pool::poolReturn(con), add = TRUE)
+
+  on.exit({
+    # Return the connection; if this fails, you WANT to see it.
+    pool::poolReturn(con)
+  }, add = TRUE)
+
   fun(con)
 }
 
@@ -188,8 +216,8 @@ now_ts <- function() format(Sys.time(), "%Y-%m-%d %H:%M:%S")
 db_get  <- function(con, sql, ...) DBI::dbGetQuery(con, DBI::sqlInterpolate(con, sql, ...))
 db_exec <- function(con, sql, ...) DBI::dbExecute(con, DBI::sqlInterpolate(con, sql, ...))
 
-db_get1  <- function(sql, ...) with_db(function(con) db_get(con, sql, ...))
-db_exec1 <- function(sql, ...) with_db(function(con) db_exec(con, sql, ...))
+db_get1  <- function(sql, ...)  with_db(function(con) db_get(con, sql, ...))
+db_exec1 <- function(sql, ...)  with_db(function(con) db_exec(con, sql, ...))
 
 # -----------------------------------------------------------------------------
 # ADMIN: Transactions helper (query)
@@ -1067,7 +1095,11 @@ server <- function(input, output, session) {
 
     checkout_started = FALSE,
     checkout_token   = "",
-    checkout_lock    = FALSE
+    checkout_lock    = FALSE,
+
+    receipt_qr_token = "",
+    receipt_qr_file  = ""
+
   )
 
   # -----------------------------------------------------------------------------
@@ -1075,7 +1107,7 @@ server <- function(input, output, session) {
   # -----------------------------------------------------------------------------
  
 config_updated_at <- reactivePoll(
-  intervalMillis = 5000,
+  intervalMillis = 15000,
   session        = session,
   checkFunc      = function() cfg_get_db("__config_updated_at", ""),
   valueFunc      = function() cfg_get_db("__config_updated_at", "")
@@ -1087,6 +1119,22 @@ config_updated_at <- reactivePoll(
   }, once = TRUE)
 
   receipt_tx <- reactiveVal(NULL)
+  receipt_cart_df <- reactiveVal(NULL)
+
+# Cache parsed cart for the current receipt (avoid repeated fromJSON)
+observeEvent(receipt_tx(), {
+  tx <- receipt_tx()
+  if (is.null(tx) || nrow(tx) != 1) {
+    receipt_cart_df(NULL)
+    return()
+  }
+
+  cart_df <- tryCatch(
+    jsonlite::fromJSON(tx$cart_json[1] %||% ""),
+    error = function(e) NULL
+  )
+  receipt_cart_df(cart_df)
+}, ignoreInit = TRUE)
 
   day_date_ui_nonce   <- reactiveVal(0L)
   last_valid_day_date <- reactiveVal(Sys.Date())
@@ -2097,9 +2145,8 @@ output$tab_day_ui <- renderUI({
   req(identical(input$main_nav, "Day Pass"))
   fluidPage(
     h3("Day Passes"),
-    tags$p(season_label(season_win())),
     p("Choose your ski day and passes, then add to cart. Review and pay on the right."),
-    p(style="color:#666;", "Age buckets (not enforced for day passes): Child 0–8, Youth 9–18, Adult 19+."),
+    p(style="color:#666;", "Age buckets: Child 0–8, Youth 9–18, Adult 19+."),
     fluidRow(
       column(
         4,
@@ -2120,7 +2167,6 @@ output$tab_xmas_ui <- renderUI({
   req(identical(input$main_nav, "Christmas Pass"))
   fluidPage(
     h3("Christmas Pass"),
-    tags$p(season_label(season_win())),
     p("Choose a 14-day window that must include Dec 25. Add to cart, then pay on the right."),
     fluidRow(
       column(
@@ -3070,77 +3116,79 @@ return(invisible(TRUE))
     showNotification(paste0("Donation of $", sprintf("%.2f", amt), " added to cart."), type = "message")
   })
 
-  # -----------------------------------------------------------------------------
-  # RECEIPT PAGE (UI + STATUS POLL)
-  # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# RECEIPT PAGE (UI + STATUS POLL)
+# -----------------------------------------------------------------------------
 
-  observeEvent(receipt_tx(), {
-    poll_count(0L)
-  }, ignoreInit = TRUE)
+observeEvent(receipt_tx(), {
+  poll_count(0L)
+}, ignoreInit = TRUE)
 
-  observe({
-    tx <- receipt_tx()
-    if (is.null(tx) || nrow(tx) != 1) return()
+observe({
+  tx <- receipt_tx()
+  if (is.null(tx) || nrow(tx) != 1) return()
 
-    st <- as.character(tx$status[1] %||% "")
-    if (st %in% c("COMPLETED", "FAILED", "SANDBOX_TEST_OK")) return()
+  st <- as.character(tx$status[1] %||% "")
+  if (st %in% c("COMPLETED", "FAILED", "SANDBOX_TEST_OK")) return()
 
-    n <- poll_count()
-    if (n >= 12) return()
+  n <- poll_count()
+  if (n >= 12) return()
 
-    invalidateLater(5000, session)
-    poll_count(n + 1L)
-    verify_and_refresh_receipt()
-  })
+  invalidateLater(5000, session)
+  poll_count(n + 1L)
+  verify_and_refresh_receipt()
+})
 
-  observeEvent(input$receipt_refresh, {
-    verify_and_refresh_receipt()
-  }, ignoreInit = TRUE)
+observeEvent(input$receipt_refresh, {
+  verify_and_refresh_receipt()
+}, ignoreInit = TRUE)
 
-  observeEvent(input$receipt_clear, {
-    receipt_tx(NULL)
-    session$sendCustomMessage("toggleReceiptNav", list(show = FALSE))
-    updateTabsetPanel(session, "main_nav", selected = "Day Pass")
-  }, ignoreInit = TRUE)
+observeEvent(input$receipt_clear, {
+  receipt_tx(NULL)
+  session$sendCustomMessage("toggleReceiptNav", list(show = FALSE))
+  updateTabsetPanel(session, "main_nav", selected = "Day Pass")
+}, ignoreInit = TRUE)
 
-  receipt_status_class <- function(st) {
-    st <- toupper(trimws(st %||% ""))
-    if (st %in% c("COMPLETED", "SANDBOX_TEST_OK")) return("receipt-ok")
-    if (st %in% c("FAILED")) return("receipt-bad")
-    "receipt-neutral"
+receipt_status_class <- function(st) {
+  st <- toupper(trimws(st %||% ""))
+  if (st %in% c("COMPLETED", "SANDBOX_TEST_OK")) return("receipt-ok")
+  if (st %in% c("FAILED")) return("receipt-bad")
+  "receipt-neutral"
+}
+
+receipt_status_title <- function(st) {
+  st <- toupper(trimws(st %||% ""))
+  if (st %in% c("COMPLETED")) return("COMPLETED")
+  if (st %in% c("SANDBOX_TEST_OK")) return("SANDBOX TEST OK")
+  if (st %in% c("FAILED")) return("FAILED")
+  if (st %in% c("PENDING", "PENDING_SANDBOX", "UNKNOWN", "")) return("PENDING")
+  st
+}
+
+safe_money <- function(cents, currency = "CAD") {
+  cents <- suppressWarnings(as.integer(cents))
+  if (is.na(cents)) return(paste0(currency, " ", "N/A"))
+  paste0("$", sprintf("%.2f", cents / 100))
+}
+
+receipt_url_for_token <- function(token) {
+  if (!nzchar(token %||% "")) return("")
+
+  if (!is.na(RETURN_BASE_URL) && nzchar(RETURN_BASE_URL)) {
+    return(paste0(RETURN_BASE_URL, "/?receipt=", token))
   }
 
-  receipt_status_title <- function(st) {
-    st <- toupper(trimws(st %||% ""))
-    if (st %in% c("COMPLETED")) return("COMPLETED")
-    if (st %in% c("SANDBOX_TEST_OK")) return("SANDBOX TEST OK")
-    if (st %in% c("FAILED")) return("FAILED")
-    if (st %in% c("PENDING", "PENDING_SANDBOX", "UNKNOWN", "")) return("PENDING")
-    st
-  }
+  base <- session$clientData$url_protocol %||% ""
+  host <- session$clientData$url_hostname %||% ""
+  port <- session$clientData$url_port %||% ""
+  path <- session$clientData$url_pathname %||% "/"
 
-  safe_money <- function(cents, currency = "CAD") {
-    cents <- suppressWarnings(as.integer(cents))
-    if (is.na(cents)) return(paste0(currency, " ", "N/A"))
-    paste0("$", sprintf("%.2f", cents / 100))
-  }
+  if (nzchar(port)) host <- paste0(host, ":", port)
 
-  receipt_url_for_token <- function(token) {
-    if (!nzchar(token %||% "")) return("")
-    if (!is.na(RETURN_BASE_URL) && nzchar(RETURN_BASE_URL)) {
-      paste0(RETURN_BASE_URL, "/?receipt=", token)
-    } else {
-      base <- session$clientData$url_protocol %||% ""
-      host <- session$clientData$url_hostname %||% ""
-      port <- session$clientData$url_port %||% ""
-      path <- session$clientData$url_pathname %||% "/"
-      if (nzchar(port)) host <- paste0(host, ":", port)
-      paste0(base, "//", host, path, "?receipt=", token)
-    }
-  }
+  paste0(base, "//", host, path, "?receipt=", token)
+}
 
 output$receipt_qr <- renderImage({
-
   tx <- receipt_tx()
   if (is.null(tx) || nrow(tx) != 1) return(NULL)
 
@@ -3150,18 +3198,40 @@ output$receipt_qr <- renderImage({
   token <- as.character(tx$receipt_token[1] %||% "")
   if (!nzchar(token)) return(NULL)
 
+  # Reuse cached QR file if still valid
+  if (identical(rv$receipt_qr_token, token) &&
+      nzchar(rv$receipt_qr_file) &&
+      file.exists(rv$receipt_qr_file)) {
+    return(list(
+      src = rv$receipt_qr_file,
+      contentType = "image/png",
+      width = 220,
+      height = 220,
+      alt = "Receipt QR"
+    ))
+  }
+
   url <- receipt_url_for_token(token)
   if (!nzchar(url)) return(NULL)
 
-  tf <- tempfile(fileext = ".png")
+  # Clean up any previous cached file
+  if (nzchar(rv$receipt_qr_file) && file.exists(rv$receipt_qr_file)) {
+    try(unlink(rv$receipt_qr_file), silent = TRUE)
+  }
 
+  tf <- tempfile(fileext = ".png")
   qr <- qrcode::qr_code(url)
 
   grDevices::png(filename = tf, width = 360, height = 360)
   op <- par(mar = c(0, 0, 0, 0))
-  on.exit({ par(op); grDevices::dev.off() }, add = TRUE)
-
+  on.exit({
+    par(op)
+    grDevices::dev.off()
+  }, add = TRUE)
   plot(qr)
+
+  rv$receipt_qr_token <- token
+  rv$receipt_qr_file  <- tf
 
   list(
     src = tf,
@@ -3170,141 +3240,148 @@ output$receipt_qr <- renderImage({
     height = 220,
     alt = "Receipt QR"
   )
+}, deleteFile = FALSE)
 
-}, deleteFile = TRUE)
+output$receipt_items <- renderUI({
+  tx <- receipt_tx()
+  if (is.null(tx) || nrow(tx) != 1) return(NULL)
 
-  output$receipt_items <- renderUI({
-    tx <- receipt_tx()
-    if (is.null(tx) || nrow(tx) != 1) return(NULL)
+  cart_df <- receipt_cart_df()
+  if (is.null(cart_df) || nrow(cart_df) == 0) return(tags$div("No cart details."))
 
-    cart_df <- tryCatch(jsonlite::fromJSON(tx$cart_json[1] %||% ""), error = function(e) NULL)
-    if (is.null(cart_df) || nrow(cart_df) == 0) return(tags$div("No cart details."))
-    if (!all(c("category", "description", "quantity", "unit_price", "meta_json") %in% names(cart_df))) {
-      return(tags$div("Cart format is missing expected fields."))
-    }
+  need_cols <- c("category", "description", "quantity", "unit_price", "meta_json")
+  if (!all(need_cols %in% names(cart_df))) {
+    return(tags$div("Cart format is missing expected fields."))
+  }
 
-    cart_df$line_total <- suppressWarnings(as.numeric(cart_df$quantity) * as.numeric(cart_df$unit_price))
+  cart_df$line_total <- suppressWarnings(as.numeric(cart_df$quantity) * as.numeric(cart_df$unit_price))
 
-    tagList(
-      tags$h4("Items"),
-      tags$table(
-        class = "table table-condensed",
-        tags$thead(
+  tagList(
+    tags$h4("Items"),
+    tags$table(
+      class = "table table-condensed",
+      tags$thead(
+        tags$tr(
+          tags$th("Description"),
+          tags$th("Qty"),
+          tags$th("Unit"),
+          tags$th("Line total")
+        )
+      ),
+      tags$tbody(
+        lapply(seq_len(nrow(cart_df)), function(i) {
           tags$tr(
-            tags$th("Description"),
-            tags$th("Qty"),
-            tags$th("Unit"),
-            tags$th("Line total")
+            tags$td(line_item_label(cart_df$category[i], cart_df$description[i], cart_df$meta_json[i])),
+            tags$td(as.integer(cart_df$quantity[i] %||% 0)),
+            tags$td(paste0("$", sprintf("%.2f", as.numeric(cart_df$unit_price[i] %||% 0)))),
+            tags$td(paste0("$", sprintf("%.2f", as.numeric(cart_df$line_total[i] %||% 0))))
           )
-        ),
-        tags$tbody(
-          lapply(seq_len(nrow(cart_df)), function(i) {
-            tags$tr(
-              tags$td(line_item_label(cart_df$category[i], cart_df$description[i], cart_df$meta_json[i])),
-              tags$td(as.integer(cart_df$quantity[i] %||% 0)),
-              tags$td(paste0("$", sprintf("%.2f", as.numeric(cart_df$unit_price[i] %||% 0)))),
-              tags$td(paste0("$", sprintf("%.2f", as.numeric(cart_df$line_total[i] %||% 0))))
-            )
-          })
-        )
+        })
       )
     )
-  })
+  )
+})
 
-  output$receipt_panel <- renderUI({
-    tx <- receipt_tx()
-    if (is.null(tx) || nrow(tx) != 1) {
-      return(tagList(
-        tags$div(class="receipt-card receipt-neutral",
-                 tags$div(class="receipt-title","No receipt loaded"),
-                 tags$div(class="receipt-sub","If you have a receipt token, open: /?receipt=YOUR_TOKEN")
-        ),
-        br(),
-        textInput("receipt_lookup_token", "Lookup receipt token", value = ""),
-        actionButton("receipt_lookup_btn", "Load receipt")
-      ))
-    }
-
-    st <- as.character(tx$status[1] %||% "")
-    cls <- receipt_status_class(st)
-    ttl <- receipt_status_title(st)
-
-    is_final_ok <- toupper(trimws(st %||% "")) %in% c("COMPLETED","SANDBOX_TEST_OK")
-
-    token <- as.character(tx$receipt_token[1] %||% "")
-    ord   <- as.character(tx$square_order_id[1] %||% "")
-    chk   <- as.character(tx$square_checkout_id[1] %||% "")
-
-    buyer_nm <- trimws(as.character(tx$buyer_name[1] %||% ""))
-    thank_you_line <- if (nzchar(buyer_nm)) {
-      paste0("Thank you ", buyer_nm, " for supporting the Bulkley Valley Cross Country Ski Club.")
-    } else {
-      "Thank you for supporting the Bulkley Valley Cross Country Ski Club."
-    }
-
-    polling_note <- if (!is_final_ok) {
-      tags$span(
-        tags$span(class="receipt-spinner"),
-        " Payment not confirmed yet. Do not accept this screen as proof of payment."
-      )
-    } else NULL
-
-    tagList(
+output$receipt_panel <- renderUI({
+  tx <- receipt_tx()
+  if (is.null(tx) || nrow(tx) != 1) {
+    return(tagList(
       tags$div(
-        class = paste("receipt-card", cls),
-        tags$div(class="receipt-title", ttl),
-        tags$div(class="receipt-sub", thank_you_line),
-        tags$div(class="receipt-sub", polling_note),
-        tags$div(style="margin-top:10px;",
-                 tags$div(tags$strong("Date: "), as.character(tx$created_at[1] %||% "")),
-                 tags$div(tags$strong("Name: "), as.character(tx$buyer_name[1] %||% "")),
-                 tags$div(tags$strong("Email: "), as.character(tx$buyer_email[1] %||% "")),
-                 tags$div(tags$strong("Total: "), safe_money(tx$total_amount_cents[1] %||% NA_integer_, tx$currency[1] %||% "CAD")),
-                 tags$div(tags$strong("Receipt token: "), token),
-                 if (nzchar(ord)) tags$div(tags$strong("Square order id: "), ord) else NULL,
-                 if (nzchar(chk)) tags$div(tags$strong("Square checkout id: "), chk) else NULL
-        )
+        class = "receipt-card receipt-neutral",
+        tags$div(class = "receipt-title", "No receipt loaded"),
+        tags$div(class = "receipt-sub", "If you have a receipt token, open: /?receipt=YOUR_TOKEN")
       ),
       br(),
-      fluidRow(
-        column(
-          4,
-          tags$h4("Receipt QR"),
-          if (is_final_ok) {
-            tagList(
-              imageOutput("receipt_qr"),
-              tags$div(
-                style="margin-top:8px; color:#666; font-size:0.95em;",
-                "Scan to reload this receipt status."
-              )
-            )
-          } else {
-            tags$div(
-              style="color:#666;",
-              "QR is available only after payment is confirmed."
-            )
-          }
-        ),
-        column(8, uiOutput("receipt_items"))
-      ),
-      br(),
-      actionButton("receipt_refresh", "Refresh status"),
-      actionButton("receipt_clear", "Clear receipt")
-    )
-  })
+      textInput("receipt_lookup_token", "Lookup receipt token", value = ""),
+      actionButton("receipt_lookup_btn", "Load receipt")
+    ))
+  }
 
-  observeEvent(input$receipt_lookup_btn, {
-    token <- trimws(input$receipt_lookup_token %||% "")
-    if (!nzchar(token)) return()
-    tx <- load_receipt_token(token)
-    if (is.null(tx)) {
-      showNotification("Receipt token not found.", type = "error")
-      return()
-    }
-    receipt_tx(tx)
-    poll_count(0L)
-    updateTabsetPanel(session, "main_nav", selected = "Receipt")
-  }, ignoreInit = TRUE)
+  st  <- as.character(tx$status[1] %||% "")
+  cls <- receipt_status_class(st)
+  ttl <- receipt_status_title(st)
+
+  is_final_ok <- toupper(trimws(st %||% "")) %in% c("COMPLETED", "SANDBOX_TEST_OK")
+
+  token <- as.character(tx$receipt_token[1] %||% "")
+  ord   <- as.character(tx$square_order_id[1] %||% "")
+  chk   <- as.character(tx$square_checkout_id[1] %||% "")
+
+  buyer_nm <- trimws(as.character(tx$buyer_name[1] %||% ""))
+  thank_you_line <- if (nzchar(buyer_nm)) {
+    paste0("Thank you ", buyer_nm, " for supporting the Bulkley Valley Cross Country Ski Club.")
+  } else {
+    "Thank you for supporting the Bulkley Valley Cross Country Ski Club."
+  }
+
+  polling_note <- if (!is_final_ok) {
+    tags$span(
+      tags$span(class = "receipt-spinner"),
+      " Payment not confirmed yet. Do not accept this screen as proof of payment."
+    )
+  } else {
+    NULL
+  }
+
+  tagList(
+    tags$div(
+      class = paste("receipt-card", cls),
+      tags$div(class = "receipt-title", ttl),
+      tags$div(class = "receipt-sub", thank_you_line),
+      tags$div(class = "receipt-sub", polling_note),
+      tags$div(
+        style = "margin-top:10px;",
+        tags$div(tags$strong("Date: "),  as.character(tx$created_at[1] %||% "")),
+        tags$div(tags$strong("Name: "),  as.character(tx$buyer_name[1] %||% "")),
+        tags$div(tags$strong("Email: "), as.character(tx$buyer_email[1] %||% "")),
+        tags$div(tags$strong("Total: "), safe_money(
+          tx$total_amount_cents[1] %||% NA_integer_,
+          tx$currency[1] %||% "CAD"
+        )),
+        tags$div(tags$strong("Receipt token: "), token),
+        if (nzchar(ord)) tags$div(tags$strong("Square order id: "), ord) else NULL,
+        if (nzchar(chk)) tags$div(tags$strong("Square checkout id: "), chk) else NULL
+      )
+    ),
+    br(),
+    fluidRow(
+      column(
+        4,
+        tags$h4("Receipt QR"),
+        if (is_final_ok) {
+          tagList(
+            imageOutput("receipt_qr"),
+            tags$div(
+              style = "margin-top:8px; color:#666; font-size:0.95em;",
+              "Scan to reload this receipt status."
+            )
+          )
+        } else {
+          tags$div(style = "color:#666;", "QR is available only after payment is confirmed.")
+        }
+      ),
+      column(8, uiOutput("receipt_items"))
+    ),
+    br(),
+    actionButton("receipt_refresh", "Refresh status"),
+    actionButton("receipt_clear",   "Clear receipt")
+  )
+})
+
+observeEvent(input$receipt_lookup_btn, {
+  token <- trimws(input$receipt_lookup_token %||% "")
+  if (!nzchar(token)) return()
+
+  tx <- load_receipt_token(token)
+  if (is.null(tx)) {
+    showNotification("Receipt token not found.", type = "error")
+    return()
+  }
+
+  receipt_tx(tx)
+  poll_count(0L)
+  updateTabsetPanel(session, "main_nav", selected = "Receipt")
+}, ignoreInit = TRUE)
 
 # -----------------------------------------------------------------------------
 # ADMIN: Prices / Config
@@ -3340,18 +3417,38 @@ output$admin_prices_ui <- renderUI({
   tagList(
     h3("Prices / Config"),
 
-    panel("Early-bird + Global limits",
-      dateInput("admin_cfg_early_bird_cutoff", "Early-bird cutoff (YYYY-MM-DD)",
-                value = cfg_date("early_bird_cutoff", Sys.Date())),
-      fluidRow(
-        column(6, numericInput("admin_cfg_limit_max_total_cad", "Max total (CAD) — blank/NA = no limit",
-                               value = cfg_num("limit_max_total_cad", NA_real_), min = 0, step = 10)),
-        column(6, numericInput("admin_cfg_limit_max_items_total", "Max items — blank/NA = no limit",
-                               value = cfg_int("limit_max_items_total", NA_integer_), min = 0, step = 1))
+panel(
+  "Early-bird + Global limits",
+  dateInput(
+    "admin_cfg_early_bird_cutoff",
+    "Early-bird cutoff (YYYY-MM-DD)",
+    value = cfg_date("early_bird_cutoff", Sys.Date())
+  ),
+  fluidRow(
+    column(
+      6,
+      numericInput(
+        "admin_cfg_limit_max_total_cad",
+        "Max total — blank/NA = no limit",
+        value = cfg_num("limit_max_total_cad", NA_real_),
+        min = 0,
+        step = 10
       )
     ),
+    column(
+      6,
+      numericInput(
+        "admin_cfg_limit_max_items_total",
+        "Max items — blank/NA = no limit",
+        value = cfg_int("limit_max_items_total", NA_integer_),
+        min = 0,
+        step = 1
+      )
+    )
+  )
+),
 
-    panel("Day pass prices (CAD)",
+    panel("Day pass prices",
       fluidRow(
         column(3, numericInput("admin_price_day_adult",   "Adult",   value = cfg_num("price_day_adult", NA_real_),   min = 0, step = 1)),
         column(3, numericInput("admin_price_day_youth",   "Youth",   value = cfg_num("price_day_youth", NA_real_),   min = 0, step = 1)),
@@ -3360,20 +3457,20 @@ output$admin_prices_ui <- renderUI({
       )
     ),
 
-    panel("Christmas pass (CAD)",
+    panel("Christmas pass",
       numericInput("admin_price_christmas_pass", "Christmas pass price",
                    value = cfg_num("price_christmas_pass", NA_real_), min = 0, step = 1)
     ),
 
-    panel("Season pass prices (CAD)",
+    panel("Season pass prices",
       fluidRow(
         column(6, h4("Early-bird"),
-               numericInput("admin_price_season_eb_adult", "Adult (EB)", value = cfg_num("price_season_eb_adult", NA_real_), min = 0, step = 1),
-               numericInput("admin_price_season_eb_youth", "Youth (EB)", value = cfg_num("price_season_eb_youth", NA_real_), min = 0, step = 1)
+               numericInput("admin_price_season_eb_adult", "Adult", value = cfg_num("price_season_eb_adult", NA_real_), min = 0, step = 1),
+               numericInput("admin_price_season_eb_youth", "Youth", value = cfg_num("price_season_eb_youth", NA_real_), min = 0, step = 1)
         ),
         column(6, h4("Regular"),
-               numericInput("admin_price_season_reg_adult", "Adult (REG)", value = cfg_num("price_season_reg_adult", NA_real_), min = 0, step = 1),
-               numericInput("admin_price_season_reg_youth", "Youth (REG)", value = cfg_num("price_season_reg_youth", NA_real_), min = 0, step = 1)
+               numericInput("admin_price_season_reg_adult", "Adult", value = cfg_num("price_season_reg_adult", NA_real_), min = 0, step = 1),
+               numericInput("admin_price_season_reg_youth", "Youth", value = cfg_num("price_season_reg_youth", NA_real_), min = 0, step = 1)
         )
       )
     ),
@@ -3385,7 +3482,7 @@ output$admin_prices_ui <- renderUI({
         r <- prog[i, , drop = FALSE]
         fluidRow(
           column(5, tags$strong(r$name[1])),
-          column(3, numericInput(paste0("admin_prog_price_", r$id[1]), "Price (CAD)",
+          column(3, numericInput(paste0("admin_prog_price_", r$id[1]), "Price",
                                  value = cfg_num(r$price_key[1], NA_real_), min = 0, step = 1)),
           column(4, textInput(paste0("admin_prog_cap_", r$id[1]), "Capacity (blank = unlimited)",
                               value = { v <- cfg_get(r$cap_key[1], ""); if (!nzchar(v)) "" else v }))
@@ -3559,7 +3656,7 @@ output$admin_events_ui <- renderUI({
     selectInput("admin_event_pick", "Select event", choices = choices, selected = "NEW"),
     textInput("admin_event_name", "Event name", value = ""),
     dateInput("admin_event_date", "Event date", value = Sys.Date()),
-    numericInput("admin_event_price", "Price (CAD)", value = NA_real_, min = 0, step = 1),
+    numericInput("admin_event_price", "Price", value = NA_real_, min = 0, step = 1),
     textInput("admin_event_capacity", "Capacity (blank = unlimited)", value = ""),
     checkboxInput("admin_event_enabled", "Enabled", value = TRUE),
     actionButton("admin_event_save", "Save / Update"),
