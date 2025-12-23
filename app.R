@@ -2298,7 +2298,7 @@ observeEvent(session$clientData$url_search, {
 
   poll_count(0L)
   updateTabsetPanel(session, "main_nav", selected = "Receipt")
-}, ignoreInit = TRUE, once = TRUE)
+}, ignoreInit = FALSE)
 
 # -----------------------------------------------------------------------------
 # DAY PASS date UI
