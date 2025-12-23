@@ -1,6 +1,6 @@
 # app.R
 # BVXC – Passes, Programs, Events + Admin Controls (Square)
-# v6.3 – Age enforcement (Season + Programs), person details on Square line items + receipt items, meta-unique per person – 2025-12-19
+# v6.3 – 2025-12-23
 
 # ---- renv -------------------------------------------------------------------
 if (file.exists("renv/activate.R")) {
@@ -30,7 +30,7 @@ HAVE_DT <- requireNamespace("DT", quietly = TRUE)
 # -----------------------------------------------------------------------------
 
 Sys.setenv(TZ = "America/Vancouver")
-APP_VERSION <- "BVXC v6.3 – Age enforcement + receipt labels + meta-unique per person – 2025-12-19"
+APP_VERSION <- "BVXC v6.3 – Age enforcement + receipt labels + meta-unique per person – 2025-12-23"
 
 if (file.exists(".Renviron")) readRenviron(".Renviron")
 
@@ -547,7 +547,7 @@ cfg_date <- function(key, default = as.Date(NA)) {
 # BUSINESS DATA
 # -----------------------------------------------------------------------------
 
-get_early_bird_cutoff <- function() cfg_date("early_bird_cutoff", as.Date(NA))
+get_early_bird_cutoff <- function() cfg_date("early_bird_cutoff", EARLY_BIRD_CUTOFF)
 
 get_day_prices <- function() {
   data.frame(
@@ -586,35 +586,41 @@ get_season_prices <- function(is_early_bird = FALSE) {
 
 get_christmas_pass_price <- function() cfg_num("price_christmas_pass", NA_real_)
 
-program_catalog <- function() {
-  data.frame(
-    id = c(
-      "bunnies", "rabbits", "u10", "u12", "u14", "u16", "u18", "u20",
-      "biathlon_adp", "biathlon_rifle_rental_adp", "biathlon_youth_intro",
-      "masters_2x", "masters_1x", "biathlon_masters", "biathlon_masters_rifle_rental"
-    ),
-    name = c(
-      "Bunnies", "Rabbits", "U10", "U12", "U14", "U16", "U18", "U20",
-      "Biathlon ADP", "Biathlon Rifle Rental ADP", "Biathlon Youth Intro",
-      "Masters 2X", "Masters 1X", "Biathlon Masters", "Biathlon Masters Rifle Rental"
-    ),
-    price_key = c(
-      "price_program_bunnies", "price_program_rabbits", "price_program_u10", "price_program_u12",
-      "price_program_u14", "price_program_u16", "price_program_u18", "price_program_u20",
-      "price_program_biathlon_adp", "price_program_biathlon_rifle_rental_adp", "price_program_biathlon_youth_intro",
-      "price_program_masters_2x", "price_program_masters_1x", "price_program_biathlon_masters", "price_program_biathlon_masters_rifle_rental"
-    ),
-    cap_key = c(
-      "cap_program_bunnies", "cap_program_rabbits", "cap_program_u10", "cap_program_u12",
-      "cap_program_u14", "cap_program_u16", "cap_program_u18", "cap_program_u20",
-      "cap_program_biathlon_adp", "cap_program_biathlon_rifle_rental_adp", "cap_program_biathlon_youth_intro",
-      "cap_program_masters_2x", "cap_program_masters_1x", "cap_program_biathlon_masters", "cap_program_biathlon_masters_rifle_rental"
-    ),
-    stringsAsFactors = FALSE
-  )
-}
+PROGRAM_CATALOG <- data.frame(
+  id = c(
+    "bunnies", "rabbits", "u10", "u12", "u14", "u16", "u18", "u20",
+    "biathlon_adp", "biathlon_rifle_rental_adp", "biathlon_youth_intro",
+    "masters_2x", "masters_1x", "biathlon_masters", "biathlon_masters_rifle_rental"
+  ),
+  name = c(
+    "Bunnies", "Rabbits", "U10", "U12", "U14", "U16", "U18", "U20",
+    "Biathlon ADP", "Biathlon Rifle Rental ADP", "Biathlon Youth Intro",
+    "Masters 2X", "Masters 1X", "Biathlon Masters", "Biathlon Masters Rifle Rental"
+  ),
+  price_key = c(
+    "price_program_bunnies", "price_program_rabbits", "price_program_u10", "price_program_u12",
+    "price_program_u14", "price_program_u16", "price_program_u18", "price_program_u20",
+    "price_program_biathlon_adp", "price_program_biathlon_rifle_rental_adp", "price_program_biathlon_youth_intro",
+    "price_program_masters_2x", "price_program_masters_1x", "price_program_biathlon_masters", "price_program_biathlon_masters_rifle_rental"
+  ),
+  cap_key = c(
+    "cap_program_bunnies", "cap_program_rabbits", "cap_program_u10", "cap_program_u12",
+    "cap_program_u14", "cap_program_u16", "cap_program_u18", "cap_program_u20",
+    "cap_program_biathlon_adp", "cap_program_biathlon_rifle_rental_adp", "cap_program_biathlon_youth_intro",
+    "cap_program_masters_2x", "cap_program_masters_1x", "cap_program_biathlon_masters", "cap_program_biathlon_masters_rifle_rental"
+  ),
+  stringsAsFactors = FALSE
+)
+
+program_catalog <- function() PROGRAM_CATALOG
 
 get_program_list <- function() {
+
+  # Warm config cache first (prevents repeated DB reads when cfg_num/cfg_int are called many times)
+  if (exists("cfg_refresh_cache", mode = "function")) {
+    cfg_refresh_cache(force = FALSE)
+  }
+
   cat <- program_catalog()
   cat$price <- vapply(cat$price_key, function(k) cfg_num(k, NA_real_), numeric(1))
   cat$capacity <- vapply(cat$cap_key, function(k) cfg_int(k, NA_integer_), integer(1))
@@ -1099,23 +1105,25 @@ server <- function(input, output, session) {
 
     receipt_qr_token = "",
     receipt_qr_file  = ""
-
   )
 
-# ---- tiny cache so reactivePoll doesn't hit DB twice every interval ----
-CFG_UPDATED_CACHE <- new.env(parent = emptyenv())
-CFG_UPDATED_CACHE$val <- ""
-CFG_UPDATED_CACHE$t   <- as.POSIXct(0, origin = "1970-01-01")
+# One-time DB maintenance: ensure tx_items is backfilled (safe to run repeatedly)
+try(ensure_tx_items_backfill_completed(), silent = TRUE)
 
-cfg_get_updated_at_cached <- function(ttl_secs = 1) {
-  age <- as.numeric(difftime(Sys.time(), CFG_UPDATED_CACHE$t, units = "secs"))
-  if (!is.na(age) && age <= ttl_secs) return(CFG_UPDATED_CACHE$val)
+  # ---- tiny cache so reactivePoll doesn't hit DB twice every interval ----
+  CFG_UPDATED_CACHE <- new.env(parent = emptyenv())
+  CFG_UPDATED_CACHE$val <- ""
+  CFG_UPDATED_CACHE$t   <- as.POSIXct(0, origin = "1970-01-01")
 
-  v <- cfg_get_db("__config_updated_at", "")
-  CFG_UPDATED_CACHE$val <- as.character(v %||% "")
-  CFG_UPDATED_CACHE$t   <- Sys.time()
-  CFG_UPDATED_CACHE$val
-}
+  cfg_get_updated_at_cached <- function(ttl_secs = 1) {
+    age <- as.numeric(difftime(Sys.time(), CFG_UPDATED_CACHE$t, units = "secs"))
+    if (!is.na(age) && age <= ttl_secs) return(CFG_UPDATED_CACHE$val)
+
+    v <- cfg_get_db("__config_updated_at", "")
+    CFG_UPDATED_CACHE$val <- as.character(v %||% "")
+    CFG_UPDATED_CACHE$t   <- Sys.time()
+    CFG_UPDATED_CACHE$val
+  }
 
   # -----------------------------------------------------------------------------
   # CONFIG REACTIVITY: re-render nav when config changes
@@ -1124,8 +1132,8 @@ cfg_get_updated_at_cached <- function(ttl_secs = 1) {
 config_updated_at <- reactivePoll(
   intervalMillis = 60000,
   session        = session,
-  checkFunc      = function() cfg_get_db("__config_updated_at", ""),
-  valueFunc      = function() cfg_get_db("__config_updated_at", "")
+  checkFunc      = function() cfg_get_updated_at_cached(1),
+  valueFunc      = function() cfg_get_updated_at_cached(1)
 )
 
   # Run once after the UI is ready: disable autofill on buyer fields
@@ -1711,51 +1719,126 @@ event_sold_qty_completed <- function(event_id) {
   if (is.na(sold)) 0L else sold
 }
 
-  validate_event_capacities_for_cart <- function(cart_df) {
-    if (is.null(cart_df) || nrow(cart_df) == 0) return(NULL)
+# -----------------------------------------------------------------------------
+# PERF: Batch helpers for capacity checks (1 DB round-trip for caps + sold)
+# -----------------------------------------------------------------------------
 
-    ix <- which(cart_df$category == "event")
-    if (length(ix) == 0) return(NULL)
+sql_in_clause <- function(con, ids) {
+  ids <- unique(as.character(ids))
+  ids <- ids[nzchar(ids)]
+  if (length(ids) == 0) return("(NULL)")
+  paste0("(", paste(DBI::dbQuoteString(con, ids), collapse = ","), ")")
+}
 
-    req_by_event <- list()
-    for (i in ix) {
-      eid <- parse_event_id_from_meta(cart_df$meta_json[i] %||% "")
-      if (!nzchar(eid)) next
-      req_by_event[[eid]] <- (req_by_event[[eid]] %||% 0L) + as.integer(cart_df$quantity[i] %||% 0L)
-    }
-    if (length(req_by_event) == 0) return(NULL)
+batch_event_caps_and_sold <- function(event_ids) {
+  event_ids <- unique(as.character(event_ids))
+  event_ids <- event_ids[nzchar(event_ids)]
+  if (length(event_ids) == 0) return(list(caps = data.frame(), sold = data.frame()))
 
-    for (eid in names(req_by_event)) {
-      cap_row <- db_get1(
-        "SELECT capacity, name, event_date
+  with_db(function(con) {
+    in_sql <- sql_in_clause(con, event_ids)
+
+    caps <- DBI::dbGetQuery(
+      con,
+      paste0(
+        "SELECT id, capacity, name, event_date
          FROM special_events
-         WHERE id = ?id
-         LIMIT 1",
-        id = eid
+         WHERE id IN ", in_sql
       )
-      if (nrow(cap_row) != 1) next
+    )
 
-      cap <- suppressWarnings(as.integer(cap_row$capacity[1]))
-      if (is.na(cap)) next  # blank/NA capacity = unlimited
+    sold <- DBI::dbGetQuery(
+      con,
+      paste0(
+        "SELECT item_id, COALESCE(SUM(qty), 0) AS sold
+         FROM tx_items
+         WHERE category = 'event'
+           AND status IN ('COMPLETED','SANDBOX_TEST_OK')
+           AND item_id IN ", in_sql,
+        " GROUP BY item_id"
+      )
+    )
 
-      sold      <- event_sold_qty_completed(eid)
-      remaining <- cap - sold
-      requested <- as.integer(req_by_event[[eid]] %||% 0L)
+    list(caps = caps, sold = sold)
+  })
+}
 
-      if (remaining <= 0L) {
-        return(paste0("Event is sold out: ", cap_row$name[1], " (", cap_row$event_date[1], ")."))
-      }
-      if (requested > remaining) {
-        return(paste0(
-          "Not enough remaining capacity for event: ",
-          cap_row$name[1], " (", cap_row$event_date[1], "). ",
-          "Remaining: ", remaining, ", requested: ", requested, "."
-        ))
-      }
-    }
+batch_program_sold <- function(program_ids) {
+  program_ids <- unique(as.character(program_ids))
+  program_ids <- program_ids[nzchar(program_ids)]
+  if (length(program_ids) == 0) return(data.frame(item_id = character(), sold = integer()))
 
-    NULL
+  with_db(function(con) {
+    in_sql <- sql_in_clause(con, program_ids)
+
+    DBI::dbGetQuery(
+      con,
+      paste0(
+        "SELECT item_id, COALESCE(SUM(qty), 0) AS sold
+         FROM tx_items
+         WHERE category = 'program'
+           AND status IN ('COMPLETED','SANDBOX_TEST_OK')
+           AND item_id IN ", in_sql,
+        " GROUP BY item_id"
+      )
+    )
+  })
+}
+
+validate_event_capacities_for_cart <- function(cart_df) {
+  if (is.null(cart_df) || nrow(cart_df) == 0) return(NULL)
+
+  ix <- which(cart_df$category == "event")
+  if (length(ix) == 0) return(NULL)
+
+  # requested qty per event_id
+  req_by_event <- list()
+  for (i in ix) {
+    eid <- parse_event_id_from_meta(cart_df$meta_json[i] %||% "")
+    if (!nzchar(eid)) next
+    req_by_event[[eid]] <- (req_by_event[[eid]] %||% 0L) + as.integer(cart_df$quantity[i] %||% 0L)
   }
+  if (length(req_by_event) == 0) return(NULL)
+
+  event_ids <- names(req_by_event)
+
+  snap <- batch_event_caps_and_sold(event_ids)
+  caps <- snap$caps
+  sold <- snap$sold
+
+  # sold lookup map
+  sold_map <- integer()
+  if (nrow(sold) > 0) {
+    sold_map <- setNames(as.integer(sold$sold), as.character(sold$item_id))
+  }
+
+  for (eid in event_ids) {
+    cap_row <- caps[caps$id == eid, , drop = FALSE]
+    if (nrow(cap_row) != 1) next
+
+    cap <- suppressWarnings(as.integer(cap_row$capacity[1]))
+    if (is.na(cap)) next  # NA capacity = unlimited
+
+    sold_i <- sold_map[[eid]]
+    if (is.null(sold_i) || is.na(sold_i)) sold_i <- 0L
+
+    remaining <- cap - sold_i
+    requested <- as.integer(req_by_event[[eid]] %||% 0L)
+
+    if (remaining <= 0L) {
+      return(paste0("Event is sold out: ", cap_row$name[1], " (", cap_row$event_date[1], ")."))
+    }
+    if (requested > remaining) {
+      return(paste0(
+        "Not enough remaining capacity for event: ",
+        cap_row$name[1], " (", cap_row$event_date[1], "). ",
+        "Remaining: ", remaining, ", requested: ", requested, "."
+      ))
+    }
+  }
+
+  NULL
+}
 
   # -----------------------------------------------------------------------------
   # PROGRAM CAPACITY ENFORCEMENT
@@ -1801,44 +1884,63 @@ program_sold_qty_completed <- function(program_id) {
   if (is.na(sold)) 0L else sold
 }
 
-  validate_program_capacities_for_cart <- function(cart_df) {
-    if (is.null(cart_df) || nrow(cart_df) == 0) return(NULL)
+validate_program_capacities_for_cart <- function(cart_df) {
+  if (is.null(cart_df) || nrow(cart_df) == 0) return(NULL)
 
-    ix <- which(cart_df$category == "program")
-    if (length(ix) == 0) return(NULL)
+  ix <- which(cart_df$category == "program")
+  if (length(ix) == 0) return(NULL)
 
-    req_by_program <- list()
-    for (i in ix) {
-      pid <- parse_program_id_from_meta(cart_df$meta_json[i] %||% "")
-      if (!nzchar(pid)) next
-      req_by_program[[pid]] <- (req_by_program[[pid]] %||% 0L) + as.integer(cart_df$quantity[i] %||% 0L)
-    }
-    if (length(req_by_program) == 0) return(NULL)
-
-    prog <- get_program_list()
-
-    for (pid in names(req_by_program)) {
-      row <- prog[prog$id == pid, , drop = FALSE]
-      if (nrow(row) != 1) next
-
-      cap <- suppressWarnings(as.integer(row$capacity[1]))
-      if (is.na(cap)) next
-
-      sold      <- program_sold_qty_completed(pid)
-      remaining <- cap - sold
-      requested <- as.integer(req_by_program[[pid]] %||% 0L)
-
-      if (remaining <= 0L) {
-        return(paste0("Program is full: ", row$name[1], "."))
-      }
-      if (requested > remaining) {
-        return(paste0("Not enough remaining capacity for program: ", row$name[1],
-                      ". Remaining: ", remaining, ", requested: ", requested, "."))
-      }
-    }
-
-    NULL
+  # requested qty per program_id
+  req_by_program <- list()
+  for (i in ix) {
+    pid <- parse_program_id_from_meta(cart_df$meta_json[i] %||% "")
+    if (!nzchar(pid)) next
+    req_by_program[[pid]] <- (req_by_program[[pid]] %||% 0L) + as.integer(cart_df$quantity[i] %||% 0L)
   }
+  if (length(req_by_program) == 0) return(NULL)
+
+  program_ids <- names(req_by_program)
+
+  # program caps come from config (cached), so fetch once
+  prog <- get_program_list()
+  prog_sub <- prog[prog$id %in% program_ids, , drop = FALSE]
+
+  # sold counts: 1 query total
+  sold_df <- batch_program_sold(program_ids)
+
+  sold_map <- integer()
+  if (nrow(sold_df) > 0) {
+    sold_map <- setNames(as.integer(sold_df$sold), as.character(sold_df$item_id))
+  }
+
+  for (pid in program_ids) {
+    row <- prog_sub[prog_sub$id == pid, , drop = FALSE]
+    if (nrow(row) != 1) next
+
+    cap <- suppressWarnings(as.integer(row$capacity[1]))
+    if (is.na(cap)) next  # NA capacity = unlimited
+
+    sold_i <- sold_map[[pid]]
+    if (is.null(sold_i) || is.na(sold_i)) sold_i <- 0L
+
+    remaining <- cap - sold_i
+    requested <- as.integer(req_by_program[[pid]] %||% 0L)
+
+    if (remaining <= 0L) {
+      return(paste0("Program is full: ", row$name[1], "."))
+    }
+    if (requested > remaining) {
+      return(paste0(
+        "Not enough remaining capacity for program: ",
+        row$name[1],
+        ". Remaining: ", remaining,
+        ", requested: ", requested, "."
+      ))
+    }
+  }
+
+  NULL
+}
 
   # -----------------------------------------------------------------------------
   # RECEIPT LOAD / DB HELPERS
@@ -2223,7 +2325,10 @@ output$tab_season_ui <- renderUI({
 output$tab_prog_ui <- renderUI({
   req(identical(input$main_nav, "Programs"))
 
-  # IMPORTANT: compute program list only when Programs tab is opened
+  # Invalidate this UI when config changes (so program list/prices/caps refresh)
+  config_updated_at()
+
+  # Compute program list only when Programs tab is opened OR config changes
   prog <- get_program_list()
 
   fluidPage(
