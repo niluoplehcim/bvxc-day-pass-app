@@ -197,18 +197,31 @@ onStop(function() {
 })
 
 # -----------------------------------------------------------------------------
-# DB HELPERS (safe checkout/return; DO NOT swallow poolReturn errors)
+# DB HELPERS (robust checkout/return; force result before returning connection)
 # -----------------------------------------------------------------------------
 
 with_db <- function(fun) {
+  stopifnot(is.function(fun))
+
   con <- pool::poolCheckout(DB_POOL)
+  returned <- FALSE
 
   on.exit({
-    # Return the connection; if this fails, you WANT to see it.
-    pool::poolReturn(con)
-  }, add = TRUE)
+    if (!returned) {
+      pool::poolReturn(con)
+    }
+  }, add = FALSE)
 
-  fun(con)
+  res <- fun(con)
+
+  # Ensure nothing lazy still references `con`
+  force(res)
+
+  # Return immediately (don't rely only on on.exit)
+  pool::poolReturn(con)
+  returned <- TRUE
+
+  res
 }
 
 now_ts <- function() format(Sys.time(), "%Y-%m-%d %H:%M:%S")
@@ -216,8 +229,8 @@ now_ts <- function() format(Sys.time(), "%Y-%m-%d %H:%M:%S")
 db_get  <- function(con, sql, ...) DBI::dbGetQuery(con, DBI::sqlInterpolate(con, sql, ...))
 db_exec <- function(con, sql, ...) DBI::dbExecute(con, DBI::sqlInterpolate(con, sql, ...))
 
-db_get1  <- function(sql, ...)  with_db(function(con) db_get(con, sql, ...))
-db_exec1 <- function(sql, ...)  with_db(function(con) db_exec(con, sql, ...))
+db_get1  <- function(sql, ...) with_db(function(con) db_get(con, sql, ...))
+db_exec1 <- function(sql, ...) with_db(function(con) db_exec(con, sql, ...))
 
 # -----------------------------------------------------------------------------
 # ADMIN: Transactions helper (query)
@@ -547,7 +560,7 @@ cfg_date <- function(key, default = as.Date(NA)) {
 # BUSINESS DATA
 # -----------------------------------------------------------------------------
 
-get_early_bird_cutoff <- function() cfg_date("early_bird_cutoff", EARLY_BIRD_CUTOFF)
+get_early_bird_cutoff <- function() cfg_date("early_bird_cutoff", as.Date(NA))
 
 get_day_prices <- function() {
   data.frame(
