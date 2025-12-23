@@ -1067,7 +1067,7 @@ server <- function(input, output, session) {
 
     checkout_started = FALSE,
     checkout_token   = "",
-    checkout_lock    = FALSE,
+    checkout_lock    = FALSE
   )
 
   # -----------------------------------------------------------------------------
@@ -1140,6 +1140,8 @@ config_updated_at <- reactivePoll(
       admin_nonce(admin_nonce() + 1L)
     }
   }, ignoreInit = TRUE)
+
+
 
   output$admin_lock_msg <- renderUI({
     admin_nonce()
@@ -2041,261 +2043,266 @@ insert_tx_items_for_cart <- function(tx_id, created_at, status, cart_df) {
     last_valid_day_date(picked)
   }, ignoreInit = TRUE)
 
-  # -----------------------------------------------------------------------------
-  # DYNAMIC NAVBAR
-  # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# DYNAMIC NAVBAR (LAZY TAB BODIES)
+# -----------------------------------------------------------------------------
 
-  output$main_nav_ui <- renderUI({
-   config_updated_at()
-    tab_on <- function(key, default = TRUE) cfg_bool(key, default)
-    tabs <- list()
+output$main_nav_ui <- renderUI({
+  config_updated_at()
 
-    if (tab_on("tab_daypass_enabled", TRUE)) {
-      tabs <- c(tabs, list(
-        tabPanel(
-          title = "Day Pass",
-          value = "Day Pass",
-          fluidPage(
-            h3("Day Passes"),
-            tags$p(season_label(season_win())),
-            p("Choose your ski day and passes, then add to cart. Review and pay on the right."),
-            p(style="color:#666;", "Age buckets (not enforced for day passes): Child 0–8, Youth 9–18, Adult 19+."),
-            fluidRow(
-              column(
-                4,
-                uiOutput("day_date_ui"),
-                numericInput("day_adult",  "Adult",   value = 0, min = 0, step = 1),
-                numericInput("day_youth",  "Youth",   value = 0, min = 0, step = 1),
-                numericInput("day_under9", "Under 9", value = 0, min = 0, step = 1),
-                numericInput("day_family", "Family",  value = 0, min = 0, step = 1),
-                br(),
-                actionButton("day_add_to_cart", "Add to cart")
-              ),
-              column(8, checkout_panel_ui("day", "Checkout"))
-            )
-          )
-        )
-      ))
-    }
+  tab_on <- function(key, default = TRUE) cfg_bool(key, default)
+  tabs <- list()
 
-    if (tab_on("tab_christmas_enabled", TRUE)) {
-      tabs <- c(tabs, list(
-        tabPanel(
-          title = "Christmas Pass",
-          value = "Christmas Pass",
-          fluidPage(
-            h3("Christmas Pass"),
-            tags$p(season_label(season_win())),
-            p("Choose a 14-day window that must include Dec 25. Add to cart, then pay on the right."),
-            fluidRow(
-              column(
-                4,
-                dateInput("xmas_start", "Start date (14-day window)", value = Sys.Date()),
-                numericInput("xmas_qty", "Number of passes", value = 0, min = 0, step = 1),
-                br(),
-                actionButton("xmas_add_to_cart", "Add to cart")
-              ),
-              column(8, checkout_panel_ui("xmas", "Checkout"))
-            )
-          )
-        )
-      ))
-    }
+  if (tab_on("tab_daypass_enabled", TRUE)) {
+    tabs <- c(tabs, list(tabPanel("Day Pass", value = "Day Pass", uiOutput("tab_day_ui"))))
+  }
+  if (tab_on("tab_christmas_enabled", TRUE)) {
+    tabs <- c(tabs, list(tabPanel("Christmas Pass", value = "Christmas Pass", uiOutput("tab_xmas_ui"))))
+  }
+  if (tab_on("tab_season_enabled", TRUE)) {
+    tabs <- c(tabs, list(tabPanel("Season Pass", value = "Season Pass", uiOutput("tab_season_ui"))))
+  }
+  if (tab_on("tab_programs_enabled", TRUE)) {
+    tabs <- c(tabs, list(tabPanel("Programs", value = "Programs", uiOutput("tab_prog_ui"))))
+  }
+  if (tab_on("tab_events_enabled", TRUE)) {
+    tabs <- c(tabs, list(tabPanel("Special Events", value = "Special Events", uiOutput("tab_event_ui"))))
+  }
+  if (tab_on("tab_donation_enabled", TRUE)) {
+    tabs <- c(tabs, list(tabPanel("Donation", value = "Donation", uiOutput("tab_don_ui"))))
+  }
 
-    if (tab_on("tab_season_enabled", TRUE)) {
-      tabs <- c(tabs, list(
-        tabPanel(
-          title = "Season Pass",
-          value = "Season Pass",
-          fluidPage(
-            h3("Season Passes"),
-            uiOutput("season_info"),
-            tags$div(
-              style="margin:8px 0; padding:10px; border:1px solid #ddd; border-radius:6px; background:#fafafa;",
-              tags$strong("Age enforcement: "),
-              "Adult requires age 19+; Youth requires age 9–18 (age as-of Dec 31 of the season)."
-            ),
-            fluidRow(
-              column(
-                4,
-                numericInput("season_adult", "Adult", value = 0, min = 0, step = 1),
-                numericInput("season_youth", "Youth", value = 0, min = 0, step = 1),
-                uiOutput("season_people_ui"),
-                br(),
-                actionButton("season_add_to_cart", "Add to cart")
-              ),
-              column(8, checkout_panel_ui("season", "Checkout"))
-            )
-          )
-        )
-      ))
-    }
+  # Receipt + Admin always exist (Receipt nav item is hidden until we show it)
+  tabs <- c(tabs, list(tabPanel("Receipt", value = "Receipt", uiOutput("tab_receipt_ui"))))
+  tabs <- c(tabs, list(tabPanel("Admin",   value = "Admin",   uiOutput("tab_admin_ui"))))
 
-    if (tab_on("tab_programs_enabled", TRUE)) {
-      prog <- get_program_list()
-      tabs <- c(tabs, list(
-        tabPanel(
-          title = "Programs",
-          value = "Programs",
-          fluidPage(
-            h3("Programs"),
-            tags$div(
-              style="margin:8px 0; padding:10px; border:1px solid #ddd; border-radius:6px; background:#fafafa;",
-              tags$strong("Age rule: "),
-              "Program eligibility is checked using age as-of Dec 31 of the ski season."
-            ),
-            p("Select a program and number of participants, then add to cart. Review and pay on the right."),
-            fluidRow(
-              column(
-               4,
-               selectInput("program_choice", "Program", choices = setNames(prog$id, prog$name)),
-               numericInput("program_qty", "Number of participants", value = 0, min = 0, step = 1),
-               uiOutput("program_people_ui"),
-               br(),
-               actionButton("program_add_to_cart", "Add to cart")
-              ),
-              column(8, checkout_panel_ui("prog", "Checkout"))
-            )
-          )
-        )
-      ))
-    }
+  do.call(navbarPage, c(list(title = "BVXC", id = "main_nav"), tabs))
+})
 
-    if (tab_on("tab_events_enabled", TRUE)) {
-      tabs <- c(tabs, list(
-        tabPanel(
-          title = "Special Events",
-          value = "Special Events",
-          fluidPage(
-            h3("Special Events"),
-            p("Add one or more special event registrations to the cart. Review and pay on the right."),
-            fluidRow(
-              column(
-                4,
-                uiOutput("event_picker_ui"),
-                numericInput("event_qty", "Number of participants", value = 0, min = 0, step = 1),
-                br(),
-                actionButton("event_add_to_cart", "Add to cart")
-              ),
-              column(8, checkout_panel_ui("event", "Checkout"))
-            )
-          )
-        )
-      ))
-    }
+# Hide Receipt tab in the navbar by default (we only show it once a receipt exists)
+session$onFlushed(function() {
+  session$sendCustomMessage("toggleReceiptNav", list(show = FALSE))
+}, once = TRUE)
 
-    if (tab_on("tab_donation_enabled", TRUE)) {
-      tabs <- c(tabs, list(
-        tabPanel(
-          title = "Donation",
-          value = "Donation",
-          fluidPage(
-            h3("Donation"),
-            p("Add a donation to the cart and pay on the right."),
-            tags$div(
-              style = "margin-top: 8px; padding: 10px; border: 1px solid #ddd; border-radius: 6px; background: #fafafa;",
-              tags$strong("Important: "),
-              "The club is not a registered charity at this time. Donations are not tax-deductible."
-            ),
-            br(),
-            fluidRow(
-              column(
-                4,
-                numericInput("donation_amount", "Donation amount (CAD)", value = 0, min = 0, step = 10),
-                br(),
-                actionButton("donate_add_to_cart", "Add donation to cart")
-              ),
-              column(8, checkout_panel_ui("don", "Checkout"))
-            )
-          )
-        )
-      ))
-    }
+# Show/hide Receipt tab whenever receipt_tx changes
+observeEvent(receipt_tx(), {
+  session$sendCustomMessage("toggleReceiptNav", list(show = !is.null(receipt_tx())))
+}, ignoreInit = TRUE)
 
-    # Receipt always present (nav item hidden until we show it)
-    tabs <- c(tabs, list(
-      tabPanel(
-        title = "Receipt",
-        value = "Receipt",
-        fluidPage(
-          h3("Payment receipt"),
-          uiOutput("receipt_panel")
-        )
+# -----------------------------------------------------------------------------
+# TAB BODIES (LAZY): each tab UI is only created when the tab is active
+# -----------------------------------------------------------------------------
+
+output$tab_day_ui <- renderUI({
+  req(identical(input$main_nav, "Day Pass"))
+  fluidPage(
+    h3("Day Passes"),
+    tags$p(season_label(season_win())),
+    p("Choose your ski day and passes, then add to cart. Review and pay on the right."),
+    p(style="color:#666;", "Age buckets (not enforced for day passes): Child 0–8, Youth 9–18, Adult 19+."),
+    fluidRow(
+      column(
+        4,
+        uiOutput("day_date_ui"),
+        numericInput("day_adult",  "Adult",   value = 0, min = 0, step = 1),
+        numericInput("day_youth",  "Youth",   value = 0, min = 0, step = 1),
+        numericInput("day_under9", "Under 9", value = 0, min = 0, step = 1),
+        numericInput("day_family", "Family",  value = 0, min = 0, step = 1),
+        br(),
+        actionButton("day_add_to_cart", "Add to cart")
+      ),
+      column(8, checkout_panel_ui("day", "Checkout"))
+    )
+  )
+})
+
+output$tab_xmas_ui <- renderUI({
+  req(identical(input$main_nav, "Christmas Pass"))
+  fluidPage(
+    h3("Christmas Pass"),
+    tags$p(season_label(season_win())),
+    p("Choose a 14-day window that must include Dec 25. Add to cart, then pay on the right."),
+    fluidRow(
+      column(
+        4,
+        dateInput("xmas_start", "Start date (14-day window)", value = Sys.Date()),
+        numericInput("xmas_qty", "Number of passes", value = 0, min = 0, step = 1),
+        br(),
+        actionButton("xmas_add_to_cart", "Add to cart")
+      ),
+      column(8, checkout_panel_ui("xmas", "Checkout"))
+    )
+  )
+})
+
+output$tab_season_ui <- renderUI({
+  req(identical(input$main_nav, "Season Pass"))
+  fluidPage(
+    h3("Season Passes"),
+    uiOutput("season_info"),
+    tags$div(
+      style="margin:8px 0; padding:10px; border:1px solid #ddd; border-radius:6px; background:#fafafa;",
+      tags$strong("Age enforcement: "),
+      "Adult requires age 19+; Youth requires age 9–18 (age as-of Dec 31 of the season)."
+    ),
+    fluidRow(
+      column(
+        4,
+        numericInput("season_adult", "Adult", value = 0, min = 0, step = 1),
+        numericInput("season_youth", "Youth", value = 0, min = 0, step = 1),
+        uiOutput("season_people_ui"),
+        br(),
+        actionButton("season_add_to_cart", "Add to cart")
+      ),
+      column(8, checkout_panel_ui("season", "Checkout"))
+    )
+  )
+})
+
+output$tab_prog_ui <- renderUI({
+  req(identical(input$main_nav, "Programs"))
+
+  # IMPORTANT: compute program list only when Programs tab is opened
+  prog <- get_program_list()
+
+  fluidPage(
+    h3("Programs"),
+    tags$div(
+      style="margin:8px 0; padding:10px; border:1px solid #ddd; border-radius:6px; background:#fafafa;",
+      tags$strong("Age rule: "),
+      "Program eligibility is checked using age as-of Dec 31 of the ski season."
+    ),
+    p("Select a program and number of participants, then add to cart. Review and pay on the right."),
+    fluidRow(
+      column(
+        4,
+        selectInput("program_choice", "Program", choices = setNames(prog$id, prog$name)),
+        numericInput("program_qty", "Number of participants", value = 0, min = 0, step = 1),
+        uiOutput("program_people_ui"),
+        br(),
+        actionButton("program_add_to_cart", "Add to cart")
+      ),
+      column(8, checkout_panel_ui("prog", "Checkout"))
+    )
+  )
+})
+
+output$tab_event_ui <- renderUI({
+  req(identical(input$main_nav, "Special Events"))
+  fluidPage(
+    h3("Special Events"),
+    p("Add one or more special event registrations to the cart. Review and pay on the right."),
+    fluidRow(
+      column(
+        4,
+        uiOutput("event_picker_ui"),
+        numericInput("event_qty", "Number of participants", value = 0, min = 0, step = 1),
+        br(),
+        actionButton("event_add_to_cart", "Add to cart")
+      ),
+      column(8, checkout_panel_ui("event", "Checkout"))
+    )
+  )
+})
+
+output$tab_don_ui <- renderUI({
+  req(identical(input$main_nav, "Donation"))
+  fluidPage(
+    h3("Donation"),
+    p("Add a donation to the cart and pay on the right."),
+    tags$div(
+      style = "margin-top: 8px; padding: 10px; border: 1px solid #ddd; border-radius: 6px; background: #fafafa;",
+      tags$strong("Important: "),
+      "The club is not a registered charity at this time. Donations are not tax-deductible."
+    ),
+    br(),
+    fluidRow(
+      column(
+        4,
+        numericInput("donation_amount", "Donation amount (CAD)", value = 0, min = 0, step = 10),
+        br(),
+        actionButton("donate_add_to_cart", "Add donation to cart")
+      ),
+      column(8, checkout_panel_ui("don", "Checkout"))
+    )
+  )
+})
+
+output$tab_receipt_ui <- renderUI({
+  req(identical(input$main_nav, "Receipt"))
+  fluidPage(
+    h3("Payment receipt"),
+    uiOutput("receipt_panel")
+  )
+})
+
+output$tab_admin_ui <- renderUI({
+  req(identical(input$main_nav, "Admin"))
+  fluidPage(
+    h3("Admin"),
+    tags$p(APP_VERSION),
+    tags$p(ENV_LABEL),
+    if (db_is_postgres()) {
+      tags$div(
+        style="margin:8px 0; padding:10px; border:1px solid #ddd; border-radius:6px; background:#fafafa;",
+        tags$strong("Database: "), "Postgres (BVXC_DB_URL set)"
       )
-    ))
-
-    tabs <- c(tabs, list(
-      tabPanel(
-        title = "Admin",
-        value = "Admin",
-        fluidPage(
-          h3("Admin"),
-          tags$p(APP_VERSION),
-          tags$p(ENV_LABEL),
-          if (db_is_postgres()) {
-            tags$div(
-              style="margin:8px 0; padding:10px; border:1px solid #ddd; border-radius:6px; background:#fafafa;",
-              tags$strong("Database: "), "Postgres (BVXC_DB_URL set)"
-            )
-          } else {
-            tags$div(
-              style="margin:8px 0; padding:10px; border:1px solid #ffc107; border-radius:6px; background:#fff8e1;",
-              tags$strong("Database: "), "SQLite fallback (dev only). Do not use this on Connect Cloud for persistence."
-            )
-          },
-          hr(),
-          passwordInput("admin_password", "Admin password"),
-          actionButton("admin_login", "Log in"),
-          uiOutput("admin_lock_msg"),
-          br(),
-          uiOutput("admin_content")
-        )
+    } else {
+      tags$div(
+        style="margin:8px 0; padding:10px; border:1px solid #ffc107; border-radius:6px; background:#fff8e1;",
+        tags$strong("Database: "), "SQLite fallback (dev only). Do not use this on Connect Cloud for persistence."
       )
-    ))
+    },
+    hr(),
+    passwordInput("admin_password", "Admin password"),
+    actionButton("admin_login", "Log in"),
+    uiOutput("admin_lock_msg"),
+    br(),
+    uiOutput("admin_content")
+  )
+})
 
-    do.call(navbarPage, c(list(title = "BVXC", id = "main_nav"), tabs))
-  })
+# -----------------------------------------------------------------------------
+# Auto-load receipt from URL (?receipt=TOKEN)
+# -----------------------------------------------------------------------------
 
-  # Hide receipt tab in navbar by default (we show it only after a receipt exists)
-  session$onFlushed(function() {
-    session$sendCustomMessage("toggleReceiptNav", list(show = FALSE))
-  }, once = TRUE)
+observeEvent(session$clientData$url_search, {
+  qs <- session$clientData$url_search %||% ""
+  if (!nzchar(qs)) return()
 
-  observeEvent(receipt_tx(), {
-    session$sendCustomMessage("toggleReceiptNav", list(show = !is.null(receipt_tx())))
-  }, ignoreInit = TRUE)
+  q <- tryCatch(parseQueryString(qs), error = function(e) list())
+  token <- trimws(as.character(q$receipt %||% ""))
+  if (!nzchar(token)) return()
 
-  # -----------------------------------------------------------------------------
-  # Auto-load receipt from URL (?receipt=TOKEN)
-  # -----------------------------------------------------------------------------
+  tx <- load_receipt_token(token)
+  if (is.null(tx)) return()
 
-  observe({
-    qs <- session$clientData$url_search %||% ""
-    if (!nzchar(qs)) return()
+  # If it's already loaded, don't re-run everything (prevents loops / extra work)
+  cur <- receipt_tx()
+  if (!is.null(cur) && nrow(cur) == 1 &&
+      identical(as.character(cur$receipt_token[1] %||% ""), token)) {
+    return()
+  }
 
-    q <- tryCatch(parseQueryString(qs), error = function(e) list())
-    token <- trimws(as.character(q$receipt %||% ""))
-    if (!nzchar(token)) return()
+  receipt_tx(tx)
 
-    tx <- load_receipt_token(token)
-    if (is.null(tx)) return()
+  # Ensure Receipt tab is visible in navbar when deep-linking
+  session$sendCustomMessage("toggleReceiptNav", list(show = TRUE))
 
-    receipt_tx(tx)
+  # Clear cart ONLY if this receipt matches the checkout we just started
+  if (isTRUE(rv$checkout_started) && identical(token, rv$checkout_token)) {
+    clear_cart()
+    rv$checkout_started <- FALSE
+    rv$checkout_token   <- ""
+  }
 
-    # Clear cart ONLY if this receipt matches the checkout we just started
-    if (isTRUE(rv$checkout_started) && identical(token, rv$checkout_token)) {
-      clear_cart()
-      rv$checkout_started <- FALSE
-      rv$checkout_token   <- ""
-    }
+  poll_count(0L)
+  updateTabsetPanel(session, "main_nav", selected = "Receipt")
+}, ignoreInit = TRUE, once = TRUE)
 
-    poll_count(0L)
-    updateTabsetPanel(session, "main_nav", selected = "Receipt")
-  })
-
-  # -----------------------------------------------------------------------------
-  # DAY PASS date UI
-  # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# DAY PASS date UI
+# -----------------------------------------------------------------------------
 
   output$day_date_ui <- renderUI({
     day_date_ui_nonce()
