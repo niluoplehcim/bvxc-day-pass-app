@@ -142,7 +142,8 @@ tlog <- function(label, t0) {
 timed <- function(label, expr) {
   t0 <- Sys.time()
   on.exit(tlog(label, t0), add = TRUE)
-  force(expr)
+  result <- force(expr)
+  result
 }
 
 make_pool <- function() {
@@ -155,22 +156,29 @@ make_pool <- function() {
         drv = RPostgres::Postgres(),
         dbname = s,
         minSize = 1,
-        maxSize = 5,
+        maxSize = 2,
         idleTimeout = 600000,        # 10 minutes (ms)
         validationInterval = 60000   # 1 minute (ms)
       ))
     }
 
-    # KV form: host=... port=... dbname=... user=... password=...
-    args <- parse_kv_conn(s)
-    need <- c("host", "port", "dbname", "user", "password")
-    missing <- setdiff(need, names(args))
-    if (length(missing) > 0) {
-      stop(
-        "BVXC_DB_URL is missing: ", paste(missing, collapse = ", "),
-        "\nUse URI form: postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require"
-      )
-    }
+# KV form: host=... port=... dbname=... user=... password=...
+args <- parse_kv_conn(s)
+
+# Required fields
+required <- c("host", "port", "dbname", "user", "password")
+missing  <- setdiff(required, names(args))
+
+if (length(missing) > 0) {
+  stop(
+    "BVXC_DB_URL is missing required fields: ",
+    paste(missing, collapse = ", "),
+    "\nExample KV form:\n",
+    "  host=HOST port=5432 dbname=DBNAME user=USER password=PASSWORD sslmode=require\n",
+    "Or URI form:\n",
+    "  postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require"
+  )
+}
 
     return(do.call(
       pool::dbPool,
@@ -179,7 +187,7 @@ make_pool <- function() {
         args,
         list(
           minSize = 1,
-          maxSize = 5,
+          maxSize = 2,
           idleTimeout = 600000,        # 10 minutes (ms)
           validationInterval = 60000   # 1 minute (ms)
         )
@@ -794,22 +802,39 @@ square_safe_json <- function(res) {
 }
 
 square_http_get <- function(path, query = list()) {
-  res <- httr::GET(
-    url = paste0(square_base_url(), path),
-    square_headers(include_version = TRUE),
-    query = query
-  )
-  list(status = httr::status_code(res), body = square_safe_json(res), raw = res)
+  res <- timed(paste0("square_http_get() ", path), {
+    httr::GET(
+      url = paste0(square_base_url(), path),
+      square_headers(include_version = TRUE),
+      query = query,
+      httr::timeout(15)
+    )
+  })
+
+  body <- timed(paste0("square_safe_json() ", path), {
+    square_safe_json(res)
+  })
+
+  list(status = httr::status_code(res), body = body, raw = res)
 }
 
 square_http_post <- function(path, body) {
-  res <- httr::POST(
-    url    = paste0(square_base_url(), path),
-    square_headers(include_version = TRUE),
-    body   = body,
-    encode = "json"
-  )
-  list(status = httr::status_code(res), body = square_safe_json(res), raw = res)
+  res <- timed(paste0("square_http_post() ", path), {
+    httr::POST(
+      url    = paste0(square_base_url(), path),
+      square_headers(include_version = TRUE),
+      httr::content_type_json(),
+      body   = body,
+      encode = "json",
+      httr::timeout(15)
+    )
+  })
+
+  body_parsed <- timed(paste0("square_safe_json() ", path), {
+    square_safe_json(res)
+  })
+
+  list(status = httr::status_code(res), body = body_parsed, raw = res)
 }
 
 create_square_checkout_from_cart <- function(cart_df,
@@ -2122,48 +2147,74 @@ insert_tx_items_for_cart <- function(tx_id, created_at, status, cart_df) {
   invisible(TRUE)
 }
 
-  # -----------------------------------------------------------------------------
-  # RECEIPT VERIFICATION (Square)
-  # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# RECEIPT VERIFICATION (Square)  -- with PERF timing
+# -----------------------------------------------------------------------------
 
-  infer_status_from_square <- function(order_id) {
-    # returns one of: COMPLETED, PENDING, FAILED, UNKNOWN
-    if (!HAVE_SQUARE_CREDS) return("UNKNOWN")
-    if (!nzchar(order_id %||% "")) return("UNKNOWN")
+infer_status_from_square <- function(order_id) {
+  # returns one of: COMPLETED, PENDING, FAILED, UNKNOWN
+  if (!HAVE_SQUARE_CREDS) return("UNKNOWN")
+  if (!nzchar(order_id %||% "")) return("UNKNOWN")
 
-    payments <- square_list_payments_by_order(order_id)
+  payments <- timed("square_list_payments_by_order()", {
+    square_list_payments_by_order(order_id)
+  })
+
+  sts <- timed("compute_payment_status()", {
     if (!is.null(payments) && length(payments) > 0) {
-      sts <- toupper(vapply(payments, function(p) as.character(p$status %||% ""), character(1)))
-      if (any(sts %in% c("COMPLETED"))) return("COMPLETED")
-      if (any(sts %in% c("CANCELED", "FAILED"))) return("FAILED")
-      return("PENDING")
+      toupper(vapply(payments, function(p) as.character(p$status %||% ""), character(1)))
+    } else {
+      character(0)
     }
+  })
 
-    ord <- square_get_order(order_id)
-    if (is.null(ord)) return("UNKNOWN")
-    "PENDING"
+  if (length(sts) > 0) {
+    if (any(sts %in% "COMPLETED"))        return("COMPLETED")
+    if (any(sts %in% c("CANCELED","FAILED"))) return("FAILED")
+    return("PENDING")
   }
 
-  verify_and_refresh_receipt <- function() {
-    tx <- receipt_tx()
-    if (is.null(tx) || nrow(tx) != 1) return(FALSE)
+  ord <- timed("square_get_order()", {
+    square_get_order(order_id)
+  })
 
-    st0 <- as.character(tx$status[1] %||% "")
-    if (st0 %in% c("COMPLETED", "SANDBOX_TEST_OK", "FAILED")) {
-      return(TRUE)
+  if (is.null(ord)) return("UNKNOWN")
+  "PENDING"
+}
+
+verify_and_refresh_receipt <- function() {
+  tx <- timed("receipt_tx()", {
+    receipt_tx()
+  })
+  if (is.null(tx) || nrow(tx) != 1) return(FALSE)
+
+  st0 <- as.character(tx$status[1] %||% "")
+  if (st0 %in% c("COMPLETED", "SANDBOX_TEST_OK", "FAILED")) {
+    return(TRUE)
+  }
+
+  if (SQUARE_ENV == "sandbox" && SANDBOX_MODE == "fake") {
+    return(TRUE)
+  }
+
+  new_st <- timed("infer_status_from_square()", {
+    infer_status_from_square(as.character(tx$square_order_id[1] %||% ""))
+  })
+
+  if (new_st %in% c("COMPLETED", "FAILED", "PENDING", "UNKNOWN")) {
+    if (new_st != "UNKNOWN") {
+      timed("update_tx_status()", {
+        update_tx_status(as.character(tx$id[1]), new_st)
+      })
     }
 
-    if (SQUARE_ENV == "sandbox" && SANDBOX_MODE == "fake") {
-      return(TRUE)
-    }
-
-    new_st <- infer_status_from_square(as.character(tx$square_order_id[1] %||% ""))
-    if (new_st %in% c("COMPLETED", "FAILED", "PENDING", "UNKNOWN")) {
-      if (new_st != "UNKNOWN") update_tx_status(as.character(tx$id[1]), new_st)
+    timed("receipt_tx_refresh()", {
       receipt_tx(load_receipt_token(as.character(tx$receipt_token[1] %||% "")))
-    }
-    TRUE
+    })
   }
+
+  TRUE
+}
 
   # -----------------------------------------------------------------------------
   # REACTIVE DATA SOURCES
