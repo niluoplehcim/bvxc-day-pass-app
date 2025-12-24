@@ -66,6 +66,8 @@ Redirect back to the app using a receipt token, then
 
 Polling Square’s order/payment endpoints to confirm final status (works, but webhooks are the production-grade upgrade).
 
+
+
 Public User Guide (Buyers)
 1) Open the app
 
@@ -129,6 +131,8 @@ Club staff can scan it to validate the purchase.
 
 If the status is not confirmed (pending/failed), the QR code should not be treated as valid.
 
+
+
 Admin User Guide (Club Staff)
 Access
 
@@ -185,6 +189,8 @@ Item breakdown (what was sold)
 
 Export CSV for bookkeeping and reconciliation
 
+
+
 Troubleshooting (Operators)
 Buyer says: “I paid but I didn’t get the QR code”
 
@@ -217,6 +223,8 @@ App is slow on first load
 Hosting cold-start issue (workers spin up).
 
 Fix: keep at least one worker warm (host-specific setting), reduce heavy startup work, avoid unnecessary DB queries at init.
+
+
 
 Deployment & Configuration (Posit Connect / Shiny + Supabase + Square)
 1) Architecture (what talks to what)
@@ -390,6 +398,8 @@ Have a simple playbook for staff:
 
 “No QR code? Check transaction status in Admin / Square.”
 
+
+
 Post-season
 
 Export reports
@@ -411,6 +421,8 @@ Clean up
 Remove expired events
 
 Rotate admin password and (optionally) Square tokens
+
+
 
 Staff Quick Reference (Front Desk / Trailhead / Volunteer Hut)
 What a valid purchase looks like
@@ -539,6 +551,8 @@ Never accept “pending” bank notifications as proof of payment.
 Never manually mark someone as paid unless you can see a Completed transaction in Admin or Square.
 
 Never share admin password or leave admin tab logged in on a public tablet.
+
+
 
 Coder / Maintainer Guide (BVXC Day Pass App)
 1) What this app does (architecture)
