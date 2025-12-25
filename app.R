@@ -31,6 +31,8 @@ HAVE_DT <- requireNamespace("DT", quietly = TRUE)
 Sys.setenv(TZ = "America/Vancouver")
 APP_VERSION <- "BVXC v6.3 – Age enforcement + receipt labels + meta-unique per person – 2025-12-23"
 
+CFG_TX_ITEMS_BACKFILL_V1_DONE <- "tx_items_backfill_v1_done"
+
 if (file.exists(".Renviron")) readRenviron(".Renviron")
 
 ALLOWED_SQUARE_ENVS <- c("sandbox", "production")
@@ -575,6 +577,16 @@ cfg_date <- function(key, default = as.Date(NA)) {
   }
   d <- suppressWarnings(as.Date(s))
   if (is.na(d)) default else d
+}
+
+cfg_get_sentinel <- function(key) {
+  v <- tolower(trimws(cfg_get(key, default = "")))
+  v %in% c("1", "true", "yes", "on")
+}
+
+cfg_set_sentinel <- function(key, done = TRUE) {
+  cfg_set(key, if (isTRUE(done)) "1" else "0")
+  invisible(TRUE)
 }
 
 # -----------------------------------------------------------------------------
@@ -1176,8 +1188,6 @@ ui <- fluidPage(
 # tx_items helpers (fast capacity counts)
 # -----------------------------------------------------------------------------
 
-tx_items_missing_backfill_done <- FALSE
-
 extract_item_id_for_tx_item <- function(category, meta_json) {
   cat <- as.character(category %||% "")
   s <- as.character(meta_json %||% "")
@@ -1202,32 +1212,63 @@ extract_item_id_for_tx_item <- function(category, meta_json) {
 
 # Backfill only if you have old COMPLETED tx without tx_items rows (prevents oversell)
 ensure_tx_items_backfill_completed <- function(batch = 200L, max_batches = 20L) {
-  if (isTRUE(tx_items_missing_backfill_done)) {
+
+  # If already done (DB sentinel), skip
+  if (cfg_get_sentinel(CFG_TX_ITEMS_BACKFILL_V1_DONE)) {
     return(invisible(TRUE))
   }
 
   for (b in seq_len(max_batches)) {
+
     # Find completed tx that have no tx_items yet
+    # (ONLY those likely to contain capacity-relevant items)
     tx <- db_get1(
       "
       SELECT id, created_at, status, cart_json
       FROM transactions t
       WHERE t.status IN ('COMPLETED','SANDBOX_TEST_OK')
+        AND (
+          t.cart_json LIKE '%\"category\":\"event\"%'
+          OR t.cart_json LIKE '%\"category\":\"program\"%'
+        )
         AND NOT EXISTS (SELECT 1 FROM tx_items x WHERE x.tx_id = t.id)
       LIMIT ?n
       ",
       n = as.integer(batch)
     )
-
+ 
+    # Nothing left to backfill -> mark done (only if truly none remain)
     if (nrow(tx) == 0) {
-      tx_items_missing_backfill_done <<- TRUE
+
+      remaining <- db_get1(
+        "
+        SELECT COUNT(*) AS n
+        FROM transactions t
+        WHERE t.status IN ('COMPLETED','SANDBOX_TEST_OK')
+          AND (
+            t.cart_json LIKE '%\"category\":\"event\"%'
+            OR t.cart_json LIKE '%\"category\":\"program\"%'
+          )
+          AND NOT EXISTS (SELECT 1 FROM tx_items x WHERE x.tx_id = t.id)
+        "
+      )$n[1]
+
+      if (!is.na(remaining) && remaining == 0) {
+        cfg_set_sentinel(CFG_TX_ITEMS_BACKFILL_V1_DONE, TRUE)
+      }
+
       return(invisible(TRUE))
     }
 
     # Insert tx_items for each tx
     for (i in seq_len(nrow(tx))) {
-      cart_df <- tryCatch(jsonlite::fromJSON(tx$cart_json[i] %||% ""), error = function(e) NULL)
-      if (is.null(cart_df) || nrow(cart_df) == 0) next
+
+      cart_df <- tryCatch(
+        jsonlite::fromJSON(tx$cart_json[i] %||% ""),
+        error = function(e) NULL
+      )
+
+      if (is.null(cart_df) || !is.data.frame(cart_df) || nrow(cart_df) == 0) next
       if (!all(c("category", "quantity", "meta_json") %in% names(cart_df))) next
 
       st  <- as.character(tx$status[i] %||% "")
@@ -1235,12 +1276,13 @@ ensure_tx_items_backfill_completed <- function(batch = 200L, max_batches = 20L) 
       ca  <- as.character(tx$created_at[i] %||% now_ts())
       if (!nzchar(tid)) next
 
-      # only event/program matter for capacity; store only those
+      # Only event/program matter for capacity; store only those
       ix <- which(cart_df$category %in% c("event", "program"))
       if (length(ix) == 0) next
 
       with_db(function(con) {
         DBI::dbWithTransaction(con, {
+
           for (j in ix) {
             item_id <- extract_item_id_for_tx_item(cart_df$category[j], cart_df$meta_json[j])
             if (!nzchar(item_id)) next
@@ -1261,11 +1303,13 @@ ensure_tx_items_backfill_completed <- function(batch = 200L, max_batches = 20L) 
               created_at = ca
             )
           }
+
         })
       })
     }
   }
 
+  # Hit max_batches; do NOT set sentinel. We'll continue next time.
   invisible(TRUE)
 }
 
@@ -1342,25 +1386,30 @@ server <- function(input, output, session) {
     receipt_qr_file  = ""
   )
 
-  # One-time DB maintenance: ensure tx_items is backfilled (safe to run repeatedly)
-  try(ensure_tx_items_backfill_completed(), silent = TRUE)
+  # One-time DB maintenance (cross-process): backfill tx_items if needed
+  # DB sentinel controls "done" state across sessions/processes
+  try({
+    if (!cfg_get_sentinel(CFG_TX_ITEMS_BACKFILL_V1_DONE)) {
+      ensure_tx_items_backfill_completed()
+    }
+  }, silent = TRUE)
 
   # ---- tiny cache so reactivePoll doesn't hit DB twice every interval ----
   CFG_UPDATED_CACHE <- new.env(parent = emptyenv())
   CFG_UPDATED_CACHE$val <- ""
   CFG_UPDATED_CACHE$t <- as.POSIXct(0, origin = "1970-01-01")
 
-  cfg_get_updated_at_cached <- function(ttl_secs = 1) {
-    age <- as.numeric(difftime(Sys.time(), CFG_UPDATED_CACHE$t, units = "secs"))
-    if (!is.na(age) && age <= ttl_secs) {
-      return(CFG_UPDATED_CACHE$val)
-    }
-
-    v <- cfg_get_db("__config_updated_at", "")
-    CFG_UPDATED_CACHE$val <- as.character(v %||% "")
-    CFG_UPDATED_CACHE$t <- Sys.time()
-    CFG_UPDATED_CACHE$val
+cfg_get_updated_at_cached <- function(ttl_secs = 1) {
+  age <- as.numeric(difftime(Sys.time(), CFG_UPDATED_CACHE$t, units = "secs"))
+  if (!is.na(age) && age <= ttl_secs) {
+    return(CFG_UPDATED_CACHE$val)
   }
+
+  v <- cfg_get_db("__config_updated_at", "")
+  CFG_UPDATED_CACHE$val <- as.character(v %||% "")
+  CFG_UPDATED_CACHE$t <- Sys.time()
+  CFG_UPDATED_CACHE$val
+}
 
   # -----------------------------------------------------------------------------
   # CONFIG REACTIVITY: re-render nav when config changes
@@ -3142,7 +3191,7 @@ return(invisible(TRUE))
         showNotification("Price is N/A. Admin must set prices first.", type = "error")
         return(FALSE)
       }
-      rows[[length(rows) + 1L]] <<- data.frame(
+      rows[[length(rows) + 1L]] <- data.frame(
         id = UUIDgenerate(),
         category = "day_pass",
         description = paste("Day pass –", type, "–", as.character(d)),
