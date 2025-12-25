@@ -3191,7 +3191,7 @@ return(invisible(TRUE))
         showNotification("Price is N/A. Admin must set prices first.", type = "error")
         return(FALSE)
       }
-      rows[[length(rows) + 1L]] <- data.frame(
+      rows[[length(rows) + 1L]] <<- data.frame(
         id = UUIDgenerate(),
         category = "day_pass",
         description = paste("Day pass –", type, "–", as.character(d)),
