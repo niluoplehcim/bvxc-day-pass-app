@@ -1099,7 +1099,6 @@ css_tabs <- "
   animation: receiptSpin .8s linear infinite;
   vertical-align: -2px;
 }
-
 @keyframes receiptSpin { to { transform: rotate(360deg); } }
 
 /* ---- Pay button emphasis (ONLY when cart has items) ---- */
@@ -1120,6 +1119,22 @@ css_tabs <- "
 ui <- fluidPage(
   tags$head(
     tags$style(HTML(css_tabs)),
+
+    # --- Mobile-friendly +/- stepper for ALL input[type=number] (adds buttons on phones too)
+    tags$style(HTML("
+      .numwrap { display:flex; align-items:center; gap:10px; }
+      .numwrap input[type=number] { width: 90px; text-align:center; }
+      .numbtn {
+        padding: 6px 12px;
+        font-size: 18px;
+        line-height: 1;
+        border: 1px solid #ccc;
+        border-radius: 8px;
+        background: #fff;
+      }
+      .numbtn:active { transform: scale(0.98); }
+    ")),
+
     tags$script(HTML("
 (function() {
   function bindBVXC() {
@@ -1129,6 +1144,11 @@ ui <- fluidPage(
     if (window.__bvxcBound) return;
     window.__bvxcBound = true;
 
+    var $ = window.jQuery;
+
+    // ------------------------------------------------------------
+    // Shiny message handlers (define ONCE, here)
+    // ------------------------------------------------------------
     Shiny.addCustomMessageHandler('redirect', function(message) {
       try { window.top.location.href = message.url; }
       catch(e) { window.location.href = message.url; }
@@ -1138,22 +1158,6 @@ ui <- fluidPage(
       var show = !!message.show;
       var a = $('a[data-value=\"Receipt\"]');
       if (a.length) a.closest('li').toggle(show);
-    });
-
-    // Admin table actions: Blocked dates delete
-    $(document).off('click.bvxc', 'a.admin-block-del');
-    $(document).on('click.bvxc', 'a.admin-block-del', function(e){
-      e.preventDefault();
-      var d = $(this).data('date');
-      Shiny.setInputValue('admin_block_del', {date: d, nonce: Math.random()}, {priority: 'event'});
-    });
-
-    // Admin table actions: Transactions load receipt
-    $(document).off('click.bvxc', 'a.admin-tx-load');
-    $(document).on('click.bvxc', 'a.admin-tx-load', function(e){
-      e.preventDefault();
-      var tok = $(this).data('token');
-      Shiny.setInputValue('admin_tx_load', {token: tok, nonce: Math.random()}, {priority: 'event'});
     });
 
     Shiny.addCustomMessageHandler('disableBuyerAutofill', function(message) {
@@ -1169,17 +1173,100 @@ ui <- fluidPage(
         });
       } catch(e) {}
     });
+
+    // ------------------------------------------------------------
+    // Mobile numeric stepper (+ / -) for ALL input[type=number]
+    // ------------------------------------------------------------
+    function enhanceOne(input) {
+      if (!input) return;
+      if (input.dataset.stepperEnhanced === '1') return;
+      if (input.type !== 'number') return;
+      if (input.disabled) return;
+
+      input.dataset.stepperEnhanced = '1';
+
+      // Encourage numeric keypad on mobile
+      input.setAttribute('inputmode', 'numeric');
+      input.setAttribute('pattern', '[0-9]*');
+
+      var wrap = document.createElement('div');
+      wrap.className = 'numwrap';
+
+      var dec = document.createElement('button');
+      dec.type = 'button';
+      dec.className = 'numbtn numdec';
+      dec.textContent = '−';
+
+      var inc = document.createElement('button');
+      inc.type = 'button';
+      inc.className = 'numbtn numinc';
+      inc.textContent = '+';
+
+      var parent = input.parentNode;
+      if (!parent) return;
+
+      parent.insertBefore(wrap, input);
+      wrap.appendChild(dec);
+      wrap.appendChild(input);
+      wrap.appendChild(inc);
+
+      function bump(dir) {
+        try {
+          if (dir > 0) input.stepUp(); else input.stepDown();
+        } catch (e) {
+          var v = parseFloat(input.value || '0');
+          var step = parseFloat(input.getAttribute('step') || '1');
+          input.value = (v + dir * step);
+        }
+        input.dispatchEvent(new Event('input',  { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+
+      dec.addEventListener('click', function(){ bump(-1); });
+      inc.addEventListener('click', function(){ bump( 1); });
+
+      // Touch responsiveness
+      dec.addEventListener('touchstart', function(e){ e.preventDefault(); bump(-1); }, { passive:false });
+      inc.addEventListener('touchstart', function(e){ e.preventDefault(); bump( 1); }, { passive:false });
+    }
+
+    function enhanceAll() {
+      document.querySelectorAll('input[type=number]').forEach(enhanceOne);
+    }
+
+    enhanceAll();
+
+    // Re-run when Shiny inserts dynamic UI
+    var mo = new MutationObserver(function() { enhanceAll(); });
+    mo.observe(document.body, { childList: true, subtree: true });
+
+    // ------------------------------------------------------------
+    // Admin table actions (delegated handlers)
+    // ------------------------------------------------------------
+    $(document).off('click.bvxc', 'a.admin-block-del');
+    $(document).on('click.bvxc', 'a.admin-block-del', function(e){
+      e.preventDefault();
+      var d = $(this).data('date');
+      Shiny.setInputValue('admin_block_del', {date: d, nonce: Math.random()}, {priority: 'event'});
+    });
+
+    $(document).off('click.bvxc', 'a.admin-tx-load');
+    $(document).on('click.bvxc', 'a.admin-tx-load', function(e){
+      e.preventDefault();
+      var tok = $(this).data('token');
+      Shiny.setInputValue('admin_tx_load', {token: tok, nonce: Math.random()}, {priority: 'event'});
+    });
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', bindBVXC);
-  } else {
+  // Try immediately, then retry until Shiny/jQuery are ready
+  bindBVXC();
+  var t = setInterval(function() {
+    if (window.__bvxcBound) return clearInterval(t);
     bindBVXC();
-  }
-  setTimeout(bindBVXC, 50);
-  setTimeout(bindBVXC, 250);
+  }, 200);
 })();
-"))
+    "))
+
   ),
   uiOutput("main_nav_ui")
 )
@@ -1353,6 +1440,9 @@ insert_tx_items_for_cart <- function(tx_id, created_at, status, cart_df) {
 
   invisible(TRUE)
 }
+
+
+
 
 # -----------------------------------------------------------------------------
 # SERVER
