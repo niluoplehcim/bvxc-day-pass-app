@@ -1434,9 +1434,12 @@ cfg_get_updated_at_cached <- function(ttl_secs = 1) {
     valueFunc      = function() cfg_get_updated_at_cached(1)
   )
 
-  # Run once after the UI is ready: disable autofill on buyer fields
+# Run once after the UI is ready
   session$onFlushed(function() {
     session$sendCustomMessage("disableBuyerAutofill", list())
+
+    # Warm config cache after first paint (avoids first-load blocking)
+    try(cfg_refresh_cache(force = FALSE), silent = TRUE)
   }, once = TRUE)
 
   receipt_tx <- reactiveVal(NULL)
