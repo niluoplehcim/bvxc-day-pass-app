@@ -1099,6 +1099,7 @@ css_tabs <- "
   animation: receiptSpin .8s linear infinite;
   vertical-align: -2px;
 }
+
 @keyframes receiptSpin { to { transform: rotate(360deg); } }
 
 /* ---- Pay button emphasis (ONLY when cart has items) ---- */
@@ -1119,36 +1120,16 @@ css_tabs <- "
 ui <- fluidPage(
   tags$head(
     tags$style(HTML(css_tabs)),
-
-    # --- Mobile-friendly +/- stepper for ALL input[type=number] (adds buttons on phones too)
-    tags$style(HTML("
-      .numwrap { display:flex; align-items:center; gap:10px; }
-      .numwrap input[type=number] { width: 90px; text-align:center; }
-      .numbtn {
-        padding: 6px 12px;
-        font-size: 18px;
-        line-height: 1;
-        border: 1px solid #ccc;
-        border-radius: 8px;
-        background: #fff;
-      }
-      .numbtn:active { transform: scale(0.98); }
-    ")),
-
     tags$script(HTML("
 (function() {
   function bindBVXC() {
     if (!window.jQuery || !window.Shiny) return;
 
-    // prevent double-binding
+    // Prevent double-binding of custom message handlers
     if (window.__bvxcBound) return;
     window.__bvxcBound = true;
 
-    var $ = window.jQuery;
-
-    // ------------------------------------------------------------
-    // Shiny message handlers (define ONCE, here)
-    // ------------------------------------------------------------
+    // --- Custom message handlers ---
     Shiny.addCustomMessageHandler('redirect', function(message) {
       try { window.top.location.href = message.url; }
       catch(e) { window.location.href = message.url; }
@@ -1174,99 +1155,43 @@ ui <- fluidPage(
       } catch(e) {}
     });
 
-    // ------------------------------------------------------------
-    // Mobile numeric stepper (+ / -) for ALL input[type=number]
-    // ------------------------------------------------------------
-    function enhanceOne(input) {
-      if (!input) return;
-      if (input.dataset.stepperEnhanced === '1') return;
-      if (input.type !== 'number') return;
-      if (input.disabled) return;
+    // --- Admin table actions (delegated handlers) ---
 
-      input.dataset.stepperEnhanced = '1';
-
-      // Encourage numeric keypad on mobile
-      input.setAttribute('inputmode', 'numeric');
-      input.setAttribute('pattern', '[0-9]*');
-
-      var wrap = document.createElement('div');
-      wrap.className = 'numwrap';
-
-      var dec = document.createElement('button');
-      dec.type = 'button';
-      dec.className = 'numbtn numdec';
-      dec.textContent = '−';
-
-      var inc = document.createElement('button');
-      inc.type = 'button';
-      inc.className = 'numbtn numinc';
-      inc.textContent = '+';
-
-      var parent = input.parentNode;
-      if (!parent) return;
-
-      parent.insertBefore(wrap, input);
-      wrap.appendChild(dec);
-      wrap.appendChild(input);
-      wrap.appendChild(inc);
-
-      function bump(dir) {
-        try {
-          if (dir > 0) input.stepUp(); else input.stepDown();
-        } catch (e) {
-          var v = parseFloat(input.value || '0');
-          var step = parseFloat(input.getAttribute('step') || '1');
-          input.value = (v + dir * step);
-        }
-        input.dispatchEvent(new Event('input',  { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-
-      dec.addEventListener('click', function(){ bump(-1); });
-      inc.addEventListener('click', function(){ bump( 1); });
-
-      // Touch responsiveness
-      dec.addEventListener('touchstart', function(e){ e.preventDefault(); bump(-1); }, { passive:false });
-      inc.addEventListener('touchstart', function(e){ e.preventDefault(); bump( 1); }, { passive:false });
-    }
-
-    function enhanceAll() {
-      document.querySelectorAll('input[type=number]').forEach(enhanceOne);
-    }
-
-    enhanceAll();
-
-    // Re-run when Shiny inserts dynamic UI
-    var mo = new MutationObserver(function() { enhanceAll(); });
-    mo.observe(document.body, { childList: true, subtree: true });
-
-    // ------------------------------------------------------------
-    // Admin table actions (delegated handlers)
-    // ------------------------------------------------------------
+    // Blocked dates delete
     $(document).off('click.bvxc', 'a.admin-block-del');
     $(document).on('click.bvxc', 'a.admin-block-del', function(e){
       e.preventDefault();
       var d = $(this).data('date');
-      Shiny.setInputValue('admin_block_del', {date: d, nonce: Math.random()}, {priority: 'event'});
+      Shiny.setInputValue(
+        'admin_block_del',
+        { date: d, nonce: Math.random() },
+        { priority: 'event' }
+      );
     });
 
+    // Transactions: load receipt
     $(document).off('click.bvxc', 'a.admin-tx-load');
     $(document).on('click.bvxc', 'a.admin-tx-load', function(e){
       e.preventDefault();
       var tok = $(this).data('token');
-      Shiny.setInputValue('admin_tx_load', {token: tok, nonce: Math.random()}, {priority: 'event'});
+      Shiny.setInputValue(
+        'admin_tx_load',
+        { token: String(tok || ''), nonce: Math.random() },
+        { priority: 'event' }
+      );
     });
   }
 
-  // Try immediately, then retry until Shiny/jQuery are ready
-  bindBVXC();
-  var t = setInterval(function() {
-    if (window.__bvxcBound) return clearInterval(t);
+  // Bind when ready, and retry shortly in case Shiny/jQuery load slightly later
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bindBVXC);
+  } else {
     bindBVXC();
-  }, 200);
+  }
+  setTimeout(bindBVXC, 50);
+  setTimeout(bindBVXC, 250);
 })();
-    "))
-
+"))
   ),
   uiOutput("main_nav_ui")
 )
@@ -1440,9 +1365,6 @@ insert_tx_items_for_cart <- function(tx_id, created_at, status, cart_df) {
 
   invisible(TRUE)
 }
-
-
-
 
 # -----------------------------------------------------------------------------
 # SERVER
@@ -4594,113 +4516,103 @@ tagList(
     )
   })
 
-  # Only register the DT output if DT exists on this host
-  if (isTRUE(HAVE_DT)) {
-    output$admin_tx_table <- DT::renderDT(
-      {
-        admin_nonce()
-        if (!isTRUE(rv$admin_logged_in)) {
-          return(NULL)
-        }
+# Only register the DT output if DT exists on this host
+if (isTRUE(HAVE_DT)) {
 
-        tx_nonce()
+  output$admin_tx_table <- DT::renderDT({
 
-        # Vector-safe input defaults (avoid %||% on vectors)
-        lim <- suppressWarnings(as.integer(input$admin_tx_limit))
-        if (is.na(lim) || lim < 1L) lim <- 50L
+    admin_nonce()
+    if (!isTRUE(rv$admin_logged_in)) return(NULL)
 
-        sd <- input$admin_tx_start
-        if (is.null(sd) || !nzchar(as.character(sd))) sd <- NULL
+    tx_nonce()
 
-        ed <- input$admin_tx_end
-        if (is.null(ed) || !nzchar(as.character(ed))) ed <- NULL
+    # Vector-safe input defaults
+    lim <- suppressWarnings(as.integer(input$admin_tx_limit))
+    if (is.na(lim) || lim < 1L) lim <- 50L
 
-        nm <- trimws(as.character(input$admin_tx_name))
-        if (is.na(nm)) nm <- ""
+    sd <- input$admin_tx_start
+    if (is.null(sd) || !nzchar(as.character(sd))) sd <- NULL
 
-        em <- trimws(as.character(input$admin_tx_email))
-        if (is.na(em)) em <- ""
+    ed <- input$admin_tx_end
+    if (is.null(ed) || !nzchar(as.character(ed))) ed <- NULL
 
-        st <- trimws(as.character(input$admin_tx_status))
-        if (is.na(st)) st <- ""
+    nm <- trimws(as.character(input$admin_tx_name))
+    if (is.na(nm)) nm <- ""
 
-        tt <- trimws(as.character(input$admin_tx_type))
-        if (is.na(tt)) tt <- ""
+    em <- trimws(as.character(input$admin_tx_email))
+    if (is.na(em)) em <- ""
 
-        sb <- trimws(as.character(input$admin_tx_sort_by))
-        if (is.na(sb) || !nzchar(sb)) sb <- "created_at"
+    st <- trimws(as.character(input$admin_tx_status))
+    if (is.na(st)) st <- ""
 
-        df <- fetch_transactions(
-          limit      = lim,
-          start_date = sd,
-          end_date   = ed,
-          name       = nm,
-          email      = em,
-          status     = st,
-          tx_type    = tt,
-          sort_by    = sb
-        )
+    tt <- trimws(as.character(input$admin_tx_type))
+    if (is.na(tt)) tt <- ""
 
-        if (nrow(df) == 0) {
-          return(DT::datatable(
-            data.frame(Message = "No results.", stringsAsFactors = FALSE),
-            rownames = FALSE,
-            options = list(dom = "t"),
-            class = "compact"
-          ))
-        }
+    sb <- trimws(as.character(input$admin_tx_sort_by))
+    if (is.na(sb) || !nzchar(sb)) sb <- "created_at"
 
-        # Vector-safe formatting + Action links
-        created <- ifelse(is.na(df$created_at), "", as.character(df$created_at))
-        name_v <- ifelse(is.na(df$buyer_name), "", as.character(df$buyer_name))
-        email_v <- ifelse(is.na(df$buyer_email), "", as.character(df$buyer_email))
-        type_v <- ifelse(is.na(df$tx_type), "", as.character(df$tx_type))
-        status_v <- ifelse(is.na(df$status), "", as.character(df$status))
-
-        amt_cents <- suppressWarnings(as.numeric(df$total_amount_cents))
-        amt_cents[is.na(amt_cents)] <- 0
-        total_v <- sprintf("$%.2f", amt_cents / 100)
-
-        tok <- as.character(df$receipt_token)
-        tok[is.na(tok)] <- ""
-        has_tok <- nzchar(tok)
-
-        action_v <- ifelse(
-          has_tok,
-          paste0(
-            "<a href='#' class='admin-tx-load' data-token='",
-            htmltools::htmlEscape(tok, attribute = TRUE),
-            "'>View receipt</a>"
-          ),
-          "—"
-        )
-
-        df_out <- data.frame(
-          Created = created,
-          Name = name_v,
-          Email = email_v,
-          Type = type_v,
-          Total = total_v,
-          Status = status_v,
-          Action = action_v,
-          stringsAsFactors = FALSE
-        )
-
-        DT::datatable(
-          df_out,
-          rownames = FALSE,
-          escape = FALSE,
-          class = "compact stripe hover",
-          options = list(
-            order      = list(list(0, "desc")),
-            pageLength = 25,
-            lengthMenu = list(c(25, 50, 100, 200, 500), c(25, 50, 100, 200, 500))
-          )
-        )
-      },
-      server = FALSE
+    df <- fetch_transactions(
+      limit      = lim,
+      start_date = sd,
+      end_date   = ed,
+      name       = nm,
+      email      = em,
+      status     = st,
+      tx_type    = tt,
+      sort_by    = sb
     )
-  }
+
+    # Empty / NULL guard FIRST
+    if (is.null(df) || nrow(df) == 0) {
+      return(DT::datatable(
+        data.frame(Message = "No results.", stringsAsFactors = FALSE),
+        rownames = FALSE,
+        options  = list(dom = "t"),
+        class    = "compact"
+      ))
+    }
+
+    # ---- build a display table with an Action link ----
+    df_out <- df
+
+    cents <- suppressWarnings(as.numeric(df_out$total_amount_cents))
+    df_out$total <- ifelse(
+      is.na(cents),
+      "",
+      sprintf("$%.2f", cents / 100)
+    )
+
+    token <- ifelse(is.na(df_out$receipt_token), "", as.character(df_out$receipt_token))
+
+    df_out$action <- ifelse(
+      nzchar(token),
+      paste0(
+        "<a href='#' class='admin-tx-load' data-token='",
+        htmltools::htmlEscape(token, attribute = TRUE),
+        "'>View receipt</a>"
+      ),
+      ""
+    )
+
+    df_out <- df_out[, c(
+      "created_at", "buyer_name", "buyer_email", "tx_type",
+      "total", "status", "action"
+    ), drop = FALSE]
+
+    # IMPORTANT: make this the FINAL expression returned by renderDT()
+    DT::datatable(
+      df_out,
+      rownames = FALSE,
+      escape   = FALSE,  # allows <a> to be clickable
+      class    = "compact stripe hover",
+      options  = list(
+        order      = list(list(0, "desc")),
+        pageLength = 25,
+        lengthMenu = list(c(25, 50, 100), c("25", "50", "100"))
+      )
+    )
+  })
+}
 
   observeEvent(input$admin_tx_refresh,
     {
