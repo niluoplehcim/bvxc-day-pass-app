@@ -3160,6 +3160,19 @@ if (isTRUE(IS_FAKE_MODE)) {
     # Normalize/merge cart lines before checks
     df <- normalize_cart(df)
 
+    # Guardrail: too many distinct cart lines can crash small Connect workers
+    max_lines <- 60L
+    if (!is.null(df) && nrow(df) > max_lines) {
+      showNotification(
+        paste0(
+          "Cart has too many different items (", nrow(df), "). ",
+          "Please reduce items or split into multiple payments."
+        ),
+        type = "error", duration = 12
+      )
+      return()
+    }
+
     # ---- PERF: checkout prechecks (run ONCE) ----
     msg <- timed("validate_cart_limits()", validate_cart_limits(df))
     if (!is.null(msg)) {
