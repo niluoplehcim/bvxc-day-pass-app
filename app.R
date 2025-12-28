@@ -1049,20 +1049,62 @@ css_tabs <- "
 
 .cart-controls { display: flex; align-items: center; gap: 12px; }
 
-.qty-stepper { display:flex; align-items:center; gap:12px; }
-.qty-stepper .qty-value { min-width:34px; text-align:center; font-weight:800; font-size:20px; }
-
-.qty-stepper .btn {
-  min-width:56px;
-  height:56px;
-  font-weight:900;
-  font-size:28px;
-  line-height: 1;
-  cursor: pointer;
+/* ---- Quantity stepper (white square +/- boxes, high visibility) ---- */
+.qty-stepper {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #fff;
 }
 
-.qty-stepper .btn:active { transform: scale(0.98); }
-.qty-stepper .btn:focus { outline: 2px solid rgba(13,110,253,0.35); outline-offset: 2px; }
+.qty-stepper .qty-value {
+  min-width: 44px;
+  height: 56px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 900;
+  font-size: 20px;
+  background: #fff;
+  border: 1px solid #ced4da;
+  border-radius: 8px;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.qty-stepper .btn {
+  width: 56px;
+  height: 56px;
+  padding: 0;
+  background: #fff !important;
+  border: 1px solid #ced4da !important;
+  border-radius: 8px !important;
+  box-shadow: none !important;
+
+  font-weight: 900;
+  font-size: 30px;
+  line-height: 1;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.qty-stepper .btn:hover {
+  background: #fff !important;
+  border-color: #0d6efd !important;
+}
+
+.qty-stepper .btn:active {
+  background: #fff !important;
+  transform: scale(0.97);
+}
+
+.qty-stepper .btn:focus {
+  outline: none !important;
+  box-shadow: 0 0 0 0.25rem rgba(13,110,253,0.25) !important;
+}
 
 .cart-qty-input {
   font-size: 20px;
@@ -2750,10 +2792,10 @@ if (isTRUE(IS_FAKE_MODE)) {
         column(
           4,
           uiOutput("day_date_ui"),
-          numericInput("day_adult", "Adult", value = 0, min = 0, step = 1),
-          numericInput("day_youth", "Youth", value = 0, min = 0, step = 1),
-          numericInput("day_under9", "Under 9", value = 0, min = 0, step = 1),
-          numericInput("day_family", "Family", value = 0, min = 0, step = 1),
+          qty_stepper_input("day_adult", "Adult", value = 0, min = 0, max = 20),
+          qty_stepper_input("day_youth", "Youth", value = 0, min = 0, max = 20),
+          qty_stepper_input("day_under9", "Under 9", value = 0, min = 0, max = 20),
+          qty_stepper_input("day_family", "Family", value = 0, min = 0, max = 20),
           br(),
           actionButton("day_add_to_cart", "Add to cart")
         ),
@@ -2793,8 +2835,8 @@ if (isTRUE(IS_FAKE_MODE)) {
       fluidRow(
         column(
           4,
-          numericInput("season_adult", "Adult", value = 0, min = 0, step = 1),
-          numericInput("season_youth", "Youth", value = 0, min = 0, step = 1),
+          qty_stepper_input("season_adult", "Adult", value = 0, min = 0, max = 20),
+          qty_stepper_input("season_youth", "Youth", value = 0, min = 0, max = 20),
           uiOutput("season_people_ui"),
           br(),
           actionButton("season_add_to_cart", "Add to cart")
@@ -2825,7 +2867,8 @@ if (isTRUE(IS_FAKE_MODE)) {
         column(
           4,
           selectInput("program_choice", "Program", choices = setNames(prog$id, prog$name)),
-          numericInput("program_qty", "Number of participants", value = 0, min = 0, step = 1),
+          qty_stepper_input("program_qty", "Number of participants", value = 0, min = 0, max = 20),
+
           uiOutput("program_people_ui"),
           br(),
           actionButton("program_add_to_cart", "Add to cart")
@@ -2844,7 +2887,7 @@ if (isTRUE(IS_FAKE_MODE)) {
         column(
           4,
           uiOutput("event_picker_ui"),
-          numericInput("event_qty", "Number of participants", value = 0, min = 0, step = 1),
+          qty_stepper_input("event_qty", "Number of participants", value = 0, min = 0, max = 20),
           br(),
           actionButton("event_add_to_cart", "Add to cart")
         ),
