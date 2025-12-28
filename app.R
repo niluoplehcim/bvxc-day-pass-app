@@ -998,6 +998,26 @@ checkout_panel_ui <- function(prefix, title = "Checkout") {
   )
 }
 
+qty_stepper_input <- function(id, label, value = 0L, min = 0L, max = 20L) {
+  v <- suppressWarnings(as.integer(value))
+  if (is.na(v)) v <- 0L
+  v <- max(as.integer(min), min(as.integer(max), v))
+
+  tags$div(
+    class = "form-group shiny-input-container",
+    tags$label(label, `for` = id),
+    tags$div(
+      class = "qty-stepper qty-stepper-global",
+      `data-target` = id,
+      `data-min` = as.integer(min),
+      `data-max` = as.integer(max),
+      tags$button(type = "button", class = "btn btn-outline-secondary btn-sm qty-dec", "−"),
+      tags$span(class = "qty-value", as.character(v)),
+      tags$button(type = "button", class = "btn btn-outline-secondary btn-sm qty-inc", "+")
+    )
+  )
+}
+
 # -----------------------------------------------------------------------------
 # UI
 # -----------------------------------------------------------------------------
@@ -1026,7 +1046,23 @@ css_tabs <- "
   border-bottom: 1px solid #eee;
 }
 .cart-desc { flex: 1; font-weight: 600; }
+
 .cart-controls { display: flex; align-items: center; gap: 12px; }
+
+.qty-stepper { display:flex; align-items:center; gap:12px; }
+.qty-stepper .qty-value { min-width:34px; text-align:center; font-weight:800; font-size:20px; }
+
+.qty-stepper .btn {
+  min-width:56px;
+  height:56px;
+  font-weight:900;
+  font-size:28px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.qty-stepper .btn:active { transform: scale(0.98); }
+.qty-stepper .btn:focus { outline: 2px solid rgba(13,110,253,0.35); outline-offset: 2px; }
 
 .cart-qty-input {
   font-size: 20px;
@@ -1120,6 +1156,59 @@ css_tabs <- "
 ui <- fluidPage(
   tags$head(
     tags$style(HTML(css_tabs)),
+
+    # --- Global quantity stepper (click-only, no typing) ---
+    tags$script(HTML("
+      (function() {
+        function clamp(v, mn, mx) {
+          v = parseInt(v, 10); mn = parseInt(mn, 10); mx = parseInt(mx, 10);
+          if (isNaN(v)) v = 0;
+          if (isNaN(mn)) mn = 0;
+          if (isNaN(mx)) mx = 20;
+          if (v < mn) v = mn;
+          if (v > mx) v = mx;
+          return v;
+        }
+
+        function push($stepper, v) {
+          var target = $stepper.data('target');
+          if (!target || !window.Shiny) return;
+          Shiny.setInputValue(target, v, {priority: 'event'});
+        }
+
+        $(document).off('click', '.qty-stepper-global .qty-dec, .qty-stepper-global .qty-inc');
+        $(document).on('click', '.qty-stepper-global .qty-dec, .qty-stepper-global .qty-inc', function(e) {
+          e.preventDefault();
+
+          var $stepper = $(this).closest('.qty-stepper-global');
+          var mn = $stepper.data('min');
+          var mx = $stepper.data('max');
+
+          var $val = $stepper.find('.qty-value');
+          var v = clamp($val.text(), mn, mx);
+
+          v = v + ($(this).hasClass('qty-inc') ? 1 : -1);
+          v = clamp(v, mn, mx);
+
+          $val.text(v);
+          push($stepper, v);
+        });
+
+        // Initialize: push displayed values into Shiny once on load
+        $(function() {
+          $('.qty-stepper-global').each(function() {
+            var $s = $(this);
+            var mn = $s.data('min');
+            var mx = $s.data('max');
+            var v = clamp($s.find('.qty-value').text(), mn, mx);
+            $s.find('.qty-value').text(v);
+            push($s, v);
+          });
+        });
+      })();
+    ")),
+
+    # --- Existing BVXC bindings (keep as-is) ---
     tags$script(HTML("
 (function() {
   function bindBVXC() {
@@ -1912,14 +2001,26 @@ cfg_get_updated_at_cached <- function(ttl_secs = 1) {
         )
       } else {
         tagList(
-          tags$input(
-            type          = "number",
-            class         = "cart-qty-input",
-            `data-itemid` = as.character(r$id[1]),
-            value         = qty,
-            min           = 0,
-            max           = max_qty,
-            step          = 1
+          tags$div(
+            class = "qty-stepper",
+            tags$button(
+              type          = "button",
+              class         = "btn btn-outline-secondary btn-sm qty-dec",
+              `data-itemid` = as.character(r$id[1]),
+              `data-max`    = as.integer(max_qty),
+              "−"
+            ),
+            tags$span(
+              class = "qty-value",
+              as.character(qty)
+            ),
+            tags$button(
+              type          = "button",
+              class         = "btn btn-outline-secondary btn-sm qty-inc",
+              `data-itemid` = as.character(r$id[1]),
+              `data-max`    = as.integer(max_qty),
+              "+"
+            )
           ),
           tags$span(
             class = "cart-line-total",
@@ -1939,14 +2040,29 @@ cfg_get_updated_at_cached <- function(ttl_secs = 1) {
       tags$div(id = box_id, class = "cart-list", row_ui),
       tags$script(HTML(sprintf(
         "
-        $(document).off('input change', '#%s .cart-qty-input');
-        $(document).on('input change', '#%s .cart-qty-input', function() {
-          var id = $(this).data('itemid');
-          var qty = parseInt($(this).val(), 10);
+        // Quantity: click-only stepper (no free typing)
+        $(document).off('click', '#%s .qty-dec, #%s .qty-inc');
+        $(document).on('click', '#%s .qty-dec, #%s .qty-inc', function(e) {
+          e.preventDefault();
+
+          var id   = $(this).data('itemid');
+          var maxq = parseInt($(this).data('max'), 10);
+          if (isNaN(maxq)) maxq = %d;
+
+          var $wrap = $(this).closest('.qty-stepper');
+          var qty = parseInt($wrap.find('.qty-value').text(), 10);
           if (isNaN(qty)) qty = 0;
+
+          var delta = $(this).hasClass('qty-inc') ? 1 : -1;
+          qty = qty + delta;
+
+          if (qty < 0) qty = 0;
+          if (qty > maxq) qty = maxq;
+
           Shiny.setInputValue('%s', {id: id, qty: qty, nonce: Math.random()}, {priority: 'event'});
         });
 
+        // Donation amount: keep free typing
         $(document).off('input change', '#%s .cart-amt-input');
         $(document).on('input change', '#%s .cart-amt-input', function() {
           var id = $(this).data('itemid');
@@ -1954,13 +2070,20 @@ cfg_get_updated_at_cached <- function(ttl_secs = 1) {
           Shiny.setInputValue('%s', {id: id, amt: amt, nonce: Math.random()}, {priority: 'event'});
         });
         ",
-        box_id, box_id, change_input_id,
+        box_id, box_id,
+        box_id, box_id,
+        as.integer(max_qty),
+        change_input_id,
         box_id, box_id, change_input_id
       )))
     )
   }
 
-  add_rows_to_cart <- function(rows_df) {
+  # -----------------------------------------------------------------------------
+  # SPECIAL EVENT CAPACITY ENFORCEMENT
+  # -----------------------------------------------------------------------------
+
+add_rows_to_cart <- function(rows_df) {
     if (is.null(rows_df) || nrow(rows_df) == 0) {
       return(invisible(FALSE))
     }
@@ -2050,10 +2173,6 @@ cfg_get_updated_at_cached <- function(ttl_secs = 1) {
 
     add_rows_to_cart(rows_df)
   }
-
-  # -----------------------------------------------------------------------------
-  # SPECIAL EVENT CAPACITY ENFORCEMENT
-  # -----------------------------------------------------------------------------
 
   parse_event_id_from_meta <- function(meta_json) {
     s <- as.character(meta_json %||% "")
@@ -2652,7 +2771,7 @@ if (isTRUE(IS_FAKE_MODE)) {
         column(
           4,
           dateInput("xmas_start", "Start date (14-day window)", value = Sys.Date()),
-          numericInput("xmas_qty", "Number of passes", value = 0, min = 0, step = 1),
+          qty_stepper_input("xmas_qty", "Number of passes", value = 0, min = 0, max = 20),
           br(),
           actionButton("xmas_add_to_cart", "Add to cart")
         ),
