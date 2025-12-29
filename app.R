@@ -1,6 +1,6 @@
 # app.R
 # BVXC – Passes, Programs, Events + Admin Controls (Square)
-# v6.3 – 2025-12-23
+# v6.4 – 2025-12-29
 
 # ---- renv -------------------------------------------------------------------
 if (file.exists("renv/activate.R")) {
@@ -990,7 +990,7 @@ checkout_panel_ui <- function(prefix, title = "Checkout") {
       textInput(paste0(prefix, "_buyer_name"), "Name for receipt", value = ""),
       textInput(paste0(prefix, "_buyer_email"), "Email for receipt", value = ""),
       br(),
-      strong(textOutput(paste0(prefix, "_cart_total"))),
+      uiOutput(paste0(prefix, "_cart_total")),
       br(), br(),
       actionButton(paste0(prefix, "_cart_clear"), "Clear cart"),
       uiOutput(paste0(prefix, "_cart_pay_ui"))
@@ -1118,6 +1118,11 @@ css_tabs <- "
   padding: 6px 12px;
   min-width: 160px;
 }
+.cart-total{
+  font-size: 28px;
+  font-weight: 800;
+  margin-top: 8px;
+}
 
 /* ---- Receipt status banners ---- */
 .receipt-card{
@@ -1201,66 +1206,64 @@ ui <- fluidPage(
 
     # --- Global quantity stepper (click-only, no typing) ---
     tags$script(HTML("
-      (function() {
-        function clamp(v, mn, mx) {
-          v = parseInt(v, 10); mn = parseInt(mn, 10); mx = parseInt(mx, 10);
-          if (isNaN(v)) v = 0;
-          if (isNaN(mn)) mn = 0;
-          if (isNaN(mx)) mx = 20;
-          if (v < mn) v = mn;
-          if (v > mx) v = mx;
-          return v;
-        }
+(function() {
+  function clamp(v, mn, mx) {
+    v  = parseInt(v, 10);
+    mn = parseInt(mn, 10);
+    mx = parseInt(mx, 10);
+    if (isNaN(v))  v  = 0;
+    if (isNaN(mn)) mn = 0;
+    if (isNaN(mx)) mx = 20;
+    if (v < mn) v = mn;
+    if (v > mx) v = mx;
+    return v;
+  }
 
-        function push($stepper, v) {
-          var target = $stepper.data('target');
-          if (!target || !window.Shiny) return;
-          Shiny.setInputValue(target, v, {priority: 'event'});
-        }
+  function push($stepper, v) {
+    var target = $stepper.data('target');
+    if (!target || !window.Shiny) return null;
+    Shiny.setInputValue(target, v, { priority: 'event' });
+    return target;
+  }
 
-        $(document).off('click', '.qty-stepper-global .qty-dec, .qty-stepper-global .qty-inc');
-        $(document).on('click', '.qty-stepper-global .qty-dec, .qty-stepper-global .qty-inc', function(e) {
-          e.preventDefault();
+  $(document).off('click.bvxcStepper', '.qty-stepper-global .qty-dec, .qty-stepper-global .qty-inc');
+  $(document).on('click.bvxcStepper', '.qty-stepper-global .qty-dec, .qty-stepper-global .qty-inc', function(e) {
+    e.preventDefault();
 
-          var $stepper = $(this).closest('.qty-stepper-global');
-          var mn = $stepper.data('min');
-          var mx = $stepper.data('max');
+    var $stepper = $(this).closest('.qty-stepper-global');
+    var mn = $stepper.data('min');
+    var mx = $stepper.data('max');
 
-          var $val = $stepper.find('.qty-value');
-          var v = clamp($val.text(), mn, mx);
+    var $val = $stepper.find('.qty-value');
+    var v = clamp($val.text(), mn, mx);
 
-          v = v + ($(this).hasClass('qty-inc') ? 1 : -1);
-          v = clamp(v, mn, mx);
+    v = v + ($(this).hasClass('qty-inc') ? 1 : -1);
+    v = clamp(v, mn, mx);
 
-          $val.text(v);
-          push($stepper, v);
-        });
+    $val.text(v);
+    var target = push($stepper, v);
 
-        // Initialize: push displayed values into Shiny once on load
-        $(function() {
-          $('.qty-stepper-global').each(function() {
-            var $s = $(this);
-            var mn = $s.data('min');
-            var mx = $s.data('max');
-            var v = clamp($s.find('.qty-value').text(), mn, mx);
-            $s.find('.qty-value').text(v);
-            push($s, v);
-          });
-        });
-      })();
-    ")),
+    // If this is a Day Pass stepper, trigger Day “Add to cart”
+    if (target && target.indexOf('day_') === 0) {
+      Shiny.setInputValue('day_add_to_cart', { nonce: Math.random() }, { priority: 'event' });
+    }
+
+    // If this is the Christmas qty stepper, trigger Christmas “Add to cart”
+    if (target === 'xmas_qty') {
+      Shiny.setInputValue('xmas_add_to_cart', { nonce: Math.random() }, { priority: 'event' });
+    }
+  });
+})();
+")),
 
     # --- Existing BVXC bindings (keep as-is) ---
     tags$script(HTML("
 (function() {
   function bindBVXC() {
     if (!window.jQuery || !window.Shiny) return;
-
-    // Prevent double-binding of custom message handlers
     if (window.__bvxcBound) return;
     window.__bvxcBound = true;
 
-    // --- Custom message handlers ---
     Shiny.addCustomMessageHandler('redirect', function(message) {
       try { window.top.location.href = message.url; }
       catch(e) { window.location.href = message.url; }
@@ -1286,34 +1289,21 @@ ui <- fluidPage(
       } catch(e) {}
     });
 
-    // --- Admin table actions (delegated handlers) ---
-
-    // Blocked dates delete
     $(document).off('click.bvxc', 'a.admin-block-del');
     $(document).on('click.bvxc', 'a.admin-block-del', function(e){
       e.preventDefault();
       var d = $(this).data('date');
-      Shiny.setInputValue(
-        'admin_block_del',
-        { date: d, nonce: Math.random() },
-        { priority: 'event' }
-      );
+      Shiny.setInputValue('admin_block_del', { date: d, nonce: Math.random() }, { priority: 'event' });
     });
 
-    // Transactions: load receipt
     $(document).off('click.bvxc', 'a.admin-tx-load');
     $(document).on('click.bvxc', 'a.admin-tx-load', function(e){
       e.preventDefault();
       var tok = $(this).data('token');
-      Shiny.setInputValue(
-        'admin_tx_load',
-        { token: String(tok || ''), nonce: Math.random() },
-        { priority: 'event' }
-      );
+      Shiny.setInputValue('admin_tx_load', { token: String(tok || ''), nonce: Math.random() }, { priority: 'event' });
     });
   }
 
-  // Bind when ready, and retry shortly in case Shiny/jQuery load slightly later
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', bindBVXC);
   } else {
@@ -2792,12 +2782,11 @@ if (isTRUE(IS_FAKE_MODE)) {
         column(
           4,
           uiOutput("day_date_ui"),
-          qty_stepper_input("day_adult", "Adult", value = 0, min = 0, max = 20),
-          qty_stepper_input("day_youth", "Youth", value = 0, min = 0, max = 20),
-          qty_stepper_input("day_under9", "Under 9", value = 0, min = 0, max = 20),
-          qty_stepper_input("day_family", "Family", value = 0, min = 0, max = 20),
+          qty_stepper_input("day_adult", "Adult", value = 0, min = 0, max = 10),
+          qty_stepper_input("day_youth", "Youth", value = 0, min = 0, max = 10),
+          qty_stepper_input("day_under9", "Under 9", value = 0, min = 0, max = 10),
+          qty_stepper_input("day_family", "Family", value = 0, min = 0, max = 10),
           br(),
-          actionButton("day_add_to_cart", "Add to cart")
         ),
         column(8, checkout_panel_ui("day", "Checkout"))
       )
@@ -2813,9 +2802,8 @@ if (isTRUE(IS_FAKE_MODE)) {
         column(
           4,
           dateInput("xmas_start", "Start date (14-day window)", value = Sys.Date()),
-          qty_stepper_input("xmas_qty", "Number of passes", value = 0, min = 0, max = 20),
+          qty_stepper_input("xmas_qty", "Number of passes", value = 0, min = 0, max = 10),
           br(),
-          actionButton("xmas_add_to_cart", "Add to cart")
         ),
         column(8, checkout_panel_ui("xmas", "Checkout"))
       )
@@ -2835,8 +2823,8 @@ if (isTRUE(IS_FAKE_MODE)) {
       fluidRow(
         column(
           4,
-          qty_stepper_input("season_adult", "Adult", value = 0, min = 0, max = 20),
-          qty_stepper_input("season_youth", "Youth", value = 0, min = 0, max = 20),
+          qty_stepper_input("season_adult", "Adult", value = 0, min = 0, max = 10),
+          qty_stepper_input("season_youth", "Youth", value = 0, min = 0, max = 10),
           uiOutput("season_people_ui"),
           br(),
           actionButton("season_add_to_cart", "Add to cart")
@@ -2867,7 +2855,7 @@ if (isTRUE(IS_FAKE_MODE)) {
         column(
           4,
           selectInput("program_choice", "Program", choices = setNames(prog$id, prog$name)),
-          qty_stepper_input("program_qty", "Number of participants", value = 0, min = 0, max = 20),
+          qty_stepper_input("program_qty", "Number of participants", value = 0, min = 0, max = 10),
 
           uiOutput("program_people_ui"),
           br(),
@@ -2887,7 +2875,7 @@ if (isTRUE(IS_FAKE_MODE)) {
         column(
           4,
           uiOutput("event_picker_ui"),
-          qty_stepper_input("event_qty", "Number of participants", value = 0, min = 0, max = 20),
+          qty_stepper_input("event_qty", "Number of participants", value = 0, min = 0, max = 10),
           br(),
           actionButton("event_add_to_cart", "Add to cart")
         ),
@@ -3041,90 +3029,91 @@ if (isTRUE(IS_FAKE_MODE)) {
     dateInput("day_date", "Ski date", value = v, min = min_d, max = max_d)
   })
 
-  # -----------------------------------------------------------------------------
-  # PER-TAB CHECKOUT WIRING (cart shown on every tab)
-  # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# PER-TAB CHECKOUT WIRING (cart shown on every tab)
+# -----------------------------------------------------------------------------
 
-  checkout_prefixes <- c("day", "xmas", "season", "prog", "event", "don")
+checkout_prefixes <- c("day", "xmas", "season", "prog", "event", "don")
 
-  for (p in checkout_prefixes) {
-    local({
-      prefix <- p
-      change_id <- paste0(prefix, "_cart_qty_change")
+for (p in checkout_prefixes) {
+  local({
+    prefix <- p
+    change_id <- paste0(prefix, "_cart_qty_change")
 
-      output[[paste0(prefix, "_cart_list")]] <- renderUI({
-        df <- rv$cart
-        render_cart_list_ui(
-          df,
-          change_input_id = change_id,
-          max_qty         = 20L,
-          show_category   = TRUE
-        )
-      })
-
-      output[[paste0(prefix, "_cart_total")]] <- renderText({
-        df <- rv$cart
-        if (is.null(df) || nrow(df) == 0) {
-          return("Cart is empty.")
-        }
-        tot <- sum(df$quantity * df$unit_price, na.rm = TRUE)
-        paste0("Total: $", sprintf("%.2f", tot))
-      })
-
-      output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
-        has_items <- !is.null(rv$cart) && nrow(rv$cart) > 0
-        actionButton(
-          inputId = paste0(prefix, "_cart_pay"),
-          label   = "Pay now",
-          class   = paste("btn", if (has_items) "pay-now-hot" else "")
-        )
-      })
-
-      # Debounce cart edit events coming from JS-driven inputs
-      cart_change <- reactive(input[[change_id]])
-      cart_change_d <- debounce(cart_change, millis = 300)
-
-      observeEvent(cart_change_d(),
-        {
-          x <- cart_change_d()
-          if (is.null(x) || is.null(x$id)) {
-            return()
-          }
-
-          if (!is.null(x$qty)) {
-            set_cart_qty(x$id, x$qty)
-          } else if (!is.null(x$amt)) {
-            set_cart_amount(x$id, x$amt)
-          }
-        },
-        ignoreInit = TRUE
-      )
-
-      observeEvent(input[[paste0(prefix, "_cart_clear")]],
-        {
-          clear_cart()
-        },
-        ignoreInit = TRUE
-      )
-
-      observeEvent(input[[paste0(prefix, "_cart_pay")]],
-        {
-          nm <- input[[paste0(prefix, "_buyer_name")]] %||% ""
-          em <- input[[paste0(prefix, "_buyer_email")]] %||% ""
-
-          if (!validate_buyer_or_notify(nm, em)) {
-            return()
-          }
-
-          rv$buyer_name <- trimws(as.character(nm))
-          rv$buyer_email <- trimws(as.character(em))
-
-          do_checkout(source = prefix)
-        },
-        ignoreInit = TRUE
+    output[[paste0(prefix, "_cart_list")]] <- renderUI({
+      df <- rv$cart
+      render_cart_list_ui(
+        df,
+        change_input_id = change_id,
+        max_qty         = 20L,
+        show_category   = FALSE
       )
     })
-  }
+
+    # BIGGER total (UI so we can style it like the Pay button)
+    output[[paste0(prefix, "_cart_total")]] <- renderUI({
+      df <- rv$cart
+      if (is.null(df) || nrow(df) == 0) {
+        return(tags$div(class = "cart-total", "Cart is empty."))
+      }
+      tot <- sum(df$quantity * df$unit_price, na.rm = TRUE)
+      tags$div(class = "cart-total", paste0("Total: $", sprintf("%.2f", tot)))
+    })
+
+    output[[paste0(prefix, "_cart_pay_ui")]] <- renderUI({
+      has_items <- !is.null(rv$cart) && nrow(rv$cart) > 0
+      actionButton(
+        inputId = paste0(prefix, "_cart_pay"),
+        label   = "Pay now",
+        class   = paste("btn", if (has_items) "pay-now-hot" else "")
+      )
+    })
+
+    # Debounce cart edit events coming from JS-driven inputs
+    cart_change <- reactive(input[[change_id]])
+    cart_change_d <- debounce(cart_change, millis = 300)
+
+    observeEvent(cart_change_d(),
+      {
+        x <- cart_change_d()
+        if (is.null(x) || is.null(x$id)) {
+          return()
+        }
+
+        if (!is.null(x$qty)) {
+          set_cart_qty(x$id, x$qty)
+        } else if (!is.null(x$amt)) {
+          set_cart_amount(x$id, x$amt)
+        }
+      },
+      ignoreInit = TRUE
+    )
+
+    observeEvent(input[[paste0(prefix, "_cart_clear")]],
+      {
+        clear_cart()
+      },
+      ignoreInit = TRUE
+    )
+
+    observeEvent(input[[paste0(prefix, "_cart_pay")]],
+      {
+        nm <- input[[paste0(prefix, "_buyer_name")]] %||% ""
+        em <- input[[paste0(prefix, "_buyer_email")]] %||% ""
+
+        if (!validate_buyer_or_notify(nm, em)) {
+          return()
+        }
+
+        rv$buyer_name <- trimws(as.character(nm))
+        rv$buyer_email <- trimws(as.character(em))
+
+        do_checkout(source = prefix)
+      },
+      ignoreInit = TRUE
+    )
+  })
+}
 
   # -----------------------------------------------------------------------------
   # CHECKOUT (single path used by all Pay buttons)
@@ -3339,130 +3328,190 @@ session$sendCustomMessage("redirect", list(url = res$checkout_url))
 return(invisible(TRUE))
 } # END do_checkout
 
-  # -----------------------------------------------------------------------------
-  # DAY PASS
-  # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# DAY PASS
+# -----------------------------------------------------------------------------
 
-  observeEvent(input$day_add_to_cart, {
-    w <- season_win()
-    d <- suppressWarnings(as.Date(input$day_date))
-    if (is.na(d)) {
-      showNotification("Please select a valid ski date.", type = "error")
-      return()
-    }
+observeEvent(input$day_add_to_cart, {
 
-    if (d < w$start || d > w$end) {
-      showNotification("That date is outside the current season window.", type = "error")
-      return()
-    }
+  # Guard: when the UI button is removed, this input is driven by JS.
+  # It can be NULL early, so explain nothing, do nothing.
+  if (is.null(input$day_add_to_cart)) return()
 
-    if (as.character(d) %in% blocked_chr()) {
-      showNotification("That date is blocked. Choose another date.", type = "error")
-      bump_day_date_ui()
-      return()
-    }
+  w <- season_win()
 
-    prices <- get_day_prices()
-    pr <- setNames(prices$price, prices$type)
+  d <- suppressWarnings(as.Date(input$day_date))
+  if (is.na(d)) {
+    showNotification("Please select a valid ski date.", type = "error")
+    return()
+  }
 
-    qa <- qty_int(input$day_adult, "Adult")
-    qy <- qty_int(input$day_youth, "Youth")
-    qu <- qty_int(input$day_under9, "Under 9")
-    qf <- qty_int(input$day_family, "Family")
+  if (d < w$start || d > w$end) {
+    showNotification("That date is outside the current season window.", type = "error")
+    return()
+  }
 
-    rows <- list()
+  if (as.character(d) %in% blocked_chr()) {
+    showNotification("That date is blocked. Choose another date.", type = "error")
+    bump_day_date_ui()
+    return()
+  }
 
-    add_row <- function(type, qty, price) {
-      if (qty <= 0) {
-        return(TRUE)
-      }
-      p <- suppressWarnings(as.numeric(price))
-      if (is.na(p)) {
-        showNotification("Price is N/A. Admin must set prices first.", type = "error")
-        return(FALSE)
-      }
-      rows[[length(rows) + 1L]] <<- data.frame(
-        id = UUIDgenerate(),
-        category = "day_pass",
-        description = paste("Day pass –", type, "–", as.character(d)),
-        quantity = as.integer(min(qty, 20L)),
-        unit_price = p,
-        meta_json = as.character(jsonlite::toJSON(list(type = type, date = as.character(d)), auto_unbox = TRUE, null = "null")),
-        merge_key = "",
-        stringsAsFactors = FALSE
-      )
-      TRUE
-    }
+  prices <- get_day_prices()
+  pr <- setNames(prices$price, prices$type)
 
-    ok <- add_row("Adult", qa, pr[["Adult"]])
-    if (!ok) {
-      return()
-    }
-    ok <- add_row("Youth", qy, pr[["Youth"]])
-    if (!ok) {
-      return()
-    }
-    ok <- add_row("Under 9", qu, pr[["Under 9"]])
-    if (!ok) {
-      return()
-    }
-    ok <- add_row("Family", qf, pr[["Family"]])
-    if (!ok) {
-      return()
-    }
+  qa <- qty_int(input$day_adult,  "Adult")
+  qy <- qty_int(input$day_youth,  "Youth")
+  qu <- qty_int(input$day_under9, "Under 9")
+  qf <- qty_int(input$day_family, "Family")
 
-    if (length(rows) == 0) {
-      showNotification("Nothing to add.", type = "warning")
-      return()
-    }
-
-    add_rows_to_cart(do.call(rbind, rows))
-  })
-
-  # -----------------------------------------------------------------------------
-  # CHRISTMAS PASS
-  # -----------------------------------------------------------------------------
-
-  observeEvent(input$xmas_add_to_cart, {
-    start_raw <- input$xmas_start
-    if (is.null(start_raw) || length(start_raw) == 0 || !nzchar(as.character(start_raw))) {
-      showNotification("Choose a start date.", type = "error")
-      return()
-    }
-
-    start <- suppressWarnings(as.Date(start_raw))
-    if (is.na(start)) {
-      showNotification("Choose a valid start date.", type = "error")
-      return()
-    }
-
-    qty <- qty_int(input$xmas_qty, "Passes")
-    if (qty <= 0) {
-      showNotification("Enter a quantity greater than zero.", type = "error")
-      return()
-    }
-
-    end <- start + 13
-    dec25 <- as.Date(sprintf("%d-12-25", as.integer(format(start, "%Y"))))
-    includes_dec25 <- (dec25 >= start) && (dec25 <= end)
-
-    if (!includes_dec25) {
-      showNotification("The 14-day window must include Dec 25.", type = "error")
-      return()
-    }
-
-    add_to_cart(
-      category    = "christmas_pass",
-      description = paste0("Christmas Pass – ", format(start), " to ", format(end)),
-      quantity    = qty,
-      unit_price  = get_christmas_pass_price(),
-      meta        = list(start = as.character(start), end = as.character(end))
+  # Ensure cart exists
+  df <- rv$cart
+  if (is.null(df) || nrow(df) == 0) {
+    df <- data.frame(
+      id          = character(),
+      category    = character(),
+      description = character(),
+      quantity    = integer(),
+      unit_price  = numeric(),
+      meta_json   = character(),
+      merge_key   = character(),
+      stringsAsFactors = FALSE
     )
-  })
+  }
 
-  # -----------------------------------------------------------------------------
-  # SEASON PASS
-  # -----------------------------------------------------------------------------
+  # CRITICAL: replace existing Day Pass lines for THIS DATE (don’t accumulate)
+  date_str <- as.character(d)
+  is_day_this_date <- (df$category == "day_pass") & grepl(date_str, df$description, fixed = TRUE)
+  df <- df[!is_day_this_date, , drop = FALSE]
+
+  make_row <- function(type, qty) {
+    if (qty <= 0) return(NULL)
+
+    p <- suppressWarnings(as.numeric(pr[[type]]))
+    if (is.na(p)) {
+      showNotification("Price is N/A. Admin must set prices first.", type = "error")
+      return(NULL)
+    }
+
+    data.frame(
+      id          = UUIDgenerate(),
+      category    = "day_pass",
+      description = paste("Day pass –", type, "–", date_str),
+      quantity    = as.integer(min(qty, 20L)),
+      unit_price  = p,
+      meta_json   = as.character(jsonlite::toJSON(list(type = type, date = date_str),
+                                                 auto_unbox = TRUE, null = "null")),
+      merge_key   = paste("day_pass", type, date_str, sep = "|"),
+      stringsAsFactors = FALSE
+    )
+  }
+
+  rows <- Filter(Negate(is.null), list(
+    make_row("Adult",   qa),
+    make_row("Youth",   qy),
+    make_row("Under 9", qu),
+    make_row("Family",  qf)
+  ))
+
+  if (length(rows) == 0) {
+    rv$cart <- normalize_cart(df)
+    showNotification("Nothing to add.", type = "warning")
+    return()
+  }
+
+  rv$cart <- normalize_cart(rbind(df, do.call(rbind, rows)))
+
+}, ignoreInit = TRUE)
+
+# -----------------------------------------------------------------------------
+# CHRISTMAS PASS
+# -----------------------------------------------------------------------------
+
+observeEvent(input$xmas_add_to_cart, {
+
+  # Guard: JS-driven input can be NULL early; do nothing.
+  if (is.null(input$xmas_add_to_cart)) return()
+
+  start_raw <- input$xmas_start
+  if (is.null(start_raw) || length(start_raw) == 0 || !nzchar(as.character(start_raw))) {
+    showNotification("Choose a start date.", type = "error")
+    return()
+  }
+
+  start <- suppressWarnings(as.Date(start_raw))
+  if (is.na(start)) {
+    showNotification("Choose a valid start date.", type = "error")
+    return()
+  }
+
+  qty <- qty_int(input$xmas_qty, "Passes")
+
+  end <- start + 13
+  dec25 <- as.Date(sprintf("%d-12-25", as.integer(format(start, "%Y"))))
+  includes_dec25 <- (dec25 >= start) && (dec25 <= end)
+
+  if (!includes_dec25) {
+    showNotification("The 14-day window must include Dec 25.", type = "error")
+    return()
+  }
+
+  # Ensure cart exists
+  df <- rv$cart
+  if (is.null(df) || nrow(df) == 0) {
+    df <- data.frame(
+      id          = character(),
+      category    = character(),
+      description = character(),
+      quantity    = integer(),
+      unit_price  = numeric(),
+      meta_json   = character(),
+      merge_key   = character(),
+      stringsAsFactors = FALSE
+    )
+  }
+
+  # CRITICAL: replace existing Christmas Pass line(s) (don’t accumulate)
+  df <- df[df$category != "christmas_pass", , drop = FALSE]
+
+  # qty <= 0 => treat as “remove”
+  if (qty <= 0) {
+    rv$cart <- normalize_cart(df)
+    showNotification("Nothing to add.", type = "warning")
+    return()
+  }
+
+  p <- suppressWarnings(as.numeric(get_christmas_pass_price()))
+  if (is.na(p)) {
+    showNotification("Price is N/A. Admin must set prices first.", type = "error")
+    rv$cart <- normalize_cart(df)
+    return()
+  }
+
+  start_str <- as.character(start)
+  end_str   <- as.character(end)
+
+  new_row <- data.frame(
+    id          = UUIDgenerate(),
+    category    = "christmas_pass",
+    description = paste0("Christmas Pass – ", start_str, " to ", end_str),
+    quantity    = as.integer(min(qty, 20L)),
+    unit_price  = p,
+    meta_json   = as.character(jsonlite::toJSON(
+      list(start = start_str, end = end_str),
+      auto_unbox = TRUE, null = "null"
+    )),
+    merge_key   = paste("christmas_pass", start_str, end_str, sep = "|"),
+    stringsAsFactors = FALSE
+  )
+
+  rv$cart <- normalize_cart(rbind(df, new_row))
+
+}, ignoreInit = TRUE)
+
+# -----------------------------------------------------------------------------
+# SEASON PASS
+# -----------------------------------------------------------------------------
 
   output$season_info <- renderUI({
     cutoff <- get_early_bird_cutoff()
