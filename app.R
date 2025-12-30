@@ -21,14 +21,24 @@ suppressPackageStartupMessages({
 })
 
 # DT is optional on Connect Cloud (prevents app startup crash)
-HAVE_DT <- requireNamespace("DT", quietly = TRUE)
+# Lazy-load: only check/load DT when Admin tab is accessed
+DT_STATE <- new.env(parent = emptyenv())
+DT_STATE$checked <- FALSE
+DT_STATE$available <- FALSE
+
+have_dt <- function() {
+  if (!DT_STATE$checked) {
+    DT_STATE$available <- requireNamespace("DT", quietly = TRUE)
+    DT_STATE$checked <- TRUE
+  }
+  DT_STATE$available
+}
 
 # -----------------------------------------------------------------------------
 # GLOBAL SETTINGS / ENV
 # -----------------------------------------------------------------------------
 
 Sys.setenv(TZ = "America/Vancouver")
-APP_VERSION <- "BVXC v6.4 2025-12-30"
 
 CFG_TX_ITEMS_BACKFILL_V1_DONE <- "tx_items_backfill_v1_done"
 
@@ -65,12 +75,6 @@ if ((SQUARE_ENV == "production" || (SQUARE_ENV == "sandbox" && SANDBOX_MODE == "
 
 if (!is.na(RETURN_BASE_URL) && nzchar(RETURN_BASE_URL)) {
   RETURN_BASE_URL <- trim_trailing_slash(RETURN_BASE_URL)
-}
-
-ENV_LABEL <- if (SQUARE_ENV == "sandbox") {
-  if (SANDBOX_MODE == "fake") "[SANDBOX – FAKE PAYMENTS]" else "[SANDBOX – SQUARE CHECKOUT]"
-} else {
-  "[LIVE – PRODUCTION]"
 }
 
 # After HAVE_SQUARE_CREDS is set and after the "force fake mode if no creds" block
@@ -1581,7 +1585,7 @@ server <- function(input, output, session) {
   # -----------------------------------------------------------------------------
 
   config_updated_at <- reactivePoll(
-    intervalMillis = 60000,
+    intervalMillis = 120000,
     session        = session,
     checkFunc      = function() cfg_get_updated_at_cached(1),
     valueFunc      = function() cfg_get_updated_at_cached(1)
@@ -1844,16 +1848,25 @@ server <- function(input, output, session) {
     as.character(jsonlite::toJSON(obj, auto_unbox = TRUE, null = "null"))
   }
 
+  ascii_safe <- function(x) {
+    x <- enc2utf8(as.character(x))
+    x <- gsub("\u2013", "-", x, fixed = TRUE)  # en-dash → hyphen
+    iconv(x, from = "UTF-8", to = "ASCII//TRANSLIT", sub = "-")
+  }
+
   cart_merge_key <- function(category, description, unit_price, meta_json) {
     p <- suppressWarnings(as.numeric(unit_price))
     if (is.na(p)) p <- NA_real_
-    paste(
+
+    key <- paste(
       as.character(category %||% ""),
       as.character(description %||% ""),
       sprintf("%.4f", p),
       canonical_meta_json(meta_json),
       sep = "|||"
     )
+
+    ascii_safe(key)
   }
 
   normalize_cart <- function(df) {
@@ -2411,9 +2424,9 @@ add_rows_to_cart <- function(rows_df) {
 
       sold_i <- sold_map[eid]  # safe even when sold_map is empty
       if (length(sold_i) == 0 || is.na(sold_i[1])) {
-      sold_i <- 0L
+       sold_i <- 0L
       } else {
-      sold_i <- as.integer(sold_i[1])
+       sold_i <- as.integer(sold_i[1])
       }
 
       remaining <- cap - sold_i
@@ -4701,7 +4714,7 @@ tagList(
         )
       ),
       br(),
-      if (isTRUE(HAVE_DT)) {
+      if (have_dt()) {
         DT::DTOutput("admin_tx_table")
       } else {
         tags$div(
@@ -4750,7 +4763,7 @@ tagList(
   }
 
   # Only register the DT output if DT exists on this host
-  if (isTRUE(HAVE_DT)) {
+ if (have_dt()) {
 
     output$admin_tx_table <- DT::renderDT({
 
@@ -4834,8 +4847,6 @@ tagList(
         "created_at","buyer_name","buyer_email","tx_type","total","status","action",
         "email_sort","total_sort"
       ), drop = FALSE]
-
-print(names(df_out))
 
       DT::datatable(
         df_out,
