@@ -589,11 +589,17 @@ cfg_set_sentinel <- function(key, done = TRUE) {
 }
 
 # Call init_db ONCE — skip if DB already initialized
+
 if (!cfg_bool("db_init_v1_done")) {
   timed("init_db()", init_db())
   cfg_set_sentinel("db_init_v1_done", TRUE)
 } else {
   cat("[PERF] init_db() skipped (already done)\n")
+}
+
+# One-time backfill (per process, not per session)
+if (!cfg_bool(CFG_TX_ITEMS_BACKFILL_V1_DONE)) {
+  try(ensure_tx_items_backfill_completed(), silent = TRUE)
 }
 
 # -----------------------------------------------------------------------------
@@ -1598,14 +1604,6 @@ server <- function(input, output, session) {
     receipt_qr_token = "",
     receipt_qr_file  = ""
   )
-
-  # One-time DB maintenance (cross-process): backfill tx_items if needed
-  # DB sentinel controls "done" state across sessions/processes
-  try({
-    if (!cfg_bool(CFG_TX_ITEMS_BACKFILL_V1_DONE)) {
-      ensure_tx_items_backfill_completed()
-    }
-  }, silent = TRUE)
 
   # ---- tiny cache so reactivePoll doesn't hit DB twice every interval ----
   CFG_UPDATED_CACHE <- new.env(parent = emptyenv())
