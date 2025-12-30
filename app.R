@@ -579,18 +579,13 @@ cfg_date <- function(key, default = as.Date(NA)) {
   if (is.na(d)) default else d
 }
 
-cfg_get_sentinel <- function(key) {
-  v <- tolower(trimws(cfg_get(key, default = "")))
-  v %in% c("1", "true", "yes", "on")
-}
-
 cfg_set_sentinel <- function(key, done = TRUE) {
   cfg_set(key, if (isTRUE(done)) "1" else "0")
   invisible(TRUE)
 }
 
 # Call init_db ONCE — skip if DB already initialized
-if (!cfg_get_sentinel("db_init_v1_done")) {
+if (!cfg_bool("db_init_v1_done")) {
   timed("init_db()", init_db())
   cfg_set_sentinel("db_init_v1_done", TRUE)
 } else {
@@ -1397,7 +1392,7 @@ extract_item_id_for_tx_item <- function(category, meta_json) {
 ensure_tx_items_backfill_completed <- function(batch = 200L, max_batches = 20L) {
 
   # If already done (DB sentinel), skip
-  if (cfg_get_sentinel(CFG_TX_ITEMS_BACKFILL_V1_DONE)) {
+  if (cfg_bool(CFG_TX_ITEMS_BACKFILL_V1_DONE)) {
     return(invisible(TRUE))
   }
 
@@ -1595,7 +1590,7 @@ server <- function(input, output, session) {
   # One-time DB maintenance (cross-process): backfill tx_items if needed
   # DB sentinel controls "done" state across sessions/processes
   try({
-    if (!cfg_get_sentinel(CFG_TX_ITEMS_BACKFILL_V1_DONE)) {
+    if (!cfg_bool(CFG_TX_ITEMS_BACKFILL_V1_DONE)) {
       ensure_tx_items_backfill_completed()
     }
   }, silent = TRUE)
