@@ -877,18 +877,32 @@ square_http_get <- function(path, query = list()) {
 
 square_http_post <- function(path, body) {
   res <- timed(paste0("square_http_post() ", path), {
-    httr::POST(
-      url = paste0(square_base_url(), path),
-      square_headers(include_version = TRUE),
-      httr::content_type_json(),
-      body = body,
-      encode = "json",
-      httr::timeout(15)
+    tryCatch(
+      httr::POST(
+        url = paste0(square_base_url(), path),
+        square_headers(include_version = TRUE),
+        httr::content_type_json(),
+        body = body,
+        encode = "json",
+        httr::timeout(45)
+      ),
+      error = function(e) e
     )
   })
 
+  if (inherits(res, "error")) {
+    return(list(
+      status = 599L,
+      body   = list(error = conditionMessage(res)),
+      raw    = NULL
+    ))
+  }
+
   body_parsed <- timed(paste0("square_safe_json() ", path), {
-    square_safe_json(res)
+    tryCatch(
+      square_safe_json(res),
+      error = function(e) list(error = conditionMessage(e))
+    )
   })
 
   list(status = httr::status_code(res), body = body_parsed, raw = res)
@@ -933,11 +947,19 @@ create_square_checkout_from_cart <- function(cart_df,
     body$pre_populated_data <- list(buyer_email = buyer_email)
   }
 
-  r <- square_http_post("/v2/online-checkout/payment-links", body = body)
-  if (r$status >= 300 || is.null(r$body$payment_link$url)) {
-    warning("Square payment link error: ", httr::content(r$raw, as = "text", encoding = "UTF-8"))
-    return(NULL)
+r <- square_http_post("/v2/online-checkout/payment-links", body = body)
+if (r$status >= 300 || is.null(r$body$payment_link$url)) {
+  err_txt <- if (!is.null(r$raw)) {
+    httr::content(r$raw, as = "text", encoding = "UTF-8")
+  } else {
+    paste0(
+      "status=", r$status,
+      " body=", jsonlite::toJSON(r$body, auto_unbox = TRUE, null = "null")
+    )
   }
+  warning("Square payment link error: ", err_txt)
+  return(NULL)
+}
 
   pl <- r$body$payment_link
   list(
