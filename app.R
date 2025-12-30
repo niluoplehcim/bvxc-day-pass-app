@@ -3026,12 +3026,30 @@ output$tab_admin_ui <- renderUI({
 
 checkout_prefixes <- c("day", "xmas", "season", "prog", "event", "don")
 
+# Map prefix to tab name for lazy rendering
+CHECKOUT_TAB_MAP <- c(
+  day = "Day Pass",
+  xmas = "Christmas Pass",
+  season = "Season Pass",
+  prog = "Programs",
+  event = "Special Events",
+  don = "Donation"
+)
+
 for (p in checkout_prefixes) {
   local({
     prefix <- p
     change_id <- paste0(prefix, "_cart_qty_change")
+    tab_name <- CHECKOUT_TAB_MAP[[prefix]]
 
     output[[paste0(prefix, "_cart_list")]] <- renderUI({
+      # PERF: Only render cart UI for the ACTIVE tab
+      # This reduces rendering from 6x to 1x per cart change
+      current_tab <- input$main_nav
+      if (!is.null(current_tab) && !identical(current_tab, tab_name)) {
+        return(NULL)
+      }
+      
       df <- rv$cart
       render_cart_list_ui(
         df,
