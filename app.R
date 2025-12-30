@@ -1,6 +1,6 @@
 # app.R
 # BVXC – Passes, Programs, Events + Admin Controls (Square)
-# v6.4 – 2025-12-29
+# v6.4 – 2025-12-30
 
 # ---- renv -------------------------------------------------------------------
 if (file.exists("renv/activate.R")) {
@@ -18,7 +18,6 @@ suppressPackageStartupMessages({
   library(pool)
   library(RPostgres)
   library(htmltools)
-  library(base64enc)
 })
 
 # DT is optional on Connect Cloud (prevents app startup crash)
@@ -29,7 +28,7 @@ HAVE_DT <- requireNamespace("DT", quietly = TRUE)
 # -----------------------------------------------------------------------------
 
 Sys.setenv(TZ = "America/Vancouver")
-APP_VERSION <- "BVXC v6.3 – Age enforcement + receipt labels + meta-unique per person – 2025-12-23"
+APP_VERSION <- "BVXC v6.4 2025-12-30"
 
 CFG_TX_ITEMS_BACKFILL_V1_DONE <- "tx_items_backfill_v1_done"
 
@@ -597,11 +596,11 @@ get_early_bird_cutoff <- function() cfg_date("early_bird_cutoff", as.Date(NA))
 
 get_day_prices <- function() {
   data.frame(
-    type = c("Adult", "Youth", "Under 9", "Family"),
+    type = c("Adult", "Youth", "Child", "Family"),
     price = c(
       cfg_num("price_day_adult", NA_real_),
       cfg_num("price_day_youth", NA_real_),
-      cfg_num("price_day_under9", NA_real_),
+      cfg_num("price_day_child", NA_real_),
       cfg_num("price_day_family", NA_real_)
     ),
     stringsAsFactors = FALSE
@@ -812,12 +811,6 @@ fmt_person_from_meta_obj <- function(obj, name_key, dob_key) {
   if (!nzchar(dob)) return(nm)
 
   paste0(nm, " — DOB: ", dob)
-}
-
-# Backward-compatible wrapper (keeps your old function name/signature)
-fmt_person_from_meta <- function(meta_json, name_key, dob_key) {
-  obj <- parse_meta_obj_safe(meta_json)
-  fmt_person_from_meta_obj(obj, name_key, dob_key)
 }
 
 # Build a line item label when you already have the parsed meta object
@@ -1413,32 +1406,12 @@ ensure_tx_items_backfill_completed <- function(batch = 200L, max_batches = 20L) 
       ix <- which(cart_df$category %in% c("event", "program"))
       if (length(ix) == 0) next
 
-      with_db(function(con) {
-        DBI::dbWithTransaction(con, {
-
-          for (j in ix) {
-            item_id <- extract_item_id_for_tx_item(cart_df$category[j], cart_df$meta_json[j])
-            if (!nzchar(item_id)) next
-
-            q <- suppressWarnings(as.integer(cart_df$quantity[j] %||% 0L))
-            if (is.na(q) || q <= 0L) next
-
-            db_exec(
-              con,
-              "INSERT INTO tx_items (id, tx_id, category, item_id, qty, status, created_at)
-               VALUES (?id, ?tx_id, ?category, ?item_id, ?qty, ?status, ?created_at)",
-              id         = UUIDgenerate(),
-              tx_id      = tid,
-              category   = as.character(cart_df$category[j]),
-              item_id    = item_id,
-              qty        = q,
-              status     = st,
-              created_at = ca
-            )
-          }
-
-        })
-      })
+      insert_tx_items_for_cart(
+        tx_id      = tid,
+        created_at = ca,
+        status     = st,
+        cart_df    = cart_df
+      )
     }
   }
 
@@ -1505,6 +1478,43 @@ server <- function(input, output, session) {
     )
   }
 
+  season_pass_row <- function(type_key, unit_price, is_early_bird, holder_name, holder_dob, age_ref, age_years) {
+    type_key <- as.character(type_key %||% "")
+    type_lbl <- paste0(toupper(substr(type_key, 1, 1)), substr(type_key, 2, nchar(type_key)))
+
+    dob_chr <- as.character(as.Date(holder_dob))
+
+    data.frame(
+      id          = UUIDgenerate(),
+      category    = "season_pass",
+      description = paste0("Season pass – ", type_lbl),
+      quantity    = 1L,
+      unit_price  = suppressWarnings(as.numeric(unit_price)),
+      meta_json   = as.character(jsonlite::toJSON(
+        list(
+          type        = type_key,
+          early_bird  = isTRUE(is_early_bird),
+          holder_uid  = UUIDgenerate(), # prevents merge collapse
+          holder_name = as.character(holder_name),
+          holder_dob  = dob_chr,
+          age_ref     = as.character(age_ref),
+          age_years   = as.integer(age_years)
+        ),
+        auto_unbox = TRUE, null = "null"
+      )),
+      merge_key   = "",
+      stringsAsFactors = FALSE
+    )
+  }
+
+  age_enforcement_box <- function() {
+    tags$div(
+      style = "margin:8px 0; padding:10px; border:1px solid #ddd; border-radius:6px; background:#fafafa;",
+      tags$strong("Age enforcement: "),
+      "Adult 19+; Youth 9–18. Age is as-of Dec 31 of the season."
+    )
+  }
+
   rv <- reactiveValues(
     cart             = empty_cart_df(),
     buyer_name       = "",
@@ -1532,17 +1542,17 @@ server <- function(input, output, session) {
   CFG_UPDATED_CACHE$val <- ""
   CFG_UPDATED_CACHE$t <- as.POSIXct(0, origin = "1970-01-01")
 
-cfg_get_updated_at_cached <- function(ttl_secs = 1) {
-  age <- as.numeric(difftime(Sys.time(), CFG_UPDATED_CACHE$t, units = "secs"))
-  if (!is.na(age) && age <= ttl_secs) {
-    return(CFG_UPDATED_CACHE$val)
-  }
+  cfg_get_updated_at_cached <- function(ttl_secs = 1) {
+    age <- as.numeric(difftime(Sys.time(), CFG_UPDATED_CACHE$t, units = "secs"))
+    if (!is.na(age) && age <= ttl_secs) {
+      return(CFG_UPDATED_CACHE$val)
+    }
 
-  v <- cfg_get_db("__config_updated_at", "")
-  CFG_UPDATED_CACHE$val <- as.character(v %||% "")
-  CFG_UPDATED_CACHE$t <- Sys.time()
-  CFG_UPDATED_CACHE$val
-}
+    v <- cfg_get_db("__config_updated_at", "")
+    CFG_UPDATED_CACHE$val <- as.character(v %||% "")
+    CFG_UPDATED_CACHE$t <- Sys.time()
+    CFG_UPDATED_CACHE$val
+  }
 
   # -----------------------------------------------------------------------------
   # CONFIG REACTIVITY: re-render nav when config changes
@@ -2772,105 +2782,100 @@ if (isTRUE(IS_FAKE_MODE)) {
   # TAB BODIES (LAZY): each tab UI is only created when the tab is active
   # -----------------------------------------------------------------------------
 
-  output$tab_day_ui <- renderUI({
-    req(identical(input$main_nav, "Day Pass"))
-    fluidPage(
-      h3("Day Passes"),
-      p("Choose your ski day and passes, then add to cart. Review and pay on the right."),
-      p(style = "color:#666;", "Age buckets: Child 0–8, Youth 9–18, Adult 19+."),
-      fluidRow(
-        column(
-          4,
-          uiOutput("day_date_ui"),
-          qty_stepper_input("day_adult", "Adult", value = 0, min = 0, max = 10),
-          qty_stepper_input("day_youth", "Youth", value = 0, min = 0, max = 10),
-          qty_stepper_input("day_under9", "Under 9", value = 0, min = 0, max = 10),
-          qty_stepper_input("day_family", "Family", value = 0, min = 0, max = 10),
-          br(),
-        ),
-        column(8, checkout_panel_ui("day", "Checkout"))
-      )
-    )
-  })
-
-  output$tab_xmas_ui <- renderUI({
-    req(identical(input$main_nav, "Christmas Pass"))
-    fluidPage(
-      h3("Christmas Pass"),
-      p("Choose a 14-day window that must include Dec 25. Add to cart, then pay on the right."),
-      fluidRow(
-        column(
-          4,
-          dateInput("xmas_start", "Start date (14-day window)", value = Sys.Date()),
-          qty_stepper_input("xmas_qty", "Number of passes", value = 0, min = 0, max = 10),
-          br(),
-        ),
-        column(8, checkout_panel_ui("xmas", "Checkout"))
-      )
-    )
-  })
-
-  output$tab_season_ui <- renderUI({
-    req(identical(input$main_nav, "Season Pass"))
-    fluidPage(
-      h3("Season Passes"),
-      uiOutput("season_info"),
-      tags$div(
-        style = "margin:8px 0; padding:10px; border:1px solid #ddd; border-radius:6px; background:#fafafa;",
-        tags$strong("Age enforcement: "),
-        "Adult requires age 19+; Youth requires age 9–18 (age as-of Dec 31 of the season)."
+output$tab_day_ui <- renderUI({
+  req(identical(input$main_nav, "Day Pass"))
+  fluidPage(
+    h3("Day Passes"),
+    tags$ol(
+      tags$li("Pay online. Keep the Square receipt and QR code for verification."),
+      tags$li("Pick up tickets from the envelopes at the trailhead. Fill the registration form and mark “Paid online”."),
+      tags$li("Enjoy your ski day.")
+    ),
+    fluidRow(
+      column(
+        4,
+        uiOutput("day_date_ui"),
+        qty_stepper_input("day_adult",  "Adult (19+)",  value = 0, min = 0, max = 10),
+        qty_stepper_input("day_youth",  "Youth (9–18)", value = 0, min = 0, max = 10),
+        qty_stepper_input("day_child", "Child (0–8)",  value = 0, min = 0, max = 10),
+        qty_stepper_input("day_family", "Family",       value = 0, min = 0, max = 10),
+        br()
       ),
-      fluidRow(
-        column(
-          4,
-          qty_stepper_input("season_adult", "Adult", value = 0, min = 0, max = 10),
-          qty_stepper_input("season_youth", "Youth", value = 0, min = 0, max = 10),
-          uiOutput("season_people_ui"),
-          br(),
-          actionButton("season_add_to_cart", "Add to cart")
-        ),
-        column(8, checkout_panel_ui("season", "Checkout"))
-      )
+      column(8, checkout_panel_ui("day", "Checkout"))
     )
-  })
+  )
+})
 
-  output$tab_prog_ui <- renderUI({
-    req(identical(input$main_nav, "Programs"))
-
-    # Invalidate this UI when config changes (so program list/prices/caps refresh)
-    config_updated_at()
-
-    # Compute program list only when Programs tab is opened OR config changes
-    prog <- get_program_list()
-
-    fluidPage(
-      h3("Programs"),
-      tags$div(
-        style = "margin:8px 0; padding:10px; border:1px solid #ddd; border-radius:6px; background:#fafafa;",
-        tags$strong("Age rule: "),
-        "Program eligibility is checked using age as-of Dec 31 of the ski season."
+output$tab_xmas_ui <- renderUI({
+  req(identical(input$main_nav, "Christmas Pass"))
+  fluidPage(
+    h3("Christmas Pass"),
+    tags$ol(
+      tags$li("Pay online here. Keep the Square receipt and QR code for verification."),
+      tags$li("Choose a 14-day window that includes Dec 25."),
+      tags$li("Pick up your pass at McBike.")
+    ),
+    fluidRow(
+      column(
+        4,
+        dateInput("xmas_start", "Start date (14-day window)", value = Sys.Date()),
+        qty_stepper_input("xmas_qty", "Number of passes", value = 0, min = 0, max = 10),
+        br()
       ),
-      p("Select a program and number of participants, then add to cart. Review and pay on the right."),
-      fluidRow(
-        column(
-          4,
-          selectInput("program_choice", "Program", choices = setNames(prog$id, prog$name)),
-          qty_stepper_input("program_qty", "Number of participants", value = 0, min = 0, max = 10),
-
-          uiOutput("program_people_ui"),
-          br(),
-          actionButton("program_add_to_cart", "Add to cart")
-        ),
-        column(8, checkout_panel_ui("prog", "Checkout"))
-      )
+      column(8, checkout_panel_ui("xmas", "Checkout"))
     )
-  })
+  )
+})
+
+output$tab_season_ui <- renderUI({
+  req(identical(input$main_nav, "Season Pass"))
+  fluidPage(
+    h3("Season Passes"),
+    age_enforcement_box(),
+    fluidRow(
+      column(
+        4,
+        qty_stepper_input("season_adult", "Adult", value = 0, min = 0, max = 10),
+        qty_stepper_input("season_youth", "Youth", value = 0, min = 0, max = 10),
+        uiOutput("season_people_ui"),
+        br(),
+        actionButton("season_add_to_cart", "Add to cart")
+      ),
+      column(8, checkout_panel_ui("season", "Checkout"))
+    )
+  )
+})
+
+output$tab_prog_ui <- renderUI({
+  req(identical(input$main_nav, "Programs"))
+
+  # Invalidate this UI when config changes (so program list/prices/caps refresh)
+  config_updated_at()
+
+  # Compute program list only when Programs tab is opened OR config changes
+  prog <- get_program_list()
+
+  fluidPage(
+    h3("Programs"),
+    age_enforcement_box(),
+    fluidRow(
+      column(
+        4,
+        selectInput("program_choice", "Program", choices = setNames(prog$id, prog$name)),
+        qty_stepper_input("program_qty", "Number of participants", value = 0, min = 0, max = 10),
+        uiOutput("program_people_ui"),
+        br(),
+        actionButton("program_add_to_cart", "Add to cart")
+      ),
+      column(8, checkout_panel_ui("prog", "Checkout"))
+    )
+  )
+})
 
   output$tab_event_ui <- renderUI({
     req(identical(input$main_nav, "Special Events"))
     fluidPage(
       h3("Special Events"),
-      p("Add one or more special event registrations to the cart. Review and pay on the right."),
       fluidRow(
         column(
           4,
@@ -2888,7 +2893,6 @@ if (isTRUE(IS_FAKE_MODE)) {
     req(identical(input$main_nav, "Donation"))
     fluidPage(
       h3("Donation"),
-      p("Add a donation to the cart and pay on the right."),
       tags$div(
         style = "margin-top: 8px; padding: 10px; border: 1px solid #ddd; border-radius: 6px; background: #fafafa;",
         tags$strong("Important: "),
@@ -2915,31 +2919,18 @@ if (isTRUE(IS_FAKE_MODE)) {
     )
   })
 
-  output$tab_admin_ui <- renderUI({
-    req(identical(input$main_nav, "Admin"))
-    fluidPage(
-      h3("Admin"),
-      tags$p(APP_VERSION),
-      tags$p(ENV_LABEL),
-      if (db_is_postgres()) {
-        tags$div(
-          style = "margin:8px 0; padding:10px; border:1px solid #ddd; border-radius:6px; background:#fafafa;",
-          tags$strong("Database: "), "Postgres (BVXC_DB_URL set)"
-        )
-      } else {
-        tags$div(
-          style = "margin:8px 0; padding:10px; border:1px solid #ffc107; border-radius:6px; background:#fff8e1;",
-          tags$strong("Database: "), "SQLite fallback (dev only). Do not use this on Connect Cloud for persistence."
-        )
-      },
-      hr(),
-      passwordInput("admin_password", "Admin password"),
-      actionButton("admin_login", "Log in"),
-      uiOutput("admin_lock_msg"),
-      br(),
-      uiOutput("admin_content")
-    )
-  })
+output$tab_admin_ui <- renderUI({
+  req(identical(input$main_nav, "Admin"))
+  fluidPage(
+    h3("Admin"),
+    hr(),
+    passwordInput("admin_password", "Admin password"),
+    actionButton("admin_login", "Log in"),
+    uiOutput("admin_lock_msg"),
+    br(),
+    uiOutput("admin_content")
+  )
+})
 
   # -----------------------------------------------------------------------------
   # Auto-load receipt from URL (?receipt=TOKEN)
@@ -3362,22 +3353,13 @@ observeEvent(input$day_add_to_cart, {
 
   qa <- qty_int(input$day_adult,  "Adult")
   qy <- qty_int(input$day_youth,  "Youth")
-  qu <- qty_int(input$day_under9, "Under 9")
+  qu <- qty_int(input$day_child, "Child")
   qf <- qty_int(input$day_family, "Family")
 
   # Ensure cart exists
   df <- rv$cart
   if (is.null(df) || nrow(df) == 0) {
-    df <- data.frame(
-      id          = character(),
-      category    = character(),
-      description = character(),
-      quantity    = integer(),
-      unit_price  = numeric(),
-      meta_json   = character(),
-      merge_key   = character(),
-      stringsAsFactors = FALSE
-    )
+    df <- empty_cart_df()
   }
 
   # CRITICAL: replace existing Day Pass lines for THIS DATE (don’t accumulate)
@@ -3410,7 +3392,7 @@ observeEvent(input$day_add_to_cart, {
   rows <- Filter(Negate(is.null), list(
     make_row("Adult",   qa),
     make_row("Youth",   qy),
-    make_row("Under 9", qu),
+    make_row("Child", qu),
     make_row("Family",  qf)
   ))
 
@@ -3459,16 +3441,7 @@ observeEvent(input$xmas_add_to_cart, {
   # Ensure cart exists
   df <- rv$cart
   if (is.null(df) || nrow(df) == 0) {
-    df <- data.frame(
-      id          = character(),
-      category    = character(),
-      description = character(),
-      quantity    = integer(),
-      unit_price  = numeric(),
-      meta_json   = character(),
-      merge_key   = character(),
-      stringsAsFactors = FALSE
-    )
+    df <- empty_cart_df()
   }
 
   # CRITICAL: replace existing Christmas Pass line(s) (don’t accumulate)
@@ -3512,21 +3485,6 @@ observeEvent(input$xmas_add_to_cart, {
 # -----------------------------------------------------------------------------
 # SEASON PASS
 # -----------------------------------------------------------------------------
-
-  output$season_info <- renderUI({
-    cutoff <- get_early_bird_cutoff()
-    if (is.na(cutoff)) {
-      return(p("Early-bird cutoff is not set. Admin can set it in the Admin tab."))
-    }
-    is_eb <- Sys.Date() <= cutoff
-    p(
-      if (is_eb) {
-        paste("Early-bird pricing in effect until", format(cutoff, "%Y-%m-%d"))
-      } else {
-        paste("Regular pricing (early-bird ended", format(cutoff, "%Y-%m-%d"), ")")
-      }
-    )
-  })
 
   is_valid_dob <- function(d) {
     d <- suppressWarnings(as.Date(d))
@@ -3652,26 +3610,14 @@ observeEvent(input$xmas_add_to_cart, {
           return()
         }
 
-        rows[[length(rows) + 1L]] <- data.frame(
-          id = UUIDgenerate(),
-          category = "season_pass",
-          description = "Season pass – Adult",
-          quantity = 1L,
-          unit_price = p_adult,
-          meta_json = as.character(jsonlite::toJSON(
-            list(
-              type        = "Adult",
-              early_bird  = is_eb,
-              holder_uid  = UUIDgenerate(), # prevents merge collapse
-              holder_name = nm,
-              holder_dob  = as.character(as.Date(dob)),
-              age_ref     = as.character(age_ref),
-              age_years   = as.integer(age)
-            ),
-            auto_unbox = TRUE, null = "null"
-          )),
-          merge_key = "",
-          stringsAsFactors = FALSE
+        rows[[length(rows) + 1L]] <- season_pass_row(
+          type_key      = "adult",
+          unit_price    = p_adult,
+          is_early_bird = is_eb,
+          holder_name   = nm,
+          holder_dob    = dob,
+          age_ref       = age_ref,
+          age_years     = age
         )
       }
     }
@@ -3703,26 +3649,14 @@ observeEvent(input$xmas_add_to_cart, {
           return()
         }
 
-        rows[[length(rows) + 1L]] <- data.frame(
-          id = UUIDgenerate(),
-          category = "season_pass",
-          description = "Season pass – Youth",
-          quantity = 1L,
-          unit_price = p_youth,
-          meta_json = as.character(jsonlite::toJSON(
-            list(
-              type        = "Youth",
-              early_bird  = is_eb,
-              holder_uid  = UUIDgenerate(), # prevents merge collapse
-              holder_name = nm,
-              holder_dob  = as.character(as.Date(dob)),
-              age_ref     = as.character(age_ref),
-              age_years   = as.integer(age)
-            ),
-            auto_unbox = TRUE, null = "null"
-          )),
-          merge_key = "",
-          stringsAsFactors = FALSE
+        rows[[length(rows) + 1L]] <- season_pass_row(
+          type_key      = "youth",
+          unit_price    = p_youth,
+          is_early_bird = is_eb,
+          holder_name   = nm,
+          holder_dob    = dob,
+          age_ref       = age_ref,
+          age_years     = age
         )
       }
     }
@@ -4246,14 +4180,6 @@ tagList(
   # ADMIN: Prices / Config
   # -----------------------------------------------------------------------------
 
-  parse_money <- function(x) {
-    if (is.null(x)) {
-      return(NA_real_)
-    }
-    v <- suppressWarnings(as.numeric(gsub(",", "", gsub("\\$", "", trimws(as.character(x))))))
-    if (is.na(v) || v < 0) NA_real_ else v
-  }
-
   parse_int_or_na <- function(x) {
     s <- trimws(as.character(x %||% ""))
     if (!nzchar(s)) {
@@ -4316,7 +4242,7 @@ tagList(
         fluidRow(
           column(3, numericInput("admin_price_day_adult", "Adult", value = cfg_num("price_day_adult", NA_real_), min = 0, step = 1)),
           column(3, numericInput("admin_price_day_youth", "Youth", value = cfg_num("price_day_youth", NA_real_), min = 0, step = 1)),
-          column(3, numericInput("admin_price_day_under9", "Under 9", value = cfg_num("price_day_under9", NA_real_), min = 0, step = 1)),
+          column(3, numericInput("admin_price_day_child", "Child", value = cfg_num("price_day_child", NA_real_), min = 0, step = 1)),
           column(3, numericInput("admin_price_day_family", "Family", value = cfg_num("price_day_family", NA_real_), min = 0, step = 1))
         )
       ),
@@ -4391,7 +4317,7 @@ tagList(
       # day
       cfg_set("price_day_adult", if (is.na(input$admin_price_day_adult)) "" else as.character(input$admin_price_day_adult))
       cfg_set("price_day_youth", if (is.na(input$admin_price_day_youth)) "" else as.character(input$admin_price_day_youth))
-      cfg_set("price_day_under9", if (is.na(input$admin_price_day_under9)) "" else as.character(input$admin_price_day_under9))
+      cfg_set("price_day_child", if (is.na(input$admin_price_day_child)) "" else as.character(input$admin_price_day_child))
       cfg_set("price_day_family", if (is.na(input$admin_price_day_family)) "" else as.character(input$admin_price_day_family))
 
       # christmas
@@ -4743,17 +4669,7 @@ tagList(
     )
   })
 
-# Only register the DT output if DT exists on this host
-if (isTRUE(HAVE_DT)) {
-
-  output$admin_tx_table <- DT::renderDT({
-
-    admin_nonce()
-    if (!isTRUE(rv$admin_logged_in)) return(NULL)
-
-    tx_nonce()
-
-    # Vector-safe input defaults
+  admin_tx_filters <- function(input) {
     lim <- suppressWarnings(as.integer(input$admin_tx_limit))
     if (is.na(lim) || lim < 1L) lim <- 50L
 
@@ -4778,7 +4694,7 @@ if (isTRUE(HAVE_DT)) {
     sb <- trimws(as.character(input$admin_tx_sort_by))
     if (is.na(sb) || !nzchar(sb)) sb <- "created_at"
 
-    df <- fetch_transactions(
+    list(
       limit      = lim,
       start_date = sd,
       end_date   = ed,
@@ -4788,76 +4704,132 @@ if (isTRUE(HAVE_DT)) {
       tx_type    = tt,
       sort_by    = sb
     )
+  }
 
-    # Empty / NULL guard FIRST
-    if (is.null(df) || nrow(df) == 0) {
-      return(DT::datatable(
-        data.frame(Message = "No results.", stringsAsFactors = FALSE),
-        rownames = FALSE,
-        options  = list(dom = "t"),
-        class    = "compact"
-      ))
-    }
+  # Only register the DT output if DT exists on this host
+  if (isTRUE(HAVE_DT)) {
 
-    # ---- build a display table with an Action link ----
-    df_out <- df
+    output$admin_tx_table <- DT::renderDT({
 
-    cents <- suppressWarnings(as.numeric(df_out$total_amount_cents))
-    df_out$total <- ifelse(
-      is.na(cents),
-      "",
-      sprintf("$%.2f", cents / 100)
-    )
+      admin_nonce()
+      if (!isTRUE(rv$admin_logged_in)) return(NULL)
 
-    token <- ifelse(is.na(df_out$receipt_token), "", as.character(df_out$receipt_token))
+      tx_nonce()
 
-    df_out$action <- ifelse(
-      nzchar(token),
-      paste0(
-        "<a href='#' class='admin-tx-load' data-token='",
-        htmltools::htmlEscape(token, attribute = TRUE),
-        "'>View receipt</a>"
-      ),
-      ""
-    )
+      f  <- admin_tx_filters(input)
+      lim <- f$limit
+      sd  <- f$start_date
+      ed  <- f$end_date
+      nm  <- f$name
+      em  <- f$email
+      st  <- f$status
+      tt  <- f$tx_type
+      sb  <- f$sort_by
 
-    df_out <- df_out[, c(
-      "created_at", "buyer_name", "buyer_email", "tx_type",
-      "total", "status", "action"
-    ), drop = FALSE]
-
-    # IMPORTANT: make this the FINAL expression returned by renderDT()
-    DT::datatable(
-      df_out,
-      rownames = FALSE,
-      escape   = FALSE,  # allows <a> to be clickable
-      class    = "compact stripe hover",
-      options  = list(
-        order      = list(list(0, "desc")),
-        pageLength = 25,
-        lengthMenu = list(c(25, 50, 100), c("25", "50", "100"))
+      df <- fetch_transactions(
+        limit      = lim,
+        start_date = sd,
+        end_date   = ed,
+        name       = nm,
+        email      = em,
+        status     = st,
+        tx_type    = tt,
+        sort_by    = sb
       )
-    )
-  })
-}
 
-  observeEvent(input$admin_tx_refresh,
-    {
-      tx_nonce(tx_nonce() + 1L)
-    },
-    ignoreInit = TRUE
-  )
+      # Build display table (df_out) + sort keys
+      if (is.null(df) || !is.data.frame(df) || nrow(df) == 0L) {
+        df_out <- data.frame(
+          created_at  = character(),
+          buyer_name  = character(),
+          buyer_email = character(),
+          tx_type     = character(),
+          total       = character(),
+          status      = character(),
+          action      = character(),
+          email_sort  = character(),
+          total_sort  = numeric(),
+          stringsAsFactors = FALSE
+        )
+      } else {
 
-  observeEvent(input$admin_tx_load,
-    {
-      if (!isTRUE(rv$admin_logged_in)) {
-        return()
+        token <- if ("receipt_token" %in% names(df)) as.character(df$receipt_token) else rep("", nrow(df))
+
+        email_disp <- as.character(df$buyer_email %||% "")
+        email_sort <- tolower(trimws(email_disp))
+
+        cents <- if ("total_amount_cents" %in% names(df)) suppressWarnings(as.numeric(df$total_amount_cents)) else rep(0, nrow(df))
+        cents[is.na(cents)] <- 0
+        total_sort <- cents / 100
+        total_disp <- paste0("$", formatC(total_sort, format = "f", digits = 2))
+
+        df_out <- data.frame(
+          created_at  = as.character(df$created_at %||% ""),
+          buyer_name  = as.character(df$buyer_name %||% ""),
+          buyer_email = email_disp,
+          tx_type     = as.character(df$tx_type %||% ""),
+          total       = total_disp,
+          status      = as.character(df$status %||% ""),
+          action      = "",
+          email_sort  = email_sort,
+          total_sort  = total_sort,
+          stringsAsFactors = FALSE
+        )
+
+        df_out$action <- ifelse(
+          nzchar(token),
+          paste0(
+            "<a href='#' class='admin-tx-load' data-token='",
+            htmltools::htmlEscape(token, attribute = TRUE),
+            "'>View receipt</a>"
+          ),
+          ""
+        )
       }
+
+      df_out <- df_out[, c(
+        "created_at","buyer_name","buyer_email","tx_type","total","status","action",
+        "email_sort","total_sort"
+      ), drop = FALSE]
+
+print(names(df_out))
+
+      DT::datatable(
+        df_out,
+        rownames = FALSE,
+        escape   = FALSE,
+        class    = "compact stripe hover",
+        options  = list(
+          order      = list(list(0, "desc")),
+          pageLength = 25,
+          lengthMenu = list(c(25, 50, 100), c("25", "50", "100")),
+          columnDefs = list(
+            # hide sort-key columns (email_sort, total_sort)
+            list(targets = c(7, 8), visible = FALSE, searchable = FALSE),
+
+            # Email (col 2) sorts by email_sort (col 7)
+            list(targets = 2, orderData = 7),
+
+            # Total (col 4) sorts by total_sort (col 8)
+            list(targets = 4, orderData = 8),
+
+            # Action column not sortable
+            list(targets = 6, orderable = FALSE)
+          )
+        )
+      )
+    }, server = FALSE)
+
+    observeEvent(input$admin_tx_refresh, {
+      tx_nonce(tx_nonce() + 1L)
+    }, ignoreInit = TRUE)
+
+    observeEvent(input$admin_tx_load, {
+
+      if (!isTRUE(rv$admin_logged_in)) return()
 
       tok <- trimws(as.character(input$admin_tx_load$token))
-      if (is.na(tok) || !nzchar(tok)) {
-        return()
-      }
+      if (is.na(tok) || !nzchar(tok)) return()
 
       tx <- load_receipt_token(tok)
       if (is.null(tx)) {
@@ -4868,54 +4840,41 @@ if (isTRUE(HAVE_DT)) {
       receipt_tx(tx)
       poll_count(0L)
       updateTabsetPanel(session, "main_nav", selected = "Receipt")
-    },
-    ignoreInit = TRUE
-  )
 
-output$admin_tx_download <- downloadHandler(
-  filename = function() {
-    paste0("transactions_", format(Sys.Date()), ".csv")
-  },
-  content = function(file) {
-    lim <- suppressWarnings(as.integer(input$admin_tx_limit))
-    if (is.na(lim) || lim < 1L) lim <- 50L
+    }, ignoreInit = TRUE)
 
-    sd <- input$admin_tx_start
-    if (is.null(sd) || !nzchar(as.character(sd))) sd <- NULL
+    output$admin_tx_download <- downloadHandler(
+      filename = function() {
+        paste0("transactions_", format(Sys.Date()), ".csv")
+      },
+      content = function(file) {
 
-    ed <- input$admin_tx_end
-    if (is.null(ed) || !nzchar(as.character(ed))) ed <- NULL
+        f  <- admin_tx_filters(input)
+        lim <- f$limit
+        sd  <- f$start_date
+        ed  <- f$end_date
+        nm  <- f$name
+        em  <- f$email
+        st  <- f$status
+        tt  <- f$tx_type
+        sb  <- f$sort_by
 
-    nm <- trimws(as.character(input$admin_tx_name))
-    if (is.na(nm)) nm <- ""
+        df <- fetch_transactions(
+          limit      = lim,
+          start_date = sd,
+          end_date   = ed,
+          name       = nm,
+          email      = em,
+          status     = st,
+          tx_type    = tt,
+          sort_by    = sb
+        )
 
-    em <- trimws(as.character(input$admin_tx_email))
-    if (is.na(em)) em <- ""
-
-    st <- trimws(as.character(input$admin_tx_status))
-    if (is.na(st)) st <- ""
-
-    tt <- trimws(as.character(input$admin_tx_type))
-    if (is.na(tt)) tt <- ""
-
-    sb <- trimws(as.character(input$admin_tx_sort_by))
-    if (is.na(sb) || !nzchar(sb)) sb <- "created_at"
-
-    df <- fetch_transactions(
-      limit      = lim,
-      start_date = sd,
-      end_date   = ed,
-      name       = nm,
-      email      = em,
-      status     = st,
-      tx_type    = tt,
-      sort_by    = sb
+        if ("receipt_token" %in% names(df)) df$receipt_token <- NULL
+        write.csv(df, file, row.names = FALSE)
+      }
     )
-
-    if ("receipt_token" %in% names(df)) df$receipt_token <- NULL
-    write.csv(df, file, row.names = FALSE)
   }
-)
 
 }  # end server()
 
