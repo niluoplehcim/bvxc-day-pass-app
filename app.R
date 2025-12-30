@@ -2290,7 +2290,7 @@ add_rows_to_cart <- function(rows_df) {
     add_rows_to_cart(rows_df)
   }
 
-  parse_event_id_from_meta <- function(meta_json) {
+  parse_id_from_meta <- function(meta_json, key) {
     s <- as.character(meta_json %||% "")
     if (!nzchar(s)) {
       return("")
@@ -2299,7 +2299,7 @@ add_rows_to_cart <- function(rows_df) {
     if (is.null(obj)) {
       return("")
     }
-    as.character(obj$event_id %||% "")
+    as.character(obj[[key]] %||% "")
   }
 
   cart_event_qty_in_session <- function(event_id) {
@@ -2318,7 +2318,7 @@ add_rows_to_cart <- function(rows_df) {
 
     q <- 0L
     for (i in ix) {
-      eid <- parse_event_id_from_meta(df$meta_json[i] %||% "")
+      eid <- parse_id_from_meta(df$meta_json[i] %||% "", "event_id")
       if (identical(eid, event_id)) q <- q + as.integer(df$quantity[i] %||% 0L)
     }
     as.integer(q)
@@ -2427,7 +2427,7 @@ add_rows_to_cart <- function(rows_df) {
     # requested qty per event_id
     req_by_event <- list()
     for (i in ix) {
-      eid <- parse_event_id_from_meta(cart_df$meta_json[i] %||% "")
+      eid <- parse_id_from_meta(cart_df$meta_json[i] %||% "", "event_id")
       if (!nzchar(eid)) next
       req_by_event[[eid]] <- (req_by_event[[eid]] %||% 0L) + as.integer(cart_df$quantity[i] %||% 0L)
     }
@@ -2483,18 +2483,6 @@ add_rows_to_cart <- function(rows_df) {
   # PROGRAM CAPACITY ENFORCEMENT
   # -----------------------------------------------------------------------------
 
-  parse_program_id_from_meta <- function(meta_json) {
-    s <- as.character(meta_json %||% "")
-    if (!nzchar(s)) {
-      return("")
-    }
-    obj <- tryCatch(jsonlite::fromJSON(s, simplifyVector = FALSE), error = function(e) NULL)
-    if (is.null(obj)) {
-      return("")
-    }
-    as.character(obj$program_id %||% "")
-  }
-
   cart_program_qty_in_session <- function(program_id) {
     if (!nzchar(program_id %||% "")) {
       return(0L)
@@ -2511,7 +2499,7 @@ add_rows_to_cart <- function(rows_df) {
 
     q <- 0L
     for (i in ix) {
-      pid <- parse_program_id_from_meta(df$meta_json[i] %||% "")
+      pid <- parse_id_from_meta(df$meta_json[i] %||% "", "program_id")
       if (identical(pid, program_id)) q <- q + as.integer(df$quantity[i] %||% 0L)
     }
     as.integer(q)
@@ -2548,7 +2536,7 @@ add_rows_to_cart <- function(rows_df) {
     # requested qty per program_id
     req_by_program <- list()
     for (i in ix) {
-      pid <- parse_program_id_from_meta(cart_df$meta_json[i] %||% "")
+      pid <- parse_id_from_meta(cart_df$meta_json[i] %||% "", "program_id")
       if (!nzchar(pid)) next
       req_by_program[[pid]] <- (req_by_program[[pid]] %||% 0L) + as.integer(cart_df$quantity[i] %||% 0L)
     }
