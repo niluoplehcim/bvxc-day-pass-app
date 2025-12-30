@@ -1960,12 +1960,19 @@ server <- function(input, output, session) {
     invisible(NULL)
   }
 
-  render_cart_list_ui <- function(df, change_input_id, max_qty = 20L, show_category = FALSE) {
+render_cart_list_ui <- function(df, change_input_id, max_qty = 20L, show_category = FALSE) {
     if (is.null(df) || nrow(df) == 0) {
       return(tags$div(style = "color:#666;", "No items."))
     }
 
     box_id <- paste0(change_input_id, "_box")
+    
+    # PERF: Pre-parse all meta_json ONCE outside the loop
+    parsed_meta <- lapply(df$meta_json, function(s) {
+      s <- as.character(s %||% "")
+      if (!nzchar(s)) return(NULL)
+      tryCatch(jsonlite::fromJSON(s, simplifyVector = TRUE), error = function(e) NULL)
+    })
 
     row_ui <- lapply(seq_len(nrow(df)), function(i) {
       r <- df[i, , drop = FALSE]
@@ -1973,7 +1980,6 @@ server <- function(input, output, session) {
       cat <- as.character(r$category[1] %||% "")
       qty <- suppressWarnings(as.integer(r$quantity[1] %||% 0L))
       price <- suppressWarnings(as.numeric(r$unit_price[1] %||% NA_real_))
-      meta_json <- as.character(r$meta_json[1] %||% "")
 
       if (is.na(qty) || qty < 0L) qty <- 0L
       if (identical(cat, "donation")) qty <- 1L
@@ -1983,7 +1989,8 @@ server <- function(input, output, session) {
 
       person_details_ui <- NULL
       if (identical(cat, "season_pass") || identical(cat, "program")) {
-        m <- tryCatch(jsonlite::fromJSON(meta_json, simplifyVector = TRUE), error = function(e) NULL)
+        # Use pre-parsed meta instead of parsing again
+        m <- parsed_meta[[i]]
 
         nm <- ""
         dob <- ""
