@@ -687,7 +687,11 @@ get_program_list <- function(ttl_secs = 30) {
   PROGRAM_LIST_CACHE$data <- result
   PROGRAM_LIST_CACHE$t <- Sys.time()
   result
-}
+  }
+
+  invalidate_program_list_cache <- function() {
+  PROGRAM_LIST_CACHE$t <- as.POSIXct(0, origin = "1970-01-01")
+  }
 
 EVENTS_CACHE <- new.env(parent = emptyenv())
 EVENTS_CACHE$data_all <- NULL
@@ -710,9 +714,13 @@ get_special_events <- function(enabled_only = TRUE, ttl_secs = 30) {
   EVENTS_CACHE[[cache_key]] <- result
   EVENTS_CACHE$t <- Sys.time()
   result
-}
+  }
 
-get_blocked_dates <- function() {
+  invalidate_events_cache <- function() {
+  EVENTS_CACHE$t <- as.POSIXct(0, origin = "1970-01-01")
+  }
+
+  get_blocked_dates <- function() {
   db_get1('SELECT "date" AS date, reason FROM blocked_dates ORDER BY "date" ASC')
 }
 
@@ -4398,7 +4406,7 @@ tagList(
       cfg_set("tab_events_enabled", if (isTRUE(input$admin_tab_events_enabled)) "1" else "0")
       cfg_set("tab_donation_enabled", if (isTRUE(input$admin_tab_donation_enabled)) "1" else "0")
 
-      PROGRAM_LIST_CACHE$t <- as.POSIXct(0, origin = "1970-01-01")  # Invalidate cache
+      invalidate_program_list_cache()
       showNotification("Saved Prices / Config.", type = "message")
     },
     ignoreInit = TRUE
@@ -4621,7 +4629,7 @@ tagList(
       }
 
       events_nonce(events_nonce() + 1L)
-        EVENTS_CACHE$t <- as.POSIXct(0, origin = "1970-01-01")  # Invalidate cache
+        invalidate_events_cache()
         showNotification("Event saved.", type = "message")
 
     },
@@ -4641,7 +4649,7 @@ tagList(
       db_exec1("DELETE FROM special_events WHERE id = ?id", id = id)
 
       events_nonce(events_nonce() + 1L)
-      EVENTS_CACHE$t <- as.POSIXct(0, origin = "1970-01-01")  # Invalidate cache
+      invalidate_events_cache()
       updateSelectInput(session, "admin_event_pick", selected = "NEW")
       showNotification("Event deleted.", type = "message")
     },
