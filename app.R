@@ -524,16 +524,20 @@ cfg_set <- function(key, value) {
 
       upsert_config(key, value)
 
-      if (!identical(key, "__config_updated_at")) {
+if (!identical(key, "__config_updated_at")) {
         upsert_config("__config_updated_at", now_ts())
       }
     })
+
+    # Refresh local cache immediately after writes
+    cfg_refresh_cache(force = TRUE)
+
+    invisible(TRUE)
   })
+}
 
-  # Refresh local cache immediately after writes
-  cfg_refresh_cache(force = TRUE)
-
-  invisible(TRUE)
+cfg_set_input <- function(key, val) {
+  cfg_set(key, if (is.na(val) || is.null(val)) "" else as.character(val))
 }
 
 cfg_bool <- function(key, default = FALSE) {
@@ -4355,23 +4359,23 @@ tagList(
       cfg_set("early_bird_cutoff", as.character(as.Date(input$admin_cfg_early_bird_cutoff)))
 
       # limits (numericInput returns NA if empty)
-      cfg_set("limit_max_total_cad", if (is.na(input$admin_cfg_limit_max_total_cad)) "" else as.character(input$admin_cfg_limit_max_total_cad))
-      cfg_set("limit_max_items_total", if (is.na(input$admin_cfg_limit_max_items_total)) "" else as.character(as.integer(input$admin_cfg_limit_max_items_total)))
+      cfg_set_input("limit_max_total_cad", input$admin_cfg_limit_max_total_cad)
+      cfg_set_input("limit_max_items_total", input$admin_cfg_limit_max_items_total)
 
       # day
-      cfg_set("price_day_adult", if (is.na(input$admin_price_day_adult)) "" else as.character(input$admin_price_day_adult))
-      cfg_set("price_day_youth", if (is.na(input$admin_price_day_youth)) "" else as.character(input$admin_price_day_youth))
-      cfg_set("price_day_child", if (is.na(input$admin_price_day_child)) "" else as.character(input$admin_price_day_child))
-      cfg_set("price_day_family", if (is.na(input$admin_price_day_family)) "" else as.character(input$admin_price_day_family))
+      cfg_set_input("price_day_adult", input$admin_price_day_adult)
+      cfg_set_input("price_day_youth", input$admin_price_day_youth)
+      cfg_set_input("price_day_child", input$admin_price_day_child)
+      cfg_set_input("price_day_family", input$admin_price_day_family)
 
       # christmas
-      cfg_set("price_christmas_pass", if (is.na(input$admin_price_christmas_pass)) "" else as.character(input$admin_price_christmas_pass))
+      cfg_set_input("price_christmas_pass", input$admin_price_christmas_pass)
 
       # season
-      cfg_set("price_season_eb_adult", if (is.na(input$admin_price_season_eb_adult)) "" else as.character(input$admin_price_season_eb_adult))
-      cfg_set("price_season_eb_youth", if (is.na(input$admin_price_season_eb_youth)) "" else as.character(input$admin_price_season_eb_youth))
-      cfg_set("price_season_reg_adult", if (is.na(input$admin_price_season_reg_adult)) "" else as.character(input$admin_price_season_reg_adult))
-      cfg_set("price_season_reg_youth", if (is.na(input$admin_price_season_reg_youth)) "" else as.character(input$admin_price_season_reg_youth))
+      cfg_set_input("price_season_eb_adult", input$admin_price_season_eb_adult)
+      cfg_set_input("price_season_eb_youth", input$admin_price_season_eb_youth)
+      cfg_set_input("price_season_reg_adult", input$admin_price_season_reg_adult)
+      cfg_set_input("price_season_reg_youth", input$admin_price_season_reg_youth)
 
       # programs (catalog-driven)
       cat <- program_catalog()
@@ -4380,7 +4384,7 @@ tagList(
         price_id <- paste0("admin_prog_price_", pid)
         cap_id <- paste0("admin_prog_cap_", pid)
 
-        cfg_set(cat$price_key[i], if (is.na(input[[price_id]])) "" else as.character(input[[price_id]]))
+        cfg_set_input(cat$price_key[i], input[[price_id]])
 
         cap_val <- parse_int_or_na(input[[cap_id]])
         cfg_set(cat$cap_key[i], if (is.na(cap_val)) "" else as.character(cap_val))
