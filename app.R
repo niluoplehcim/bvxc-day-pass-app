@@ -444,9 +444,6 @@ init_db <- function() {
   invisible(NULL)
 }
 
-# Call it ONCE (timed)
-timed("init_db()", init_db())
-
 # -----------------------------------------------------------------------------
 # CONFIG HELPERS (CACHED)
 # -----------------------------------------------------------------------------
@@ -590,6 +587,14 @@ cfg_get_sentinel <- function(key) {
 cfg_set_sentinel <- function(key, done = TRUE) {
   cfg_set(key, if (isTRUE(done)) "1" else "0")
   invisible(TRUE)
+}
+
+# Call init_db ONCE — skip if DB already initialized
+if (!cfg_get_sentinel("db_init_v1_done")) {
+  timed("init_db()", init_db())
+  cfg_set_sentinel("db_init_v1_done", TRUE)
+} else {
+  cat("[PERF] init_db() skipped (already done)\n")
 }
 
 # -----------------------------------------------------------------------------
