@@ -2626,24 +2626,12 @@ add_rows_to_cart <- function(rows_df) {
       return(FALSE)
     }
 
-    with_db(function(con) {
-      DBI::dbWithTransaction(con, {
-        # transactions table
-        db_exec(
-          con,
-          "UPDATE transactions SET status = ?st WHERE id = ?id",
-          st = as.character(status),
-          id = as.character(tx_id)
-        )
+    st <- as.character(status)
+    id <- as.character(tx_id)
 
-        # tx_items table (keep sold-counters correct)
-        db_exec(
-          con,
-          "UPDATE tx_items SET status = ?st WHERE tx_id = ?id",
-          st = as.character(status),
-          id = as.character(tx_id)
-        )
-      })
+    with_db(function(con) {
+      db_exec(con, "UPDATE transactions SET status = ?st WHERE id = ?id", st = st, id = id)
+      db_exec(con, "UPDATE tx_items SET status = ?st WHERE tx_id = ?id", st = st, id = id)
     })
 
     TRUE
