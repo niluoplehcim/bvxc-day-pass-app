@@ -663,23 +663,49 @@ PROGRAM_CATALOG <- data.frame(
 
 program_catalog <- function() PROGRAM_CATALOG
 
-get_program_list <- function() {
-  # Warm config cache first (prevents repeated DB reads when cfg_num/cfg_int are called many times)
-  if (exists("cfg_refresh_cache", mode = "function")) {
-    cfg_refresh_cache(force = FALSE)
+PROGRAM_LIST_CACHE <- new.env(parent = emptyenv())
+PROGRAM_LIST_CACHE$data <- NULL
+PROGRAM_LIST_CACHE$t <- as.POSIXct(0, origin = "1970-01-01")
+
+get_program_list <- function(ttl_secs = 30) {
+  age <- as.numeric(difftime(Sys.time(), PROGRAM_LIST_CACHE$t, units = "secs"))
+  if (!is.na(age) && age <= ttl_secs && !is.null(PROGRAM_LIST_CACHE$data)) {
+    return(PROGRAM_LIST_CACHE$data)
   }
+
+  cfg_refresh_cache(force = FALSE)
 
   cat <- program_catalog()
   cat$price <- vapply(cat$price_key, function(k) cfg_num(k, NA_real_), numeric(1))
   cat$capacity <- vapply(cat$cap_key, function(k) cfg_int(k, NA_integer_), integer(1))
-  cat[, c("id", "name", "price", "capacity", "price_key", "cap_key")]
+  result <- cat[, c("id", "name", "price", "capacity", "price_key", "cap_key")]
+
+  PROGRAM_LIST_CACHE$data <- result
+  PROGRAM_LIST_CACHE$t <- Sys.time()
+  result
 }
 
-get_special_events <- function(enabled_only = TRUE) {
+EVENTS_CACHE <- new.env(parent = emptyenv())
+EVENTS_CACHE$data_all <- NULL
+EVENTS_CACHE$data_enabled <- NULL
+EVENTS_CACHE$t <- as.POSIXct(0, origin = "1970-01-01")
+
+get_special_events <- function(enabled_only = TRUE, ttl_secs = 30) {
+  age <- as.numeric(difftime(Sys.time(), EVENTS_CACHE$t, units = "secs"))
+  cache_key <- if (enabled_only) "data_enabled" else "data_all"
+  
+  if (!is.na(age) && age <= ttl_secs && !is.null(EVENTS_CACHE[[cache_key]])) {
+    return(EVENTS_CACHE[[cache_key]])
+  }
+
   q <- "SELECT id, name, event_date, price_cad, capacity, enabled, created_at FROM special_events"
   if (enabled_only) q <- paste(q, "WHERE enabled = 1")
   q <- paste(q, "ORDER BY event_date ASC")
-  db_get1(q)
+  result <- db_get1(q)
+
+  EVENTS_CACHE[[cache_key]] <- result
+  EVENTS_CACHE$t <- Sys.time()
+  result
 }
 
 get_blocked_dates <- function() {
@@ -3932,7 +3958,9 @@ observeEvent(input$xmas_add_to_cart, {
       return()
     }
 
-    invalidateLater(5000, session)
+    # Poll faster initially (3s), then slow down (8s)
+    interval <- if (n < 3) 3000 else 8000
+    invalidateLater(interval, session)
     poll_count(n + 1L)
     verify_and_refresh_receipt()
   })
@@ -4406,6 +4434,7 @@ tagList(
       cfg_set("tab_events_enabled", if (isTRUE(input$admin_tab_events_enabled)) "1" else "0")
       cfg_set("tab_donation_enabled", if (isTRUE(input$admin_tab_donation_enabled)) "1" else "0")
 
+      PROGRAM_LIST_CACHE$t <- as.POSIXct(0, origin = "1970-01-01")  # Invalidate cache
       showNotification("Saved Prices / Config.", type = "message")
     },
     ignoreInit = TRUE
@@ -4628,7 +4657,9 @@ tagList(
       }
 
       events_nonce(events_nonce() + 1L)
-      showNotification("Event saved.", type = "message")
+        EVENTS_CACHE$t <- as.POSIXct(0, origin = "1970-01-01")  # Invalidate cache
+        showNotification("Event saved.", type = "message")
+
     },
     ignoreInit = TRUE
   )
@@ -4644,7 +4675,9 @@ tagList(
       }
 
       db_exec1("DELETE FROM special_events WHERE id = ?id", id = id)
+
       events_nonce(events_nonce() + 1L)
+      EVENTS_CACHE$t <- as.POSIXct(0, origin = "1970-01-01")  # Invalidate cache
       updateSelectInput(session, "admin_event_pick", selected = "NEW")
       showNotification("Event deleted.", type = "message")
     },
