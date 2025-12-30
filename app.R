@@ -1489,28 +1489,34 @@ insert_tx_items_for_cart <- function(tx_id, created_at, status, cart_df) {
     return(invisible(TRUE))
   }
 
-  with_db(function(con) {
+with_db(function(con) {
+    # Build all rows first
+    rows <- lapply(ix, function(j) {
+      item_id <- extract_item_id_for_tx_item(cart_df$category[j], cart_df$meta_json[j])
+      if (!nzchar(item_id)) return(NULL)
+
+      q <- suppressWarnings(as.integer(cart_df$quantity[j] %||% 0L))
+      if (is.na(q) || q <= 0L) return(NULL)
+
+      data.frame(
+        id         = UUIDgenerate(),
+        tx_id      = tx_id,
+        category   = as.character(cart_df$category[j]),
+        item_id    = item_id,
+        qty        = q,
+        status     = as.character(status %||% ""),
+        created_at = as.character(created_at %||% now_ts()),
+        stringsAsFactors = FALSE
+      )
+    })
+
+    rows <- rows[!vapply(rows, is.null, logical(1))]
+    if (length(rows) == 0) return(invisible(TRUE))
+
+    batch_df <- do.call(rbind, rows)
+
     DBI::dbWithTransaction(con, {
-      for (j in ix) {
-        item_id <- extract_item_id_for_tx_item(cart_df$category[j], cart_df$meta_json[j])
-        if (!nzchar(item_id)) next
-
-        q <- suppressWarnings(as.integer(cart_df$quantity[j] %||% 0L))
-        if (is.na(q) || q <= 0L) next
-
-        db_exec(
-          con,
-          "INSERT INTO tx_items (id, tx_id, category, item_id, qty, status, created_at)
-           VALUES (?id, ?tx_id, ?category, ?item_id, ?qty, ?status, ?created_at)",
-          id         = UUIDgenerate(),
-          tx_id      = tx_id,
-          category   = as.character(cart_df$category[j]),
-          item_id    = item_id,
-          qty        = q,
-          status     = as.character(status %||% ""),
-          created_at = as.character(created_at %||% now_ts())
-        )
-      }
+      DBI::dbWriteTable(con, "tx_items", batch_df, append = TRUE, row.names = FALSE)
     })
   })
 
