@@ -2409,8 +2409,12 @@ add_rows_to_cart <- function(rows_df) {
       cap <- suppressWarnings(as.integer(cap_row$capacity[1]))
       if (is.na(cap)) next # NA capacity = unlimited
 
-      sold_i <- sold_map[[eid]]
-      if (is.null(sold_i) || is.na(sold_i)) sold_i <- 0L
+      sold_i <- sold_map[eid]  # safe even when sold_map is empty
+      if (length(sold_i) == 0 || is.na(sold_i[1])) {
+      sold_i <- 0L
+      } else {
+      sold_i <- as.integer(sold_i[1])
+      }
 
       remaining <- cap - sold_i
       requested <- as.integer(req_by_event[[eid]] %||% 0L)
@@ -2528,9 +2532,7 @@ add_rows_to_cart <- function(rows_df) {
       cap <- suppressWarnings(as.integer(row$capacity[1]))
       if (is.na(cap)) next # NA capacity = unlimited
 
-      sold_i <- sold_map[[pid]]
-      if (is.null(sold_i) || is.na(sold_i)) sold_i <- 0L
-
+      sold_i <- if (pid %in% names(sold_map)) sold_map[[pid]] else 0L
       remaining <- cap - sold_i
       requested <- as.integer(req_by_program[[pid]] %||% 0L)
 
@@ -2596,21 +2598,6 @@ add_rows_to_cart <- function(rows_df) {
 
     TRUE
   }
-
-
-
-
-
-
-
-
-
- 
-
-
-
-
-
 
   # -----------------------------------------------------------------------------
   # RECEIPT VERIFICATION (Square)  -- with PERF timing
@@ -3153,31 +3140,27 @@ for (p in checkout_prefixes) {
   })
 }
 
-  # -----------------------------------------------------------------------------
-  # CHECKOUT (single path used by all Pay buttons)
-  # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# CHECKOUT (single path used by all Pay buttons)
+# -----------------------------------------------------------------------------
 
-  do_checkout <- function(source = "tab") {
-    # Prevent double-click / repeat submits
-    if (isTRUE(rv$checkout_lock)) {
-      showNotification("Checkout already started. Please wait.", type = "warning")
-      return()
-    }
-    rv$checkout_lock <- TRUE
-    on.exit(
-      {
-        rv$checkout_lock <- FALSE
-      },
-      add = TRUE
-    )
+do_checkout <- function(source = "tab") {
+  # Prevent double-click / repeat submits
+  if (isTRUE(rv$checkout_lock)) {
+    showNotification("Checkout already started. Please wait.", type = "warning")
+    return()
+  }
+  rv$checkout_lock <- TRUE
+  on.exit({ rv$checkout_lock <- FALSE }, add = TRUE)
 
+  tryCatch({
     df <- rv$cart
     if (is.null(df) || nrow(df) == 0) {
       showNotification("Cart is empty.", type = "warning")
       return()
     }
 
-    buyer_name <- trimws(as.character(rv$buyer_name %||% ""))
+    buyer_name  <- trimws(as.character(rv$buyer_name %||% ""))
     buyer_email <- trimws(as.character(rv$buyer_email %||% ""))
 
     if (!validate_buyer_or_notify(buyer_name, buyer_email)) {
@@ -3222,149 +3205,162 @@ for (p in checkout_prefixes) {
     tx_type <- infer_tx_type(df)
     total_cents <- cart_total_cents(df)
 
-# ---------------------------------------------------------------------------
-# Mode switch: Fake vs Square
-# ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Mode switch: Fake vs Square
+    # ---------------------------------------------------------------------------
 
-# If not in Square mode, always use fake mode (dev/test path)
-if (!isTRUE(IS_SQUARE_MODE)) {
-  receipt_token <- UUIDgenerate()
-  tx_id <- UUIDgenerate()
-  created_at <- now_ts()
-  status0 <- "SANDBOX_TEST_OK"
+    # If not in Square mode, always use fake mode (dev/test path)
+    if (!isTRUE(IS_SQUARE_MODE)) {
+      receipt_token <- UUIDgenerate()
+      tx_id <- UUIDgenerate()
+      created_at <- now_ts()
+      status0 <- "SANDBOX_TEST_OK"
 
-  ok <- timed("DB insert sandbox transaction", tryCatch(
-    {
-      db_exec1(
-        "INSERT INTO transactions (
-         id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
-         tx_type,
-         square_checkout_id, square_order_id, receipt_token, status
-       ) VALUES (
-         ?id, ?created_at, ?buyer_name, ?buyer_email, ?total_cents, 'CAD', ?cart_json,
-         ?tx_type,
-         NULL, NULL, ?receipt_token, ?status
-       )",
-        id            = tx_id,
-        created_at    = created_at,
-        buyer_name    = buyer_name,
-        buyer_email   = buyer_email,
-        total_cents   = total_cents,
-        cart_json     = as.character(jsonlite::toJSON(df, auto_unbox = TRUE, null = "null")),
-        tx_type       = tx_type,
-        receipt_token = receipt_token,
-        status        = status0
-      )
-      TRUE
-    },
-    error = function(e) {
-      showNotification(paste("DB error saving sandbox transaction:", conditionMessage(e)), type = "error")
-      FALSE
+      ok <- timed("DB insert sandbox transaction", tryCatch(
+        {
+          db_exec1(
+            "INSERT INTO transactions (
+               id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
+               tx_type,
+               square_checkout_id, square_order_id, receipt_token, status
+             ) VALUES (
+               ?id, ?created_at, ?buyer_name, ?buyer_email, ?total_cents, 'CAD', ?cart_json,
+               ?tx_type,
+               NULL, NULL, ?receipt_token, ?status
+             )",
+            id            = tx_id,
+            created_at    = created_at,
+            buyer_name    = buyer_name,
+            buyer_email   = buyer_email,
+            total_cents   = total_cents,
+            cart_json     = as.character(jsonlite::toJSON(df, auto_unbox = TRUE, null = "null")),
+            tx_type       = tx_type,
+            receipt_token = receipt_token,
+            status        = status0
+          )
+          TRUE
+        },
+        error = function(e) {
+          showNotification(
+            paste("DB error saving sandbox transaction:", conditionMessage(e)),
+            type = "error"
+          )
+          FALSE
+        }
+      ))
+
+      if (!ok) {
+        return()
+      }
+
+      timed("tx_items insert (sandbox)", insert_tx_items_for_cart(
+        tx_id      = tx_id,
+        created_at = created_at,
+        status     = status0,
+        cart_df    = df
+      ))
+
+      receipt_tx(load_receipt_token(receipt_token))
+      poll_count(0L)
+      clear_cart()
+      updateTabsetPanel(session, "main_nav", selected = "Receipt")
+
+      showModal(modalDialog(
+        title = "Sandbox test payment simulated",
+        "No real payment was processed. This is a TEST ONLY transaction in sandbox fake mode.",
+        easyClose = TRUE,
+        footer = modalButton("OK")
+      ))
+      return()
     }
-  ))
 
-  if (!ok) {
-    return()
-  }
+    # Square mode (creds guaranteed by global enforcement)
+    stopifnot(isTRUE(HAVE_SQUARE_CREDS))
 
-  timed("tx_items insert (sandbox)", insert_tx_items_for_cart(
-    tx_id      = tx_id,
-    created_at = created_at,
-    status     = status0,
-    cart_df    = df
-  ))
+    # ---------------------------------------------------------------------------
+    # Square mode
+    # ---------------------------------------------------------------------------
 
-  receipt_tx(load_receipt_token(receipt_token))
-  poll_count(0L)
-  clear_cart()
-  updateTabsetPanel(session, "main_nav", selected = "Receipt")
+    receipt_token <- UUIDgenerate()
+    redirect_url <- build_redirect_url(receipt_token)
 
-  showModal(modalDialog(
-    title = "Sandbox test payment simulated",
-    "No real payment was processed. This is a TEST ONLY transaction in sandbox fake mode.",
-    easyClose = TRUE,
-    footer = modalButton("OK")
-  ))
-  return()
-}
+    res <- timed("Square payment-link POST", create_square_checkout_from_cart(
+      cart_df      = df,
+      buyer_email  = buyer_email,
+      note         = paste("BVXC", if (SQUARE_ENV == "sandbox") "sandbox" else "production", source, "checkout"),
+      redirect_url = redirect_url
+    ))
 
-# Square mode (creds guaranteed by global enforcement)
-stopifnot(isTRUE(HAVE_SQUARE_CREDS))
+    if (is.null(res) || !nzchar(res$checkout_url %||% "")) {
+      showNotification("Unable to start checkout. Please try again.", type = "error")
+      return()
+    }
 
-# ---------------------------------------------------------------------------
-# Square mode
-# ---------------------------------------------------------------------------
+    tx_id <- UUIDgenerate()
+    created_at <- now_ts()
+    status0 <- "PENDING"
 
-receipt_token <- UUIDgenerate()
-redirect_url <- build_redirect_url(receipt_token)
+    ok <- timed("DB insert transaction (PENDING)", tryCatch(
+      {
+        db_exec1(
+          "INSERT INTO transactions (
+             id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
+             tx_type,
+             square_checkout_id, square_order_id, receipt_token, status
+           ) VALUES (
+             ?id, ?created_at, ?buyer_name, ?buyer_email, ?total_cents, 'CAD', ?cart_json,
+             ?tx_type,
+             ?checkout_id, ?order_id, ?receipt_token, ?status
+           )",
+          id            = tx_id,
+          created_at    = created_at,
+          buyer_name    = buyer_name,
+          buyer_email   = buyer_email,
+          total_cents   = total_cents,
+          cart_json     = as.character(jsonlite::toJSON(df, auto_unbox = TRUE, null = "null")),
+          tx_type       = tx_type,
+          checkout_id   = res$checkout_id %||% NA_character_,
+          order_id      = res$square_order %||% NA_character_,
+          receipt_token = receipt_token,
+          status        = status0
+        )
+        TRUE
+      },
+      error = function(e) {
+        showNotification(paste("DB error saving transaction:", conditionMessage(e)), type = "error")
+        FALSE
+      }
+    ))
 
-res <- timed("Square payment-link POST", create_square_checkout_from_cart(
-  cart_df      = df,
-  buyer_email  = buyer_email,
-  note         = paste("BVXC", if (SQUARE_ENV == "sandbox") "sandbox" else "production", source, "checkout"),
-  redirect_url = redirect_url
-))
+    if (!ok) {
+      return()
+    }
 
-if (is.null(res) || !nzchar(res$checkout_url %||% "")) {
-  showNotification("Unable to start checkout. Please try again.", type = "error")
-  return()
-}
+    timed("tx_items insert (PENDING)", insert_tx_items_for_cart(
+      tx_id      = tx_id,
+      created_at = created_at,
+      status     = status0,
+      cart_df    = df
+    ))
 
-tx_id <- UUIDgenerate()
-created_at <- now_ts()
-status0 <- "PENDING"
+    rv$checkout_started <- TRUE
+    rv$checkout_token <- receipt_token
 
-ok <- timed("DB insert transaction (PENDING)", tryCatch(
-  {
-    db_exec1(
-      "INSERT INTO transactions (
-       id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
-       tx_type,
-       square_checkout_id, square_order_id, receipt_token, status
-     ) VALUES (
-       ?id, ?created_at, ?buyer_name, ?buyer_email, ?total_cents, 'CAD', ?cart_json,
-       ?tx_type,
-       ?checkout_id, ?order_id, ?receipt_token, ?status
-     )",
-      id            = tx_id,
-      created_at    = created_at,
-      buyer_name    = buyer_name,
-      buyer_email   = buyer_email,
-      total_cents   = total_cents,
-      cart_json     = as.character(jsonlite::toJSON(df, auto_unbox = TRUE, null = "null")),
-      tx_type       = tx_type,
-      checkout_id   = res$checkout_id %||% NA_character_,
-      order_id      = res$square_order %||% NA_character_,
-      receipt_token = receipt_token,
-      status        = status0
+    session$sendCustomMessage("redirect", list(url = res$checkout_url))
+    # DO NOT clear cart here; clear only after buyer returns with ?receipt=...
+
+    return(invisible(TRUE))
+
+  }, error = function(e) {
+    message("[CHECKOUT ERROR] ", conditionMessage(e))
+    showNotification(
+      paste("Checkout failed:", conditionMessage(e)),
+      type = "error",
+      duration = 12
     )
-    TRUE
-  },
-  error = function(e) {
-    showNotification(paste("DB error saving transaction:", conditionMessage(e)), type = "error")
-    FALSE
-  }
-))
-
-if (!ok) {
-  return()
+    NULL
+  })
 }
-
-timed("tx_items insert (PENDING)", insert_tx_items_for_cart(
-  tx_id      = tx_id,
-  created_at = created_at,
-  status     = status0,
-  cart_df    = df
-))
-
-rv$checkout_started <- TRUE
-rv$checkout_token <- receipt_token
-
-session$sendCustomMessage("redirect", list(url = res$checkout_url))
-# DO NOT clear cart here; clear only after buyer returns with ?receipt=...
-
-return(invisible(TRUE))
-} # END do_checkout
 
 # -----------------------------------------------------------------------------
 # DAY PASS
