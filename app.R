@@ -2302,8 +2302,8 @@ add_rows_to_cart <- function(rows_df) {
     as.character(obj[[key]] %||% "")
   }
 
-  cart_event_qty_in_session <- function(event_id) {
-    if (!nzchar(event_id %||% "")) {
+cart_qty_in_session <- function(category, id_key, target_id) {
+    if (!nzchar(target_id %||% "")) {
       return(0L)
     }
     df <- rv$cart
@@ -2311,15 +2311,15 @@ add_rows_to_cart <- function(rows_df) {
       return(0L)
     }
 
-    ix <- which(df$category == "event")
+    ix <- which(df$category == category)
     if (length(ix) == 0) {
       return(0L)
     }
 
     q <- 0L
     for (i in ix) {
-      eid <- parse_id_from_meta(df$meta_json[i] %||% "", "event_id")
-      if (identical(eid, event_id)) q <- q + as.integer(df$quantity[i] %||% 0L)
+      item_id <- parse_id_from_meta(df$meta_json[i] %||% "", id_key)
+      if (identical(item_id, target_id)) q <- q + as.integer(df$quantity[i] %||% 0L)
     }
     as.integer(q)
   }
@@ -2482,28 +2482,6 @@ add_rows_to_cart <- function(rows_df) {
   # -----------------------------------------------------------------------------
   # PROGRAM CAPACITY ENFORCEMENT
   # -----------------------------------------------------------------------------
-
-  cart_program_qty_in_session <- function(program_id) {
-    if (!nzchar(program_id %||% "")) {
-      return(0L)
-    }
-    df <- rv$cart
-    if (is.null(df) || nrow(df) == 0) {
-      return(0L)
-    }
-
-    ix <- which(df$category == "program")
-    if (length(ix) == 0) {
-      return(0L)
-    }
-
-    q <- 0L
-    for (i in ix) {
-      pid <- parse_id_from_meta(df$meta_json[i] %||% "", "program_id")
-      if (identical(pid, program_id)) q <- q + as.integer(df$quantity[i] %||% 0L)
-    }
-    as.integer(q)
-  }
 
   program_sold_qty_completed <- function(program_id) {
     if (!nzchar(program_id %||% "")) {
@@ -3753,7 +3731,7 @@ observeEvent(input$xmas_add_to_cart, {
     cap <- suppressWarnings(as.integer(row$capacity[1]))
     if (!is.na(cap)) {
       sold <- program_sold_qty_completed(id)
-      in_cart <- cart_program_qty_in_session(id)
+      in_cart <- cart_qty_in_session("program", "program_id", id)
       remaining <- cap - sold - in_cart
 
       if (remaining <= 0L) {
@@ -3868,7 +3846,7 @@ observeEvent(input$xmas_add_to_cart, {
     cap <- suppressWarnings(as.integer(row$capacity[1]))
     if (!is.na(cap)) {
       sold <- event_sold_qty_completed(id)
-      in_cart <- cart_event_qty_in_session(id)
+      in_cart <- cart_qty_in_session("event", "event_id", id)
       remaining <- cap - sold - in_cart
 
       if (remaining <= 0L) {
