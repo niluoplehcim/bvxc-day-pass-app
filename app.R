@@ -1788,6 +1788,14 @@ observeEvent(receipt_tx(), {
     NULL
   })
 
+panel <- function(title, ...) {
+      tags$div(
+        class = "panel panel-default admin-block",
+        tags$div(class = "panel-heading", title),
+        tags$div(class = "panel-body", ...)
+      )
+    }
+
   output$admin_content <- renderUI({
     admin_nonce()
     if (!isTRUE(rv$admin_logged_in)) {
@@ -4325,16 +4333,7 @@ tagList(
 
     prog <- get_program_list()
 
-    panel <- function(title, ...) {
-      tags$div(
-        class = "panel panel-default admin-block",
-        tags$div(class = "panel-heading", title),
-        tags$div(class = "panel-body", ...)
-      )
-    }
-
     tagList(
-      h3("Prices / Config"),
       panel(
         "Early-bird + Global limits",
         dateInput(
@@ -4418,7 +4417,7 @@ tagList(
         })
       ),
       panel(
-        "Tabs enabled",
+        "Visible Customer Tabs",
         checkboxInput("admin_tab_daypass_enabled", "Day Pass", value = cfg_bool("tab_daypass_enabled", TRUE)),
         checkboxInput("admin_tab_christmas_enabled", "Christmas Pass", value = cfg_bool("tab_christmas_enabled", TRUE)),
         checkboxInput("admin_tab_season_enabled", "Season Pass", value = cfg_bool("tab_season_enabled", TRUE)),
@@ -4515,21 +4514,23 @@ tagList(
       })
     }
 
-    tagList(
-      h3("Blocked Dates"),
-      fluidRow(
-        column(4, dateInput("admin_block_date", "Date", value = Sys.Date())),
-        column(8, textInput("admin_block_reason", "Reason (optional)", value = ""))
-      ),
-      actionButton("admin_block_add", "Add / Update"),
-      br(), br(),
-      tags$table(
-        class = "table table-condensed",
-        tags$thead(tags$tr(tags$th("Date"), tags$th("Reason"), tags$th("Action"))),
-        tags$tbody(rows)
+tagList(
+      panel(
+        "Blocked Dates",
+        fluidRow(
+          column(3, dateInput("admin_block_date", "Date", value = Sys.Date())),
+          column(6, textInput("admin_block_reason", "Reason (optional)", value = "")),
+          column(3, tags$div(style = "margin-top: 25px;", actionButton("admin_block_add", "Add / Update")))
+        ),
+        hr(),
+        tags$table(
+          class = "table table-condensed",
+          tags$thead(tags$tr(tags$th("Date"), tags$th("Reason"), tags$th("Action"))),
+          tags$tbody(rows)
+        )
       )
     )
-  })
+ })
 
   observeEvent(input$admin_block_add,
     {
@@ -4608,19 +4609,27 @@ tagList(
       choices <- c(choices, setNames(ev$id, lab))
     }
 
-    tagList(
-      h3("Special Events"),
-      selectInput("admin_event_pick", "Select event", choices = choices, selected = "NEW"),
-      textInput("admin_event_name", "Event name", value = ""),
-      dateInput("admin_event_date", "Event date", value = Sys.Date()),
-      numericInput("admin_event_price", "Price", value = NA_real_, min = 0, step = 1),
-      textInput("admin_event_capacity", "Capacity (blank = unlimited)", value = ""),
-      checkboxInput("admin_event_enabled", "Enabled", value = TRUE),
-      actionButton("admin_event_save", "Save / Update"),
-      tags$span(" "),
-      actionButton("admin_event_delete", "Delete")
+tagList(
+      panel(
+        "Special Events",
+        fluidRow(
+          column(4, selectInput("admin_event_pick", "Select event", choices = choices, selected = "NEW")),
+          column(4, textInput("admin_event_name", "Event name", value = "")),
+          column(4, dateInput("admin_event_date", "Event date", value = Sys.Date()))
+        ),
+        fluidRow(
+          column(3, numericInput("admin_event_price", "Price", value = NA_real_, min = 0, step = 1)),
+          column(3, textInput("admin_event_capacity", "Capacity (blank = unlimited)", value = "")),
+          column(2, tags$div(style = "margin-top: 25px;", checkboxInput("admin_event_enabled", "Enabled", value = TRUE))),
+          column(4, tags$div(style = "margin-top: 25px;",
+            actionButton("admin_event_save", "Save / Update"),
+            tags$span(" "),
+            actionButton("admin_event_delete", "Delete")
+          ))
+        )
+      )
     )
-  })
+ })
 
   observeEvent(input$admin_event_pick,
     {
@@ -4738,69 +4747,67 @@ tagList(
       return(NULL)
     }
 
-    tagList(
-      fluidRow(
-        column(3, dateInput("admin_tx_start", "From date", value = Sys.Date() - 30)),
-        column(3, dateInput("admin_tx_end", "To date", value = Sys.Date())),
-        column(3, textInput("admin_tx_name", "Name contains", value = "")),
-        column(3, selectInput(
-          "admin_tx_type", "Transaction type",
-          choices = c(
-            "All" = "",
-            "Day pass" = "day_pass",
-            "Christmas pass" = "christmas_pass",
-            "Season pass" = "season_pass",
-            "Program" = "program",
-            "Special event" = "event",
-            "Donation" = "donation",
-            "Mixed" = "mixed"
-          ),
-          selected = ""
-        ))
-      ),
-      fluidRow(
-        column(3, selectInput(
-          "admin_tx_status", "Status",
-          choices = c(
-            "All" = "",
-            "COMPLETED" = "COMPLETED",
-            "PENDING" = "PENDING",
-            "FAILED" = "FAILED",
-            "SANDBOX_TEST_OK" = "SANDBOX_TEST_OK",
-            "UNKNOWN" = "UNKNOWN"
-          ),
-          selected = ""
-        )),
-        column(3, textInput("admin_tx_email", "Email contains", value = "")),
-        column(3, selectInput(
-          "admin_tx_sort_by", "Sort by",
-          choices = c(
-            "Date (newest first)" = "created_at",
-            "Value (highest first)" = "total_amount_cents"
-          ),
-          selected = "created_at"
-        )),
-        column(3, numericInput("admin_tx_limit", "Limit", value = 50, min = 1, max = 500, step = 1))
-      ),
-      fluidRow(
-        column(
-          12,
-          actionButton("admin_tx_refresh", "Refresh"),
-          tags$span(" "),
-          downloadButton("admin_tx_download", "Download CSV")
-        )
-      ),
-      br(),
-      if (have_dt()) {
-        DT::DTOutput("admin_tx_table")
-      } else {
-        tags$div(
-          class = "alert alert-warning",
-          "DT package is not available on this host. Transactions table is disabled."
-        )
-      }
+tagList(
+      panel(
+        "Transactions Search & Reports",
+        fluidRow(
+          column(3, dateInput("admin_tx_start", "From date", value = Sys.Date() - 30)),
+          column(3, dateInput("admin_tx_end", "To date", value = Sys.Date())),
+          column(3, textInput("admin_tx_name", "Name contains", value = "")),
+          column(3, selectInput(
+            "admin_tx_type", "Transaction type",
+            choices = c(
+              "All" = "",
+              "Day pass" = "day_pass",
+              "Christmas pass" = "christmas_pass",
+              "Season pass" = "season_pass",
+              "Program" = "program",
+              "Special event" = "event",
+              "Donation" = "donation",
+              "Mixed" = "mixed"
+            ),
+            selected = ""
+          ))
+        ),
+        fluidRow(
+          column(3, selectInput(
+            "admin_tx_status", "Status",
+            choices = c(
+              "All" = "",
+              "COMPLETED" = "COMPLETED",
+              "PENDING" = "PENDING",
+              "FAILED" = "FAILED",
+              "SANDBOX_TEST_OK" = "SANDBOX_TEST_OK",
+              "UNKNOWN" = "UNKNOWN"
+            ),
+            selected = ""
+          )),
+          column(3, textInput("admin_tx_email", "Email contains", value = "")),
+          column(3, selectInput(
+            "admin_tx_sort_by", "Sort by",
+            choices = c(
+              "Date (newest first)" = "created_at",
+              "Value (highest first)" = "total_amount_cents"
+            ),
+            selected = "created_at"
+          )),
+          column(3, numericInput("admin_tx_limit", "Limit", value = 50, min = 1, max = 500, step = 1))
+        ),
+        actionButton("admin_tx_refresh", "Refresh"),
+        tags$span(" "),
+        downloadButton("admin_tx_download", "Download CSV"),
+        hr(),
+        if (have_dt()) {
+          DT::DTOutput("admin_tx_table")
+        } else {
+          tags$div(
+            class = "alert alert-warning",
+            "DT package is not available on this host. Transactions table is disabled."
+          )
+        }
+      )
     )
-  })
+})
 
   admin_tx_filters <- function(input) {
     lim <- suppressWarnings(as.integer(input$admin_tx_limit))
