@@ -588,14 +588,10 @@ cfg_set_sentinel <- function(key, done = TRUE) {
   invisible(TRUE)
 }
 
-# Call init_db ONCE — skip if DB already initialized
-
-if (!cfg_bool("db_init_v1_done")) {
-  timed("init_db()", init_db())
-  cfg_set_sentinel("db_init_v1_done", TRUE)
-} else {
-  cat("[PERF] init_db() skipped (already done)\n")
-}
+# Always initialize schema (cheap + avoids fresh-DB crash)
+timed("init_db()", init_db())
+# Optional: warm cache so first cfg_get() doesn't hit the DB
+try(cfg_refresh_cache(force = TRUE), silent = TRUE)
 
 # One-time backfill (per process, not per session)
 if (!cfg_bool(CFG_TX_ITEMS_BACKFILL_V1_DONE)) {
