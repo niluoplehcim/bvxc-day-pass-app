@@ -590,7 +590,12 @@ cfg_set_sentinel <- function(key, done = TRUE) {
 
 # Call init_db ONCE — skip if DB already initialized
 
-if (!cfg_bool("db_init_v1_done")) {
+# Safe check: only skip init_db if config table exists AND sentinel is set
+safe_cfg_bool <- function(key) {
+  tryCatch(cfg_bool(key), error = function(e) FALSE)
+}
+
+if (!safe_cfg_bool("db_init_v1_done")) {
   timed("init_db()", init_db())
   cfg_set_sentinel("db_init_v1_done", TRUE)
 } else {
@@ -598,7 +603,7 @@ if (!cfg_bool("db_init_v1_done")) {
 }
 
 # One-time backfill (per process, not per session)
-if (!cfg_bool(CFG_TX_ITEMS_BACKFILL_V1_DONE)) {
+if (!safe_cfg_bool(CFG_TX_ITEMS_BACKFILL_V1_DONE)) {
   try(ensure_tx_items_backfill_completed(), silent = TRUE)
 }
 
