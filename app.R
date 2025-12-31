@@ -316,6 +316,11 @@ fetch_transactions <- function(limit = 50L,
 
 init_db <- function() {
   with_db(function(con) {
+    # Suppress "already exists" notices in Postgres (speeds up cold start)
+    if (db_is_postgres()) {
+      try(DBI::dbExecute(con, "SET client_min_messages = warning"), silent = TRUE)
+    }
+
     # -----------------------------
     # config
     # -----------------------------
