@@ -1486,7 +1486,7 @@ ensure_tx_items_backfill_completed <- function(batch = 200L, max_batches = 20L) 
   invisible(TRUE)
 }
 
-insert_tx_items_for_cart <- function(tx_id, created_at, status, cart_df) {
+insert_tx_items_for_cart <- function(tx_id, created_at, status, cart_df, con = NULL) {
   if (!nzchar(tx_id %||% "")) {
     return(invisible(TRUE))
   }
@@ -1499,15 +1499,13 @@ insert_tx_items_for_cart <- function(tx_id, created_at, status, cart_df) {
     return(invisible(TRUE))
   }
 
-with_db(function(con) {
+  do_insert <- function(conn) {
     # Build all rows first
     rows <- lapply(ix, function(j) {
       item_id <- extract_item_id_for_tx_item(cart_df$category[j], cart_df$meta_json[j])
       if (!nzchar(item_id)) return(NULL)
-
       q <- suppressWarnings(as.integer(cart_df$quantity[j] %||% 0L))
       if (is.na(q) || q <= 0L) return(NULL)
-
       data.frame(
         id         = UUIDgenerate(),
         tx_id      = tx_id,
@@ -1519,16 +1517,24 @@ with_db(function(con) {
         stringsAsFactors = FALSE
       )
     })
-
     rows <- rows[!vapply(rows, is.null, logical(1))]
     if (length(rows) == 0) return(invisible(TRUE))
-
     batch_df <- do.call(rbind, rows)
+    DBI::dbWriteTable(conn, "tx_items", batch_df, append = TRUE, row.names = FALSE)
+    invisible(TRUE)
+  }
 
-    DBI::dbWithTransaction(con, {
-      DBI::dbWriteTable(con, "tx_items", batch_df, append = TRUE, row.names = FALSE)
+  # If connection provided, use it directly (caller manages transaction)
+  # Otherwise, wrap in our own with_db + transaction
+  if (!is.null(con)) {
+    do_insert(con)
+  } else {
+    with_db(function(conn) {
+      DBI::dbWithTransaction(conn, {
+        do_insert(conn)
+      })
     })
-  })
+  }
 
   invisible(TRUE)
 }
@@ -3243,7 +3249,7 @@ do_checkout <- function(source = "tab") {
     tx_type <- infer_tx_type(df)
     total_cents <- cart_total_cents(df)
 
-    # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
     # Mode switch: Fake vs Square
     # ---------------------------------------------------------------------------
 
@@ -3254,28 +3260,43 @@ do_checkout <- function(source = "tab") {
       created_at <- now_ts()
       status0 <- "SANDBOX_TEST_OK"
 
-      ok <- timed("DB insert sandbox transaction", tryCatch(
+      ok <- timed("DB insert sandbox transaction + tx_items", tryCatch(
         {
-          db_exec1(
-            "INSERT INTO transactions (
-               id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
-               tx_type,
-               square_checkout_id, square_order_id, receipt_token, status
-             ) VALUES (
-               ?id, ?created_at, ?buyer_name, ?buyer_email, ?total_cents, 'CAD', ?cart_json,
-               ?tx_type,
-               NULL, NULL, ?receipt_token, ?status
-             )",
-            id            = tx_id,
-            created_at    = created_at,
-            buyer_name    = buyer_name,
-            buyer_email   = buyer_email,
-            total_cents   = total_cents,
-            cart_json     = as.character(jsonlite::toJSON(df, auto_unbox = TRUE, null = "null")),
-            tx_type       = tx_type,
-            receipt_token = receipt_token,
-            status        = status0
-          )
+          with_db(function(con) {
+            DBI::dbWithTransaction(con, {
+              # Insert transaction
+              db_exec(
+                con,
+                "INSERT INTO transactions (
+                   id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
+                   tx_type,
+                   square_checkout_id, square_order_id, receipt_token, status
+                 ) VALUES (
+                   ?id, ?created_at, ?buyer_name, ?buyer_email, ?total_cents, 'CAD', ?cart_json,
+                   ?tx_type,
+                   NULL, NULL, ?receipt_token, ?status
+                 )",
+                id            = tx_id,
+                created_at    = created_at,
+                buyer_name    = buyer_name,
+                buyer_email   = buyer_email,
+                total_cents   = total_cents,
+                cart_json     = as.character(jsonlite::toJSON(df, auto_unbox = TRUE, null = "null")),
+                tx_type       = tx_type,
+                receipt_token = receipt_token,
+                status        = status0
+              )
+
+              # Insert tx_items using same connection (inside same transaction)
+              insert_tx_items_for_cart(
+                tx_id      = tx_id,
+                created_at = created_at,
+                status     = status0,
+                cart_df    = df,
+                con        = con
+              )
+            })
+          })
           TRUE
         },
         error = function(e) {
@@ -3291,13 +3312,6 @@ do_checkout <- function(source = "tab") {
         return()
       }
 
-      timed("tx_items insert (sandbox)", insert_tx_items_for_cart(
-        tx_id      = tx_id,
-        created_at = created_at,
-        status     = status0,
-        cart_df    = df
-      ))
-
       receipt_tx(load_receipt_token(receipt_token))
       poll_count(0L)
       clear_cart()
@@ -3309,6 +3323,7 @@ do_checkout <- function(source = "tab") {
         easyClose = TRUE,
         footer = modalButton("OK")
       ))
+
       return()
     }
 
@@ -3338,30 +3353,49 @@ do_checkout <- function(source = "tab") {
     created_at <- now_ts()
     status0 <- "PENDING"
 
-    ok <- timed("DB insert transaction (PENDING)", tryCatch(
+tx_id <- UUIDgenerate()
+    created_at <- now_ts()
+    status0 <- "PENDING"
+
+    ok <- timed("DB insert transaction + tx_items (PENDING)", tryCatch(
       {
-        db_exec1(
-          "INSERT INTO transactions (
-             id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
-             tx_type,
-             square_checkout_id, square_order_id, receipt_token, status
-           ) VALUES (
-             ?id, ?created_at, ?buyer_name, ?buyer_email, ?total_cents, 'CAD', ?cart_json,
-             ?tx_type,
-             ?checkout_id, ?order_id, ?receipt_token, ?status
-           )",
-          id            = tx_id,
-          created_at    = created_at,
-          buyer_name    = buyer_name,
-          buyer_email   = buyer_email,
-          total_cents   = total_cents,
-          cart_json     = as.character(jsonlite::toJSON(df, auto_unbox = TRUE, null = "null")),
-          tx_type       = tx_type,
-          checkout_id   = res$checkout_id %||% NA_character_,
-          order_id      = res$square_order %||% NA_character_,
-          receipt_token = receipt_token,
-          status        = status0
-        )
+        with_db(function(con) {
+          DBI::dbWithTransaction(con, {
+            # Insert transaction
+            db_exec(
+              con,
+              "INSERT INTO transactions (
+                 id, created_at, buyer_name, buyer_email, total_amount_cents, currency, cart_json,
+                 tx_type,
+                 square_checkout_id, square_order_id, receipt_token, status
+               ) VALUES (
+                 ?id, ?created_at, ?buyer_name, ?buyer_email, ?total_cents, 'CAD', ?cart_json,
+                 ?tx_type,
+                 ?checkout_id, ?order_id, ?receipt_token, ?status
+               )",
+              id            = tx_id,
+              created_at    = created_at,
+              buyer_name    = buyer_name,
+              buyer_email   = buyer_email,
+              total_cents   = total_cents,
+              cart_json     = as.character(jsonlite::toJSON(df, auto_unbox = TRUE, null = "null")),
+              tx_type       = tx_type,
+              checkout_id   = res$checkout_id %||% NA_character_,
+              order_id      = res$square_order %||% NA_character_,
+              receipt_token = receipt_token,
+              status        = status0
+            )
+
+            # Insert tx_items using same connection (inside same transaction)
+            insert_tx_items_for_cart(
+              tx_id      = tx_id,
+              created_at = created_at,
+              status     = status0,
+              cart_df    = df,
+              con        = con
+            )
+          })
+        })
         TRUE
       },
       error = function(e) {
@@ -3373,13 +3407,6 @@ do_checkout <- function(source = "tab") {
     if (!ok) {
       return()
     }
-
-    timed("tx_items insert (PENDING)", insert_tx_items_for_cart(
-      tx_id      = tx_id,
-      created_at = created_at,
-      status     = status0,
-      cart_df    = df
-    ))
 
     rv$checkout_started <- TRUE
     rv$checkout_token <- receipt_token
