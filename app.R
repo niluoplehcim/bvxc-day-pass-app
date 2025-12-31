@@ -423,6 +423,7 @@ init_db <- function() {
 
     try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_tx_items_item_cat_status ON tx_items(item_id, category, status)"), silent = TRUE)
     try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_tx_items_tx_id          ON tx_items(tx_id)"), silent = TRUE)
+    try(db_exec(con, "CREATE UNIQUE INDEX IF NOT EXISTS ux_tx_items_tx_cat_item ON tx_items(tx_id, category, item_id)"), silent = TRUE)
 
     # -----------------------------
     # indexes + constraints
@@ -600,11 +601,6 @@ if (!safe_cfg_bool("db_init_v1_done")) {
   cfg_set_sentinel("db_init_v1_done", TRUE)
 } else {
   cat("[PERF] init_db() skipped (already done)\n")
-}
-
-# One-time backfill (per process, not per session)
-if (!safe_cfg_bool(CFG_TX_ITEMS_BACKFILL_V1_DONE)) {
-  try(ensure_tx_items_backfill_completed(), silent = TRUE)
 }
 
 # -----------------------------------------------------------------------------
@@ -1520,12 +1516,18 @@ ensure_tx_items_backfill_completed <- function(batch = 200L, max_batches = 20L) 
     }
   }
 
-  # Hit max_batches; do NOT set sentinel. We'll continue next time.
+# Hit max_batches; do NOT set sentinel. We'll continue next time.
   invisible(TRUE)
 }
 
+# Run backfill once at startup (after function is defined)
+if (!safe_cfg_bool(CFG_TX_ITEMS_BACKFILL_V1_DONE)) {
+  try(ensure_tx_items_backfill_completed(), silent = TRUE)
+}
+
 insert_tx_items_for_cart <- function(tx_id, created_at, status, cart_df, con = NULL) {
-  if (!nzchar(tx_id %||% "")) {
+
+if (!nzchar(tx_id %||% "")) {
     return(invisible(TRUE))
   }
   if (is.null(cart_df) || nrow(cart_df) == 0) {
@@ -1555,10 +1557,21 @@ insert_tx_items_for_cart <- function(tx_id, created_at, status, cart_df, con = N
         stringsAsFactors = FALSE
       )
     })
-    rows <- rows[!vapply(rows, is.null, logical(1))]
+
+rows <- rows[!vapply(rows, is.null, logical(1))]
     if (length(rows) == 0) return(invisible(TRUE))
     batch_df <- do.call(rbind, rows)
+    
+    # Aggregate by (category, item_id) to prevent unique constraint violations
+    agg <- aggregate(qty ~ category + item_id, data = batch_df, FUN = sum)
+    agg$id         <- vapply(seq_len(nrow(agg)), function(...) UUIDgenerate(), character(1))
+    agg$tx_id      <- tx_id
+    agg$status     <- as.character(status %||% "")
+    agg$created_at <- as.character(created_at %||% now_ts())
+    batch_df <- agg[, c("id", "tx_id", "category", "item_id", "qty", "status", "created_at")]
+    
     DBI::dbWriteTable(conn, "tx_items", batch_df, append = TRUE, row.names = FALSE)
+
     invisible(TRUE)
   }
 
@@ -1575,6 +1588,22 @@ insert_tx_items_for_cart <- function(tx_id, created_at, status, cart_df, con = N
   }
 
   invisible(TRUE)
+}
+
+# Per-process cache for Square status (avoids redundant API calls)
+square_status_cache <- new.env(parent = emptyenv())
+
+get_cached_square_status <- function(order_id, ttl_secs = 10) {
+  now <- Sys.time()
+  cached <- square_status_cache[[order_id]]
+  if (!is.null(cached) && difftime(now, cached$time, units = "secs") < ttl_secs) {
+    return(cached$status)
+  }
+  NULL
+}
+
+set_cached_square_status <- function(order_id, status) {
+  square_status_cache[[order_id]] <- list(status = status, time = Sys.time())
 }
 
 # -----------------------------------------------------------------------------
@@ -1845,22 +1874,6 @@ panel <- function(title, ...) {
       uiOutput("admin_tx_ui")
     )
   })
-
-# Per-process cache for Square status (avoids redundant API calls)
-  square_status_cache <- new.env(parent = emptyenv())
-  
-  get_cached_square_status <- function(order_id, ttl_secs = 10) {
-    now <- Sys.time()
-    cached <- square_status_cache[[order_id]]
-    if (!is.null(cached) && difftime(now, cached$time, units = "secs") < ttl_secs) {
-      return(cached$status)
-    }
-    NULL
-  }
-  
-  set_cached_square_status <- function(order_id, status) {
-    square_status_cache[[order_id]] <- list(status = status, time = Sys.time())
-  }
 
   poll_count <- reactiveVal(0L)
 
