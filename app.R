@@ -1813,6 +1813,22 @@ panel <- function(title, ...) {
     )
   })
 
+# Per-process cache for Square status (avoids redundant API calls)
+  square_status_cache <- new.env(parent = emptyenv())
+  
+  get_cached_square_status <- function(order_id, ttl_secs = 10) {
+    now <- Sys.time()
+    cached <- square_status_cache[[order_id]]
+    if (!is.null(cached) && difftime(now, cached$time, units = "secs") < ttl_secs) {
+      return(cached$status)
+    }
+    NULL
+  }
+  
+  set_cached_square_status <- function(order_id, status) {
+    square_status_cache[[order_id]] <- list(status = status, time = Sys.time())
+  }
+
   poll_count <- reactiveVal(0L)
 
   clear_cart <- function() rv$cart <- empty_cart_df()
@@ -2671,10 +2687,9 @@ validate_program_capacities_for_cart <- function(cart_df, con = NULL) {
     TRUE
   }
 
-  # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
   # RECEIPT VERIFICATION (Square)  -- with PERF timing
   # -----------------------------------------------------------------------------
-
   infer_status_from_square <- function(order_id) {
     # returns one of: COMPLETED, PENDING, FAILED, UNKNOWN
     if (!HAVE_SQUARE_CREDS) {
@@ -2683,11 +2698,14 @@ validate_program_capacities_for_cart <- function(cart_df, con = NULL) {
     if (!nzchar(order_id %||% "")) {
       return("UNKNOWN")
     }
-
+    # Check cache first
+    cached <- get_cached_square_status(order_id)
+    if (!is.null(cached)) {
+      return(cached)
+    }
     payments <- timed("square_list_payments_by_order()", {
       square_list_payments_by_order(order_id)
     })
-
     sts <- timed("compute_payment_status()", {
       if (!is.null(payments) && length(payments) > 0) {
         toupper(vapply(payments, function(p) as.character(p$status %||% ""), character(1)))
@@ -2695,25 +2713,20 @@ validate_program_capacities_for_cart <- function(cart_df, con = NULL) {
         character(0)
       }
     })
-
-    if (length(sts) > 0) {
+    result <- if (length(sts) > 0) {
       if (any(sts %in% "COMPLETED")) {
-        return("COMPLETED")
+        "COMPLETED"
+      } else if (any(sts %in% c("CANCELED", "FAILED"))) {
+        "FAILED"
+      } else {
+        "PENDING"
       }
-      if (any(sts %in% c("CANCELED", "FAILED"))) {
-        return("FAILED")
-      }
-      return("PENDING")
+    } else {
+      "PENDING"
     }
-
-    ord <- timed("square_get_order()", {
-      square_get_order(order_id)
-    })
-
-    if (is.null(ord)) {
-      return("UNKNOWN")
-    }
-    "PENDING"
+    # Cache the result
+    set_cached_square_status(order_id, result)
+    result
   }
 
   verify_and_refresh_receipt <- function() {
@@ -2723,32 +2736,26 @@ validate_program_capacities_for_cart <- function(cart_df, con = NULL) {
     if (is.null(tx) || nrow(tx) != 1) {
       return(FALSE)
     }
-
     st0 <- as.character(tx$status[1] %||% "")
     if (st0 %in% c("COMPLETED", "SANDBOX_TEST_OK", "FAILED")) {
       return(TRUE)
     }
-
-if (isTRUE(IS_FAKE_MODE)) {
-  return(TRUE)
-}
-
+    if (isTRUE(IS_FAKE_MODE)) {
+      return(TRUE)
+    }
     new_st <- timed("infer_status_from_square()", {
       infer_status_from_square(as.character(tx$square_order_id[1] %||% ""))
     })
-
     if (new_st %in% c("COMPLETED", "FAILED", "PENDING", "UNKNOWN")) {
       if (new_st != "UNKNOWN") {
         timed("update_tx_status()", {
           update_tx_status(as.character(tx$id[1]), new_st)
         })
       }
-
       timed("receipt_tx_refresh()", {
         receipt_tx(load_receipt_token(as.character(tx$receipt_token[1] %||% "")))
       })
     }
-
     TRUE
   }
 
