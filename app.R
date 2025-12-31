@@ -2387,7 +2387,7 @@ cart_qty_in_session <- function(category, id_key, target_id) {
     if (is.na(sold)) 0L else sold
   }
 
-  # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
   # PERF: Batch helpers for capacity checks (1 DB round-trip for caps + sold)
   # -----------------------------------------------------------------------------
 
@@ -2400,66 +2400,81 @@ cart_qty_in_session <- function(category, id_key, target_id) {
     paste0("(", paste(DBI::dbQuoteString(con, ids), collapse = ","), ")")
   }
 
-  batch_event_caps_and_sold <- function(event_ids) {
+  batch_event_caps_and_sold <- function(event_ids, con = NULL, lock = FALSE) {
     event_ids <- unique(as.character(event_ids))
     event_ids <- event_ids[nzchar(event_ids)]
     if (length(event_ids) == 0) {
       return(list(caps = data.frame(), sold = data.frame()))
     }
 
-    with_db(function(con) {
-      in_sql <- sql_in_clause(con, event_ids)
+    do_query <- function(conn) {
+      in_sql <- sql_in_clause(conn, event_ids)
+
+      # Lock rows if requested (Postgres only, prevents race condition)
+      lock_clause <- if (lock && db_is_postgres()) " FOR UPDATE" else ""
 
       caps <- DBI::dbGetQuery(
-        con,
+        conn,
         paste0(
           "SELECT id, capacity, name, event_date
-         FROM special_events
-         WHERE id IN ", in_sql
+           FROM special_events
+           WHERE id IN ", in_sql,
+          lock_clause
         )
       )
 
       sold <- DBI::dbGetQuery(
-        con,
+        conn,
         paste0(
           "SELECT item_id, COALESCE(SUM(qty), 0) AS sold
-         FROM tx_items
-         WHERE category = 'event'
-           AND status IN ('COMPLETED','SANDBOX_TEST_OK')
-           AND item_id IN ", in_sql,
+           FROM tx_items
+           WHERE category = 'event'
+             AND status IN ('COMPLETED','SANDBOX_TEST_OK')
+             AND item_id IN ", in_sql,
           " GROUP BY item_id"
         )
       )
 
       list(caps = caps, sold = sold)
-    })
+    }
+
+    if (!is.null(con)) {
+      do_query(con)
+    } else {
+      with_db(do_query)
+    }
   }
 
-  batch_program_sold <- function(program_ids) {
+  batch_program_sold <- function(program_ids, con = NULL) {
     program_ids <- unique(as.character(program_ids))
     program_ids <- program_ids[nzchar(program_ids)]
     if (length(program_ids) == 0) {
       return(data.frame(item_id = character(), sold = integer()))
     }
 
-    with_db(function(con) {
-      in_sql <- sql_in_clause(con, program_ids)
-
+    do_query <- function(conn) {
+      in_sql <- sql_in_clause(conn, program_ids)
       DBI::dbGetQuery(
-        con,
+        conn,
         paste0(
           "SELECT item_id, COALESCE(SUM(qty), 0) AS sold
-         FROM tx_items
-         WHERE category = 'program'
-           AND status IN ('COMPLETED','SANDBOX_TEST_OK')
-           AND item_id IN ", in_sql,
+           FROM tx_items
+           WHERE category = 'program'
+             AND status IN ('COMPLETED','SANDBOX_TEST_OK')
+             AND item_id IN ", in_sql,
           " GROUP BY item_id"
         )
       )
-    })
+    }
+
+    if (!is.null(con)) {
+      do_query(con)
+    } else {
+      with_db(do_query)
+    }
   }
 
-  validate_event_capacities_for_cart <- function(cart_df) {
+  validate_event_capacities_for_cart <- function(cart_df, con = NULL, lock = FALSE) {
     if (is.null(cart_df) || nrow(cart_df) == 0) {
       return(NULL)
     }
@@ -2476,13 +2491,13 @@ cart_qty_in_session <- function(category, id_key, target_id) {
       if (!nzchar(eid)) next
       req_by_event[[eid]] <- (req_by_event[[eid]] %||% 0L) + as.integer(cart_df$quantity[i] %||% 0L)
     }
+
     if (length(req_by_event) == 0) {
       return(NULL)
     }
 
     event_ids <- names(req_by_event)
-
-    snap <- batch_event_caps_and_sold(event_ids)
+    snap <- batch_event_caps_and_sold(event_ids, con = con, lock = lock)
     caps <- snap$caps
     sold <- snap$sold
 
@@ -2499,11 +2514,11 @@ cart_qty_in_session <- function(category, id_key, target_id) {
       cap <- suppressWarnings(as.integer(cap_row$capacity[1]))
       if (is.na(cap)) next # NA capacity = unlimited
 
-      sold_i <- sold_map[eid]  # safe even when sold_map is empty
+      sold_i <- sold_map[eid]
       if (length(sold_i) == 0 || is.na(sold_i[1])) {
-       sold_i <- 0L
+        sold_i <- 0L
       } else {
-       sold_i <- as.integer(sold_i[1])
+        sold_i <- as.integer(sold_i[1])
       }
 
       remaining <- cap - sold_i
@@ -2546,7 +2561,7 @@ cart_qty_in_session <- function(category, id_key, target_id) {
     if (is.na(sold)) 0L else sold
   }
 
-  validate_program_capacities_for_cart <- function(cart_df) {
+validate_program_capacities_for_cart <- function(cart_df, con = NULL) {
     if (is.null(cart_df) || nrow(cart_df) == 0) {
       return(NULL)
     }
@@ -2563,6 +2578,7 @@ cart_qty_in_session <- function(category, id_key, target_id) {
       if (!nzchar(pid)) next
       req_by_program[[pid]] <- (req_by_program[[pid]] %||% 0L) + as.integer(cart_df$quantity[i] %||% 0L)
     }
+
     if (length(req_by_program) == 0) {
       return(NULL)
     }
@@ -2574,8 +2590,7 @@ cart_qty_in_session <- function(category, id_key, target_id) {
     prog_sub <- prog[prog$id %in% program_ids, , drop = FALSE]
 
     # sold counts: 1 query total
-    sold_df <- batch_program_sold(program_ids)
-
+    sold_df <- batch_program_sold(program_ids, con = con)
     sold_map <- integer()
     if (nrow(sold_df) > 0) {
       sold_map <- setNames(as.integer(sold_df$sold), as.character(sold_df$item_id))
@@ -3234,26 +3249,14 @@ do_checkout <- function(source = "tab") {
       return()
     }
 
-    cap_msg <- timed("validate_event_capacities()", validate_event_capacities_for_cart(df))
-    if (!is.null(cap_msg)) {
-      showNotification(cap_msg, type = "error")
-      return()
-    }
-
-    prog_msg <- timed("validate_program_capacities()", validate_program_capacities_for_cart(df))
-    if (!is.null(prog_msg)) {
-      showNotification(prog_msg, type = "error")
-      return()
-    }
-
     tx_type <- infer_tx_type(df)
     total_cents <- cart_total_cents(df)
 
-# ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
     # Mode switch: Fake vs Square
     # ---------------------------------------------------------------------------
 
-    # If not in Square mode, always use fake mode (dev/test path)
+# If not in Square mode, always use fake mode (dev/test path)
     if (!isTRUE(IS_SQUARE_MODE)) {
       receipt_token <- UUIDgenerate()
       tx_id <- UUIDgenerate()
@@ -3264,6 +3267,13 @@ do_checkout <- function(source = "tab") {
         {
           with_db(function(con) {
             DBI::dbWithTransaction(con, {
+              # Re-check capacity INSIDE transaction with row locking
+              cap_msg <- validate_event_capacities_for_cart(df, con = con, lock = TRUE)
+              if (!is.null(cap_msg)) stop(cap_msg)
+
+              prog_msg <- validate_program_capacities_for_cart(df, con = con)
+              if (!is.null(prog_msg)) stop(prog_msg)
+
               # Insert transaction
               db_exec(
                 con,
@@ -3301,7 +3311,7 @@ do_checkout <- function(source = "tab") {
         },
         error = function(e) {
           showNotification(
-            paste("DB error saving sandbox transaction:", conditionMessage(e)),
+            paste("Checkout failed:", conditionMessage(e)),
             type = "error"
           )
           FALSE
@@ -3349,10 +3359,6 @@ do_checkout <- function(source = "tab") {
       return()
     }
 
-    tx_id <- UUIDgenerate()
-    created_at <- now_ts()
-    status0 <- "PENDING"
-
 tx_id <- UUIDgenerate()
     created_at <- now_ts()
     status0 <- "PENDING"
@@ -3361,6 +3367,13 @@ tx_id <- UUIDgenerate()
       {
         with_db(function(con) {
           DBI::dbWithTransaction(con, {
+            # Re-check capacity INSIDE transaction with row locking
+            cap_msg <- validate_event_capacities_for_cart(df, con = con, lock = TRUE)
+            if (!is.null(cap_msg)) stop(cap_msg)
+
+            prog_msg <- validate_program_capacities_for_cart(df, con = con)
+            if (!is.null(prog_msg)) stop(prog_msg)
+
             # Insert transaction
             db_exec(
               con,
@@ -3399,7 +3412,10 @@ tx_id <- UUIDgenerate()
         TRUE
       },
       error = function(e) {
-        showNotification(paste("DB error saving transaction:", conditionMessage(e)), type = "error")
+        showNotification(
+          paste("Checkout failed:", conditionMessage(e)),
+          type = "error"
+        )
         FALSE
       }
     ))
