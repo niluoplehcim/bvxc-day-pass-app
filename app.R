@@ -1441,7 +1441,7 @@ extract_item_id_for_tx_item <- function(category, meta_json) {
 ensure_tx_items_backfill_completed <- function(batch = 200L, max_batches = 20L) {
 
   # If already done (DB sentinel), skip
-  if (cfg_bool(CFG_TX_ITEMS_BACKFILL_V1_DONE)) {
+  if (safe_cfg_bool(CFG_TX_ITEMS_BACKFILL_V1_DONE)) {
     return(invisible(TRUE))
   }
 
