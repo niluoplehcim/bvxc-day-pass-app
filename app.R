@@ -165,7 +165,7 @@ make_pool <- function() {
         drv = RPostgres::Postgres(),
         dbname = s,
         minSize = 1,
-        maxSize = 2,
+        maxSize = 5,
         idleTimeout = 600000, # 10 minutes (ms)
         validationInterval = 60000 # 1 minute (ms)
       ))
@@ -196,7 +196,7 @@ make_pool <- function() {
         args,
         list(
           minSize = 1,
-          maxSize = 2,
+          maxSize = 5,
           idleTimeout = 600000, # 10 minutes (ms)
           validationInterval = 60000 # 1 minute (ms)
         )
@@ -881,8 +881,18 @@ line_item_label_from_obj <- function(category, description, obj) {
   desc
 }
 
-# Primary entry point (same signature as before)
-line_item_label <- function(category, description, meta_json) {
+# Primary entry point — prefers person_label to avoid JSON parsing
+line_item_label <- function(category, description, meta_json, person_label = NULL) {
+  desc <- as.character(description %||% "")
+  cat  <- as.character(category %||% "")
+  
+  # Use person_label if provided and non-empty (skip JSON parsing)
+  pl <- trimws(as.character(person_label %||% ""))
+  if (nzchar(pl)) {
+    return(paste0(desc, " \u2014 ", pl))
+  }
+  
+  # Fallback: parse JSON (legacy rows without person_label)
   obj <- parse_meta_obj_safe(meta_json)
   line_item_label_from_obj(category, description, obj)
 }
@@ -984,10 +994,15 @@ create_square_checkout_from_cart <- function(cart_df,
     return(NULL)
   }
 
-  line_items <- lapply(seq_len(nrow(cart_df)), function(i) {
+line_items <- lapply(seq_len(nrow(cart_df)), function(i) {
     row <- cart_df[i, , drop = FALSE]
     list(
-      name = line_item_label(as.character(row$category[1]), as.character(row$description[1]), as.character(row$meta_json[1] %||% "")),
+      name = line_item_label(
+        as.character(row$category[1]),
+        as.character(row$description[1]),
+        as.character(row$meta_json[1] %||% ""),
+        person_label = as.character(row$person_label[1] %||% "")
+      ),
       quantity = as.character(row$quantity[1]),
       base_price_money = list(
         amount   = as.integer(round(as.numeric(row$unit_price[1]) * 100)),
