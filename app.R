@@ -891,6 +891,14 @@ line_item_label <- function(category, description, meta_json) {
 # SQUARE API HELPERS
 # -----------------------------------------------------------------------------
 
+# Shared handle for Square API (enables keep-alive connection reuse)
+square_handle <- httr::handle("https://connect.squareup.com")
+square_sandbox_handle <- httr::handle("https://connect.squareupsandbox.com")
+
+get_square_handle <- function() {
+  if (identical(SQUARE_ENV, "sandbox")) square_sandbox_handle else square_handle
+}
+
 square_base_url <- function() {
   if (identical(SQUARE_ENV, "sandbox")) "https://connect.squareupsandbox.com" else "https://connect.squareup.com"
 }
@@ -910,11 +918,16 @@ square_safe_json <- function(res) {
 
 square_http_get <- function(path, query = list()) {
   res <- timed(paste0("square_http_get() ", path), {
-    httr::GET(
+    httr::RETRY(
+      "GET",
       url = paste0(square_base_url(), path),
       square_headers(include_version = TRUE),
       query = query,
-      httr::timeout(15)
+      httr::timeout(8),
+      handle = get_square_handle(),
+      times = 3,
+      pause_cap = 2,
+      quiet = TRUE
     )
   })
 
@@ -928,13 +941,18 @@ square_http_get <- function(path, query = list()) {
 square_http_post <- function(path, body) {
   res <- timed(paste0("square_http_post() ", path), {
     tryCatch(
-      httr::POST(
+      httr::RETRY(
+        "POST",
         url = paste0(square_base_url(), path),
         square_headers(include_version = TRUE),
         httr::content_type_json(),
         body = body,
         encode = "json",
-        httr::timeout(45)
+        httr::timeout(12),
+        handle = get_square_handle(),
+        times = 3,
+        pause_cap = 2,
+        quiet = TRUE
       ),
       error = function(e) e
     )
