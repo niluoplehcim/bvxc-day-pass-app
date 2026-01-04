@@ -116,12 +116,24 @@ DB_PATH <- Sys.getenv("BVXC_DB_PATH", unset = "bvxc.sqlite")
 ALLOW_SQLITE_FALLBACK <- is_true(Sys.getenv("BVXC_ALLOW_SQLITE_FALLBACK", "0"))
 db_is_postgres <- function() nzchar(trimws(DB_URL))
 
+# Detect if running on Posit Connect (or similar hosted environment)
+IS_CONNECT <- nzchar(Sys.getenv("RSCONNECT_SERVER", "")) ||
+  nzchar(Sys.getenv("RSCONNECT_DOCUMENT_ID", "")) ||
+  nzchar(Sys.getenv("POSIT_CONNECT_SERVER", "")) ||
+  nzchar(Sys.getenv("CONNECT_SERVER", ""))
+
 if (!db_is_postgres() && !ALLOW_SQLITE_FALLBACK) {
-  stop(
-    "BVXC_DB_URL is not set. Refusing to run without Postgres.\n",
-    "Set BVXC_DB_URL to your Supabase/Postgres connection string.\n",
-    "If you *really* want SQLite fallback (dev only), set BVXC_ALLOW_SQLITE_FALLBACK=1."
-  )
+  if (IS_CONNECT) {
+    # On hosted: fail hard to avoid ephemeral SQLite
+    stop(
+      "BVXC_DB_URL is not set. Refusing to run without Postgres on Posit Connect.\n",
+      "Set BVXC_DB_URL to your Supabase/Postgres connection string.\n",
+      "If you *really* want SQLite fallback (dev only), set BVXC_ALLOW_SQLITE_FALLBACK=1."
+    )
+  } else {
+    # On local dev: warn and allow SQLite fallback
+    cat("[WARN] BVXC_DB_URL not set; using SQLite at ", DB_PATH, " (dev only)\n", sep = "")
+  }
 }
 
 parse_kv_conn <- function(s) {
@@ -589,19 +601,14 @@ cfg_set_sentinel <- function(key, done = TRUE) {
   invisible(TRUE)
 }
 
-# Call init_db ONCE — skip if DB already initialized
-
-# Safe check: only skip init_db if config table exists AND sentinel is set
+# Safe check helper (used for backfill sentinel below)
 safe_cfg_bool <- function(key) {
   tryCatch(cfg_bool(key), error = function(e) FALSE)
 }
 
-if (!safe_cfg_bool("db_init_v1_done")) {
-  timed("init_db()", init_db())
-  cfg_set_sentinel("db_init_v1_done", TRUE)
-} else {
-  cat("[PERF] init_db() skipped (already done)\n")
-}
+# Always run init_db (safe on fresh DB; cheap on existing DB)
+# All statements use IF NOT EXISTS, so this is idempotent
+timed("init_db()", init_db())
 
 # -----------------------------------------------------------------------------
 # BUSINESS DATA
@@ -1605,12 +1612,22 @@ rows <- rows[!vapply(rows, is.null, logical(1))]
     agg$created_at <- as.character(created_at %||% now_ts())
     batch_df <- agg[, c("id", "tx_id", "category", "item_id", "qty", "status", "created_at")]
 
-    # Explicit INSERT (safer than dbWriteTable for transactional data)
+# Explicit INSERT (safer than dbWriteTable for transactional data)
+    # Use ON CONFLICT DO NOTHING (Postgres) / INSERT OR IGNORE (SQLite)
+    # to handle multi-worker race conditions safely
+    ins_sql <- if (db_is_postgres()) {
+      "INSERT INTO tx_items (id, tx_id, category, item_id, qty, status, created_at)
+       VALUES (?id, ?tx_id, ?category, ?item_id, ?qty, ?status, ?created_at)
+       ON CONFLICT (tx_id, category, item_id) DO NOTHING"
+    } else {
+      "INSERT OR IGNORE INTO tx_items (id, tx_id, category, item_id, qty, status, created_at)
+       VALUES (?id, ?tx_id, ?category, ?item_id, ?qty, ?status, ?created_at)"
+    }
+
     for (r in seq_len(nrow(batch_df))) {
       db_exec(
         conn,
-        "INSERT INTO tx_items (id, tx_id, category, item_id, qty, status, created_at)
-         VALUES (?id, ?tx_id, ?category, ?item_id, ?qty, ?status, ?created_at)",
+        ins_sql,
         id         = batch_df$id[r],
         tx_id      = batch_df$tx_id[r],
         category   = batch_df$category[r],
@@ -1620,7 +1637,6 @@ rows <- rows[!vapply(rows, is.null, logical(1))]
         created_at = batch_df$created_at[r]
       )
     }
-
     invisible(TRUE)
   }
 
