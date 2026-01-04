@@ -549,6 +549,41 @@ cfg_set <- function(key, value) {
   })
 }
 
+cfg_set_batch <- function(kv_list) {
+  # kv_list is a named list: list(key1 = "value1", key2 = "value2", ...)
+  if (length(kv_list) == 0) return(invisible(TRUE))
+  
+  with_db(function(con) {
+    DBI::dbWithTransaction(con, {
+      for (key in names(kv_list)) {
+        value <- as.character(kv_list[[key]] %||% "")
+        n <- db_exec(con, "UPDATE config SET value = ?value WHERE key = ?key", key = key, value = value)
+        if (isTRUE(n == 0)) {
+          tryCatch(
+            db_exec(con, "INSERT INTO config(key, value) VALUES (?key, ?value)", key = key, value = value),
+            error = function(e) {
+              db_exec(con, "UPDATE config SET value = ?value WHERE key = ?key", key = key, value = value)
+            }
+          )
+        }
+      }
+      # Update timestamp once at the end
+      ts <- now_ts()
+      n <- db_exec(con, "UPDATE config SET value = ?value WHERE key = ?key", key = "__config_updated_at", value = ts)
+      if (isTRUE(n == 0)) {
+        tryCatch(
+          db_exec(con, "INSERT INTO config(key, value) VALUES (?key, ?value)", key = "__config_updated_at", value = ts),
+          error = function(e) NULL
+        )
+      }
+    })
+    
+    # Refresh cache once at the end
+    cfg_refresh_cache(force = TRUE)
+    invisible(TRUE)
+  })
+}
+
 cfg_set_input <- function(key, val) {
   cfg_set(key, if (is.na(val) || is.null(val)) "" else as.character(val))
 }
@@ -4564,32 +4599,38 @@ server <- function(input, output, session) {
     )
   })
 
-  observeEvent(input$admin_prices_save,
+observeEvent(input$admin_prices_save,
     {
       if (!isTRUE(rv$admin_logged_in)) {
         return()
       }
 
-      cfg_set("early_bird_cutoff", as.character(as.Date(input$admin_cfg_early_bird_cutoff)))
+      # Helper to convert input to string (NA/NULL -> "")
+      input_val <- function(x) if (is.na(x) || is.null(x)) "" else as.character(x)
 
-      # limits (numericInput returns NA if empty)
-      cfg_set_input("limit_max_total_cad", input$admin_cfg_limit_max_total_cad)
-      cfg_set_input("limit_max_items_total", input$admin_cfg_limit_max_items_total)
+      # Build all config as a named list
+      cfg <- list()
+
+      cfg[["early_bird_cutoff"]] <- as.character(as.Date(input$admin_cfg_early_bird_cutoff))
+
+      # limits
+      cfg[["limit_max_total_cad"]] <- input_val(input$admin_cfg_limit_max_total_cad)
+      cfg[["limit_max_items_total"]] <- input_val(input$admin_cfg_limit_max_items_total)
 
       # day
-      cfg_set_input("price_day_adult", input$admin_price_day_adult)
-      cfg_set_input("price_day_youth", input$admin_price_day_youth)
-      cfg_set_input("price_day_child", input$admin_price_day_child)
-      cfg_set_input("price_day_family", input$admin_price_day_family)
+      cfg[["price_day_adult"]] <- input_val(input$admin_price_day_adult)
+      cfg[["price_day_youth"]] <- input_val(input$admin_price_day_youth)
+      cfg[["price_day_child"]] <- input_val(input$admin_price_day_child)
+      cfg[["price_day_family"]] <- input_val(input$admin_price_day_family)
 
       # christmas
-      cfg_set_input("price_christmas_pass", input$admin_price_christmas_pass)
+      cfg[["price_christmas_pass"]] <- input_val(input$admin_price_christmas_pass)
 
       # season
-      cfg_set_input("price_season_eb_adult", input$admin_price_season_eb_adult)
-      cfg_set_input("price_season_eb_youth", input$admin_price_season_eb_youth)
-      cfg_set_input("price_season_reg_adult", input$admin_price_season_reg_adult)
-      cfg_set_input("price_season_reg_youth", input$admin_price_season_reg_youth)
+      cfg[["price_season_eb_adult"]] <- input_val(input$admin_price_season_eb_adult)
+      cfg[["price_season_eb_youth"]] <- input_val(input$admin_price_season_eb_youth)
+      cfg[["price_season_reg_adult"]] <- input_val(input$admin_price_season_reg_adult)
+      cfg[["price_season_reg_youth"]] <- input_val(input$admin_price_season_reg_youth)
 
       # programs (catalog-driven)
       cat <- program_catalog()
@@ -4598,19 +4639,22 @@ server <- function(input, output, session) {
         price_id <- paste0("admin_prog_price_", pid)
         cap_id <- paste0("admin_prog_cap_", pid)
 
-        cfg_set_input(cat$price_key[i], input[[price_id]])
+        cfg[[cat$price_key[i]]] <- input_val(input[[price_id]])
 
         cap_val <- parse_int_or_na(input[[cap_id]])
-        cfg_set(cat$cap_key[i], if (is.na(cap_val)) "" else as.character(cap_val))
+        cfg[[cat$cap_key[i]]] <- if (is.na(cap_val)) "" else as.character(cap_val)
       }
 
       # tabs
-      cfg_set("tab_daypass_enabled", if (isTRUE(input$admin_tab_daypass_enabled)) "1" else "0")
-      cfg_set("tab_christmas_enabled", if (isTRUE(input$admin_tab_christmas_enabled)) "1" else "0")
-      cfg_set("tab_season_enabled", if (isTRUE(input$admin_tab_season_enabled)) "1" else "0")
-      cfg_set("tab_programs_enabled", if (isTRUE(input$admin_tab_programs_enabled)) "1" else "0")
-      cfg_set("tab_events_enabled", if (isTRUE(input$admin_tab_events_enabled)) "1" else "0")
-      cfg_set("tab_donation_enabled", if (isTRUE(input$admin_tab_donation_enabled)) "1" else "0")
+      cfg[["tab_daypass_enabled"]] <- if (isTRUE(input$admin_tab_daypass_enabled)) "1" else "0"
+      cfg[["tab_christmas_enabled"]] <- if (isTRUE(input$admin_tab_christmas_enabled)) "1" else "0"
+      cfg[["tab_season_enabled"]] <- if (isTRUE(input$admin_tab_season_enabled)) "1" else "0"
+      cfg[["tab_programs_enabled"]] <- if (isTRUE(input$admin_tab_programs_enabled)) "1" else "0"
+      cfg[["tab_events_enabled"]] <- if (isTRUE(input$admin_tab_events_enabled)) "1" else "0"
+      cfg[["tab_donation_enabled"]] <- if (isTRUE(input$admin_tab_donation_enabled)) "1" else "0"
+
+      # Single batched write
+      cfg_set_batch(cfg)
 
       invalidate_program_list_cache()
       showNotification("Saved Prices / Config.", type = "message")
