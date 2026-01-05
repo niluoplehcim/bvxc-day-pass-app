@@ -83,6 +83,28 @@ IS_SQUARE_MODE <- (SQUARE_ENV == "production") ||
 
 IS_FAKE_MODE <- (SQUARE_ENV == "sandbox" && SANDBOX_MODE == "fake")
 
+xmas_pass_sale_cutoff <- function(today = Sys.Date()) {
+  y <- as.integer(format(today, "%Y"))
+  m <- as.integer(format(today, "%m"))
+
+  # Season starts Nov 1. If we're in Nov/Dec, the relevant Jan 3 cutoff is NEXT year.
+  cutoff_year <- if (m >= 11) y + 1 else y
+  as.Date(sprintf("%04d-01-03", cutoff_year))
+}
+
+xmas_pass_is_available <- function(today = Sys.Date()) {
+  cutoff <- xmas_pass_sale_cutoff(today)
+  today <= cutoff
+}
+
+xmas_pass_block_message <- function(today = Sys.Date()) {
+  cutoff <- xmas_pass_sale_cutoff(today)
+  sprintf(
+    "We all wish Christmas lasted forever, but the Christmas Pass stops making sense after %s.",
+    format(cutoff, "%b %d")
+  )
+}
+
 # -----------------------------------------------------------------------------
 # SEASON WINDOW HELPERS (Nov 1 → May 1)
 # -----------------------------------------------------------------------------
@@ -1446,8 +1468,8 @@ ui <- fluidPage(
 })();
 ")),
 
-    # --- Existing BVXC bindings (keep as-is) ---
-    tags$script(HTML("
+# --- Existing BVXC bindings (keep as-is) ---
+tags$script(HTML("
 (function() {
   function bindBVXC() {
     if (!window.jQuery || !window.Shiny) return;
@@ -1478,6 +1500,26 @@ ui <- fluidPage(
         });
       } catch(e) {}
     });
+
+    // NEW: force a qty stepper + Shiny input value to a specific number
+    Shiny.addCustomMessageHandler('setQtyStepper', function(message) {
+      try {
+        var id = String((message && message.id) || '');
+        var v  = parseInt((message && message.value), 10);
+        if (!id) return;
+        if (isNaN(v)) v = 0;
+
+        // Update the visible number inside the stepper
+        var $stepper = $('.qty-stepper-global[data-target=\"' + id + '\"]');
+        if ($stepper.length) {
+          $stepper.find('.qty-value').text(String(v));
+        }
+
+        // Keep Shiny input consistent too
+        Shiny.setInputValue(id, v, { priority: 'event' });
+      } catch(e) {}
+    });
+
 
     $(document).off('click.bvxc', 'a.admin-block-del');
     $(document).on('click.bvxc', 'a.admin-block-del', function(e){
@@ -3026,7 +3068,7 @@ server <- function(input, output, session) {
     tabs <- c(tabs, list(tabPanel("Receipt", value = "Receipt", uiOutput("tab_receipt_ui"))))
     tabs <- c(tabs, list(tabPanel("Admin", value = "Admin", uiOutput("tab_admin_ui"))))
 
-    do.call(navbarPage, c(list(title = "BVXC", id = "main_nav"), tabs))
+    do.call(navbarPage, c(list(title = "BVCCSC", id = "main_nav"), tabs))
   })
 
 # Ensure performance indexes exist (run once) when Admin is opened
@@ -3077,26 +3119,46 @@ observeEvent(input$main_nav, {
     )
   })
 
-  output$tab_xmas_ui <- renderUI({
-    req(identical(input$main_nav, "Christmas Pass"))
-    fluidPage(
-      h3("Christmas Pass"),
-      tags$ol(
-        tags$li("Pay online here. Keep the Square receipt and QR code for verification."),
-        tags$li("Choose a 14-day window that includes Dec 25."),
-        tags$li("Pick up your pass at McBike.")
-      ),
-      fluidRow(
-        column(
-          4,
-          dateInput("xmas_start", "Start date (14-day window)", value = Sys.Date()),
-          qty_stepper_input("xmas_qty", "Number of passes", value = 0, min = 0, max = 10),
-          br()
-        ),
-        column(8, checkout_panel_ui("xmas", "Checkout"))
-      )
+output$xmas_purchase_ui <- renderUI({
+  # Re-check periodically in case the app stays open across midnight
+  invalidateLater(60 * 1000, session)
+
+  if (xmas_pass_is_available(Sys.Date())) {
+    tagList(
+      dateInput("xmas_start", "Start date (14-day window)", value = Sys.Date()),
+      qty_stepper_input("xmas_qty", "Number of passes", value = 0, min = 0, max = 10),
+      br()
     )
-  })
+  } else {
+    cutoff <- xmas_pass_sale_cutoff(Sys.Date())
+    tags$div(
+      style = "padding:12px; border:1px solid #f0c36d; background:#fff7e6; border-radius:8px; margin-top:10px;",
+      tags$strong("Christmas Pass unavailable."),
+      tags$div(style = "margin-top:6px;", xmas_pass_block_message(Sys.Date())),
+      tags$div(style = "margin-top:6px; color:#666;", sprintf("Cutoff date: %s.", format(cutoff, "%b %d, %Y"))),
+      tags$div(style = "margin-top:6px; color:#666;", "Please choose a Day Pass or Season Pass instead.")
+    )
+  }
+})
+
+output$tab_xmas_ui <- renderUI({
+  req(identical(input$main_nav, "Christmas Pass"))
+  fluidPage(
+    h3("Christmas Pass"),
+    tags$ol(
+      tags$li("Pay online here. Keep the Square receipt and QR code for verification."),
+      tags$li("Choose a 14-day window that includes Dec 25."),
+      tags$li("Pick up your pass at McBike.")
+    ),
+    fluidRow(
+      column(
+        4,
+        uiOutput("xmas_purchase_ui")
+      ),
+      column(8, checkout_panel_ui("xmas", "Checkout"))
+    )
+  )
+})
 
   output$tab_season_ui <- renderUI({
     req(identical(input$main_nav, "Season Pass"))
@@ -3431,6 +3493,21 @@ observeEvent(input$main_nav, {
         # Normalize/merge cart lines before checks
         df <- normalize_cart(df)
 
+        # Checkout-level guard: never allow Xmas pass purchase after cutoff
+        if (!xmas_pass_is_available(Sys.Date()) && any(df$category == "christmas_pass")) {
+          df <- df[df$category != "christmas_pass", , drop = FALSE]
+          rv$cart <- normalize_cart(df)
+
+          showNotification(
+            paste0(xmas_pass_block_message(Sys.Date()), " Please grab a Day Pass or Season Pass instead."),
+            type = "warning",
+            duration = 10
+          )
+
+          session$sendCustomMessage("setQtyStepper", list(id = "xmas_qty", value = 0))
+          return()
+        }
+
         # Guardrail: too many distinct cart lines can crash small Connect workers
         max_lines <- 60L
         if (!is.null(df) && nrow(df) > max_lines) {
@@ -3747,6 +3824,25 @@ observeEvent(input$main_nav, {
     {
       # Guard: JS-driven input can be NULL early; do nothing.
       if (is.null(input$xmas_add_to_cart)) {
+        return()
+      }
+
+      # HARD BLOCK after Jan 3 (inclusive cutoff handled by xmas_pass_is_available)
+      if (!xmas_pass_is_available(Sys.Date())) {
+        # Remove any existing Xmas pass line from cart (stale carts)
+        df <- rv$cart
+        if (!is.null(df) && nrow(df) > 0) {
+          df <- df[df$category != "christmas_pass", , drop = FALSE]
+          rv$cart <- normalize_cart(df)
+        }
+
+        showNotification(
+          paste0(xmas_pass_block_message(Sys.Date()), " Please grab a Day Pass or Season Pass instead."),
+          type = "warning",
+          duration = 8
+        )
+
+        session$sendCustomMessage("setQtyStepper", list(id = "xmas_qty", value = 0))
         return()
       }
 
@@ -4613,15 +4709,19 @@ observeEvent(input$main_nav, {
           )
         })
       ),
-      panel(
-        "Visible Customer Tabs",
-        checkboxInput("admin_tab_daypass_enabled", "Day Pass", value = cfg_bool("tab_daypass_enabled", TRUE)),
-        checkboxInput("admin_tab_christmas_enabled", "Christmas Pass", value = cfg_bool("tab_christmas_enabled", TRUE)),
-        checkboxInput("admin_tab_season_enabled", "Season Pass", value = cfg_bool("tab_season_enabled", TRUE)),
-        checkboxInput("admin_tab_programs_enabled", "Programs", value = cfg_bool("tab_programs_enabled", TRUE)),
-        checkboxInput("admin_tab_events_enabled", "Special Events", value = cfg_bool("tab_events_enabled", TRUE)),
-        checkboxInput("admin_tab_donation_enabled", "Donation", value = cfg_bool("tab_donation_enabled", TRUE))
-      ),
+
+panel(
+  "Visible Customer Tabs",
+  tags$div(
+    style = "display:flex; flex-wrap:nowrap; gap:10px 12px; align-items:center; overflow-x:auto;",
+    tags$div(style = "min-width:110px; white-space:nowrap;", checkboxInput("admin_tab_daypass_enabled",   "Day Pass",        value = cfg_bool("tab_daypass_enabled", TRUE))),
+    tags$div(style = "min-width:110px; white-space:nowrap;", checkboxInput("admin_tab_christmas_enabled", "Christmas Pass",  value = cfg_bool("tab_christmas_enabled", TRUE))),
+    tags$div(style = "min-width:110px; white-space:nowrap;", checkboxInput("admin_tab_season_enabled",    "Season Pass",     value = cfg_bool("tab_season_enabled", TRUE))),
+    tags$div(style = "min-width:110px; white-space:nowrap;", checkboxInput("admin_tab_programs_enabled",  "Programs",        value = cfg_bool("tab_programs_enabled", TRUE))),
+    tags$div(style = "min-width:110px; white-space:nowrap;", checkboxInput("admin_tab_events_enabled",    "Special Events",  value = cfg_bool("tab_events_enabled", TRUE))),
+    tags$div(style = "min-width:110px; white-space:nowrap;", checkboxInput("admin_tab_donation_enabled",  "Donation",        value = cfg_bool("tab_donation_enabled", TRUE)))
+  )
+),
       actionButton("admin_prices_save", "Save Prices / Config")
     )
   })
