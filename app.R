@@ -433,27 +433,47 @@ init_db <- function() {
       )
     ")
 
-    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_tx_items_item_cat_status ON tx_items(item_id, category, status)"), silent = TRUE)
-    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_tx_items_tx_id          ON tx_items(tx_id)"), silent = TRUE)
+    # correctness: prevent duplicates per tx/category/item
     try(db_exec(con, "CREATE UNIQUE INDEX IF NOT EXISTS ux_tx_items_tx_cat_item ON tx_items(tx_id, category, item_id)"), silent = TRUE)
 
     # -----------------------------
-    # indexes + constraints
+    # correctness constraints
     # -----------------------------
-    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_transactions_created_at     ON transactions(created_at)"), silent = TRUE)
-    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_transactions_receipt_token  ON transactions(receipt_token)"), silent = TRUE)
-    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_transactions_status         ON transactions(status)"), silent = TRUE)
-    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_transactions_tx_type        ON transactions(tx_type)"), silent = TRUE)
-    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_transactions_buyer_email    ON transactions(buyer_email)"), silent = TRUE)
-    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_transactions_buyer_name     ON transactions(buyer_name)"), silent = TRUE)
-
-    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_events_event_date           ON special_events(event_date)"), silent = TRUE)
-
     try(db_exec(con, "CREATE UNIQUE INDEX IF NOT EXISTS ux_transactions_receipt_token ON transactions(receipt_token)"), silent = TRUE)
 
     invisible(NULL)
   })
 
+  invisible(NULL)
+}
+
+# -----------------------------------------------------------------------------
+# INDEX BUILDER (PERF-ONLY, SAFE TO DEFER)
+# -----------------------------------------------------------------------------
+
+.idx_state <- new.env(parent = emptyenv())
+.idx_state$done <- FALSE
+
+ensure_indexes_once <- function() {
+  if (isTRUE(.idx_state$done)) return(invisible(NULL))
+
+  with_db(function(con) {
+    # tx_items performance indexes
+    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_tx_items_item_cat_status ON tx_items(item_id, category, status)"), silent = TRUE)
+    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_tx_items_tx_id          ON tx_items(tx_id)"), silent = TRUE)
+
+    # transactions performance indexes
+    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_transactions_created_at  ON transactions(created_at)"), silent = TRUE)
+    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_transactions_status      ON transactions(status)"), silent = TRUE)
+    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_transactions_tx_type     ON transactions(tx_type)"), silent = TRUE)
+    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_transactions_buyer_email ON transactions(buyer_email)"), silent = TRUE)
+    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_transactions_buyer_name  ON transactions(buyer_name)"), silent = TRUE)
+
+    # special_events performance index
+    try(db_exec(con, "CREATE INDEX IF NOT EXISTS idx_events_event_date        ON special_events(event_date)"), silent = TRUE)
+  })
+
+  .idx_state$done <- TRUE
   invisible(NULL)
 }
 
@@ -3008,6 +3028,13 @@ server <- function(input, output, session) {
 
     do.call(navbarPage, c(list(title = "BVXC", id = "main_nav"), tabs))
   })
+
+# Ensure performance indexes exist (run once) when Admin is opened
+observeEvent(input$main_nav, {
+  if (identical(input$main_nav, "Admin")) {
+    ensure_indexes_once()
+  }
+}, ignoreInit = TRUE)
 
   # Hide Receipt tab in the navbar by default (we only show it once a receipt exists)
   session$onFlushed(function() {
